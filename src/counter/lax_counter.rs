@@ -1,7 +1,7 @@
 use redis::aio::ConnectionManager;
 
 use crate::{
-    RedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
+    DistkitError, RedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
     counter::{CounterError, CounterTrait},
 };
 
@@ -27,15 +27,15 @@ impl LaxCounter {
 
 #[async_trait::async_trait]
 impl CounterTrait for LaxCounter {
-    async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, CounterError> {
+    async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
         todo!()
     } // end function inc
 
-    async fn dec(&self, key: &RedisKey, count: i64) -> Result<i64, CounterError> {
+    async fn dec(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
         todo!()
     } // end function dec
 
-    async fn get(&self, key: &RedisKey) -> Result<i64, CounterError> {
+    async fn get(&self, key: &RedisKey) -> Result<i64, DistkitError> {
         todo!()
     } // end function get
 } // end impl CounterTrait for LaxCounter

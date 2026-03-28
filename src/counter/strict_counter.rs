@@ -1,57 +1,80 @@
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
-    RedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
+    DistkitError, RedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
     counter::{CounterError, CounterTrait},
 };
 
 const INC_LUA: &str = r#"
     local key = KEYS[1]
-    local count = ARGV[1]
+    local count = tonumber(ARGV[1]) or 0
+    local total = 0
 
-    if redis.call('exists', key) == 0 then
-        redis.call('set', key, count)
+    if count >= 0 then
+        total = redis.call('INCRBY', key, count)
     else
-        redis.call('incrby', key, count)
+        total = redis.call('DECRBY', key, count * -1)
     end
+
+    return total
+"#;
+
+const GET_LUA: &str = r#"
+    local key = KEYS[1]
+    return redis.call('GET', key) or 0
 "#;
 
 #[derive(Debug, Clone)]
 pub struct StrictCounter {
-    prefix: RedisKey,
     connection_manager: ConnectionManager,
     key_generator: RedisKeyGenerator,
     inc_script: Script,
+    get_script: Script,
 }
 
 impl StrictCounter {
     pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
-        let key_generator =
-            RedisKeyGenerator::new(prefix.clone(), RedisKeyGeneratorTypeKey::StrictCounter);
+        let key_generator = RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::StrictCounter);
         let inc_script = Script::new(INC_LUA);
+        let get_script = Script::new(GET_LUA);
 
         Self {
-            prefix,
             connection_manager,
             key_generator,
             inc_script,
+            get_script,
         }
     }
 }
 
 #[async_trait::async_trait]
 impl CounterTrait for StrictCounter {
-    async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, CounterError> {
+    async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
         let mut conn = self.connection_manager.clone();
 
-        todo!()
+        let total: i64 = self
+            .inc_script
+            .key(self.key_generator.member_key(key))
+            .arg(count)
+            .invoke_async(&mut conn)
+            .await?;
+
+        Ok(total)
     } // end function inc
 
-    async fn dec(&self, key: &RedisKey, count: i64) -> Result<i64, CounterError> {
-        todo!()
+    async fn dec(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+        self.inc(key, -count).await
     } // end function dec
 
-    async fn get(&self, key: &RedisKey) -> Result<i64, CounterError> {
-        todo!()
+    async fn get(&self, key: &RedisKey) -> Result<i64, DistkitError> {
+        let mut conn = self.connection_manager.clone();
+
+        let total: i64 = self
+            .get_script
+            .key(self.key_generator.member_key(key))
+            .invoke_async(&mut conn)
+            .await?;
+
+        Ok(total)
     } // end function get
 }

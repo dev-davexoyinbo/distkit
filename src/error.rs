@@ -6,4 +6,6 @@ pub enum DistkitError {
     InvalidRedisKey(String),
     #[error("Counter Error: {0}")]
     CounterError(#[from] CounterError),
+    #[error("Redis Error: {0}")]
+    RedisError(#[from] redis::RedisError),
 }
