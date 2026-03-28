@@ -27,15 +27,15 @@ impl LaxCounter {
 
 #[async_trait::async_trait]
 impl CounterTrait for LaxCounter {
-    async fn inc(&self, key: String, count: i64) -> Result<(), CounterError> {
+    async fn inc(&self, key: &RedisKey, count: i64) -> Result<(), CounterError> {
         todo!()
     } // end function inc
 
-    async fn dec(&self, key: String, count: i64) -> Result<(), CounterError> {
+    async fn dec(&self, key: &RedisKey, count: i64) -> Result<(), CounterError> {
         todo!()
     } // end function dec
 
-    async fn get(&self, key: String) -> Result<i64, CounterError> {
+    async fn get(&self, key: &RedisKey) -> Result<i64, CounterError> {
         todo!()
     } // end function get
 } // end impl CounterTrait for LaxCounter

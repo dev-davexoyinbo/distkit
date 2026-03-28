@@ -65,4 +65,8 @@ impl RedisKeyGenerator {
     pub(crate) fn new(prefix: RedisKey, key_type: RedisKeyGeneratorTypeKey) -> Self {
         Self { prefix, key_type }
     }
+
+    pub(crate) fn member_key(&self, member: &RedisKey) -> String {
+        format!("{}:{}:{}", *self.prefix, self.key_type, **member)
+    }
 }

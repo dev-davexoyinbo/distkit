@@ -30,7 +30,7 @@ impl Counter {
                 prefix.clone(),
                 connection_manager.clone(),
             )),
-            lax: Arc::new(LaxCounter::new(prefix), connection_manager.clone()),
+            lax: Arc::new(LaxCounter::new(prefix, connection_manager.clone())),
         }
     } // end new
 
