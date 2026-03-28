@@ -1,4 +1,4 @@
-.PHONY: help redis-up redis-down logs
+.PHONY: help redis-up redis-down logs test
 
 REDIS_PORT ?= 16379
 REDIS_URL ?= redis://127.0.0.1:$(REDIS_PORT)/
@@ -30,3 +30,10 @@ redis-down: ## Stop local redis and remove volumes (both profiles)
 
 logs: ## Show logs
 	@docker compose logs -f
+
+
+test: ## Run tests
+	@set -e; \
+	trap "$(MAKE) -s redis-down" EXIT; \
+	$(MAKE) -s redis-up; \
+	REDIS_URL="$(REDIS_URL)" cargo test
