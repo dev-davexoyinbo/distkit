@@ -5,38 +5,37 @@ use crate::{
 };
 
 const INC_LUA: &str = r#"
-    local key = KEYS[1]
+    local container_key = KEYS[1]
+    local key = KEYS[2]
     local count = tonumber(ARGV[1]) or 0
-    local total = 0
 
-    if count == 0 then
-        total = redis.call('GET', key) or 0
-    elseif count > 0 then
-        total = redis.call('INCRBY', key, count)
-    else
-        total = redis.call('DECRBY', key, count * -1)
-    end
-
-    return total
+    return redis.call('HINCRBY', container_key, key, count)
 "#;
 
 const SET_LUA: &str = r#"
-    local key = KEYS[1]
+    local container_key = KEYS[1]
+    local key = KEYS[2]
     local count = tonumber(ARGV[1]) or 0
-    redis.call('SET', key, count)
+
+    redis.call('HSET', container_key, key, count)
 
     return count
 "#;
 
 const GET_LUA: &str = r#"
-    local key = KEYS[1]
-    return redis.call('GET', key) or 0
+    local container_key = KEYS[1]
+    local key = KEYS[2]
+
+    return redis.call('HGET', container_key, key) or 0
 "#;
 
 const DEL_LUA: &str = r#"
-    local key = KEYS[1]
-    local total = redis.call('GET', key) or 0
-    redis.call('DEL', key)
+    local container_key = KEYS[1]
+    local key = KEYS[2]
+
+    local total = redis.call('HGET', container_key, key) or 0
+
+    redis.call('HDEL', container_key, key)
 
     return total
 "#;
@@ -85,7 +84,8 @@ impl CounterTrait for StrictCounter {
 
         let total: i64 = self
             .inc_script
-            .key(self.key_generator.member_key(key))
+            .key(self.key_generator.container_key())
+            .key(key.to_string())
             .arg(count)
             .invoke_async(&mut conn)
             .await?;
@@ -102,7 +102,8 @@ impl CounterTrait for StrictCounter {
 
         let total: i64 = self
             .get_script
-            .key(self.key_generator.member_key(key))
+            .key(self.key_generator.container_key())
+            .key(key.to_string())
             .invoke_async(&mut conn)
             .await?;
 
@@ -114,7 +115,8 @@ impl CounterTrait for StrictCounter {
 
         let total: i64 = self
             .set_script
-            .key(self.key_generator.member_key(key))
+            .key(self.key_generator.container_key())
+            .key(key.to_string())
             .arg(count)
             .invoke_async(&mut conn)
             .await?;
@@ -127,7 +129,8 @@ impl CounterTrait for StrictCounter {
 
         let total: i64 = self
             .del_script
-            .key(self.key_generator.member_key(key))
+            .key(self.key_generator.container_key())
+            .key(key.to_string())
             .invoke_async(&mut conn)
             .await?;
 
