@@ -6,6 +6,9 @@ pub use lax_counter::*;
 mod strict_counter;
 pub use strict_counter::*;
 
+mod counter_trait;
+pub use counter_trait::*;
+
 mod common;
 
 mod error;
