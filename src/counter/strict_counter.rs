@@ -41,11 +41,13 @@ impl StrictCounter {
 
 #[async_trait::async_trait]
 impl CounterTrait for StrictCounter {
-    async fn inc(&self, key: &RedisKey, count: i64) -> Result<(), CounterError> {
+    async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, CounterError> {
+        let mut conn = self.connection_manager.clone();
+
         todo!()
     } // end function inc
 
-    async fn dec(&self, key: &RedisKey, count: i64) -> Result<(), CounterError> {
+    async fn dec(&self, key: &RedisKey, count: i64) -> Result<i64, CounterError> {
         todo!()
     } // end function dec
 
