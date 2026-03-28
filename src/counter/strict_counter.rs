@@ -42,8 +42,8 @@ const DEL_LUA: &str = r#"
 "#;
 
 const CLEAR_LUA: &str = r#"
-    local key = KEYS[1]
-    redis.call('DEL', key)
+    local container_key = KEYS[1]
+    redis.call('DEL', container_key)
 "#;
 
 #[derive(Debug, Clone)]
