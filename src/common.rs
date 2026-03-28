@@ -46,3 +46,23 @@ impl TryFrom<String> for RedisKey {
         }
     }
 }
+
+#[derive(Clone, Debug, strum_macros::Display)]
+pub(crate) enum RedisKeyGeneratorTypeKey {
+    #[strum(to_string = "lax_counter")]
+    LaxCounter,
+    #[strum(to_string = "strict_counter")]
+    StrictCounter,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RedisKeyGenerator {
+    prefix: RedisKey,
+    key_type: RedisKeyGeneratorTypeKey,
+}
+
+impl RedisKeyGenerator {
+    pub(crate) fn new(prefix: RedisKey, key_type: RedisKeyGeneratorTypeKey) -> Self {
+        Self { prefix, key_type }
+    }
+}

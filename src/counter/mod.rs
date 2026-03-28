@@ -4,6 +4,7 @@ use std::sync::Arc;
 pub use lax_counter::*;
 
 mod strict_counter;
+use redis::aio::ConnectionManager;
 pub use strict_counter::*;
 
 mod counter_trait;
@@ -23,10 +24,13 @@ pub struct Counter {
 }
 
 impl Counter {
-    pub fn new(prefix: RedisKey) -> Self {
+    pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
         Self {
-            strict: Arc::new(StrictCounter::new(prefix.clone())),
-            lax: Arc::new(LaxCounter::new(prefix)),
+            strict: Arc::new(StrictCounter::new(
+                prefix.clone(),
+                connection_manager.clone(),
+            )),
+            lax: Arc::new(LaxCounter::new(prefix), connection_manager.clone()),
         }
     } // end new
 

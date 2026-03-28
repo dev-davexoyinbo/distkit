@@ -1,16 +1,27 @@
+use redis::aio::ConnectionManager;
+
 use crate::{
-    RedisKey,
+    RedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
     counter::{CounterError, CounterTrait},
 };
 
 #[derive(Debug, Clone)]
 pub struct LaxCounter {
     prefix: RedisKey,
+    connection_manager: ConnectionManager,
+    key_generator: RedisKeyGenerator,
 }
 
 impl LaxCounter {
-    pub fn new(prefix: RedisKey) -> Self {
-        Self { prefix }
+    pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
+        let key_generator =
+            RedisKeyGenerator::new(prefix.clone(), RedisKeyGeneratorTypeKey::LaxCounter);
+
+        Self {
+            prefix,
+            connection_manager,
+            key_generator,
+        }
     }
 }
 
