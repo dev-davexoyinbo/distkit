@@ -38,4 +38,16 @@ impl CounterTrait for LaxCounter {
     async fn get(&self, key: &RedisKey) -> Result<i64, DistkitError> {
         todo!()
     } // end function get
+
+    async fn set(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+        todo!()
+    } // end function set
+
+    async fn del(&self, key: &RedisKey) -> Result<i64, DistkitError> {
+        todo!()
+    } // end function delete
+
+    async fn clear(&self) -> Result<(), DistkitError> {
+        todo!()
+    }
 } // end impl CounterTrait for LaxCounter
