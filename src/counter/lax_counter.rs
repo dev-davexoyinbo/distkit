@@ -1,6 +1,9 @@
 use std::{
     ops::{Deref, DerefMut},
-    sync::{Arc, atomic::AtomicI64},
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
     time::Duration,
 };
 
@@ -20,14 +23,11 @@ const GET_LUA: &str = r#"
 "#;
 
 #[derive(Debug)]
-enum SingleStore {
-    Undefined,
-    Active {
-        remote_total: i64,
-        delta: AtomicI64,
-        last_updated: Instant,
-        last_flushed: Option<Instant>,
-    },
+struct SingleStore {
+    remote_total: i64,
+    delta: AtomicI64,
+    last_updated: Instant,
+    last_flushed: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -59,7 +59,7 @@ impl LaxCounter {
         }
     }
 
-    async fn get_remote_total(&self, key: &RedisKey) -> Result<i64, DistkitError> {
+    async fn ensure_valid_state(&self, key: &RedisKey) -> Result<(), DistkitError> {
         let lock = self.get_or_create_lock(key).await;
         let _guard = lock.lock().await;
 
@@ -67,14 +67,10 @@ impl LaxCounter {
             let store = self.store.get(key);
 
             if let Some(ref store) = store
-                && let SingleStore::Active {
-                    last_updated,
-                    remote_total,
-                    ..
-                } = store.deref()
+                && let SingleStore { last_updated, .. } = store.deref()
                 && last_updated.elapsed() < self.allowed_lag
             {
-                return Ok(*remote_total);
+                return Ok(());
             }
         }
 
@@ -90,33 +86,17 @@ impl LaxCounter {
         let mut store = self
             .store
             .entry(key.clone())
-            .or_insert_with(|| SingleStore::Active {
+            .or_insert_with(|| SingleStore {
                 remote_total,
                 delta: AtomicI64::new(0),
                 last_updated: Instant::now(),
                 last_flushed: None,
             });
 
-        match store.deref_mut() {
-            SingleStore::Undefined => {
-                *store = SingleStore::Active {
-                    remote_total,
-                    delta: AtomicI64::new(0),
-                    last_updated: Instant::now(),
-                    last_flushed: None,
-                };
-            }
-            SingleStore::Active {
-                remote_total: remote_total_old,
-                last_updated,
-                ..
-            } => {
-                *remote_total_old = remote_total;
-                *last_updated = Instant::now();
-            }
-        };
+        store.remote_total = remote_total;
+        store.last_updated = Instant::now();
 
-        Ok(remote_total)
+        Ok(())
     } // end function get_remote_total
 
     async fn get_or_create_lock(&self, key: &RedisKey) -> Arc<tokio::sync::Mutex<()>> {
@@ -137,19 +117,25 @@ impl CounterTrait for LaxCounter {
         let store = match self.store.get(key) {
             Some(store) => store,
             None => {
-                self.store
-                    .entry(key.clone())
-                    .or_insert_with(|| SingleStore::Undefined);
+                self.ensure_valid_state(key).await?;
 
                 self.store.get(key).expect("store should be present here")
             }
         };
 
-        todo!()
+        let prev_delta = if count > 0 {
+            store.delta.fetch_add(count, Ordering::AcqRel)
+        } else {
+            store.delta.fetch_sub(count.abs(), Ordering::AcqRel)
+        };
+
+        let total = store.remote_total + prev_delta + count;
+
+        Ok(total)
     } // end function inc
 
     async fn dec(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
-        todo!()
+        self.inc(key, -count).await
     } // end function dec
 
     async fn get(&self, key: &RedisKey) -> Result<i64, DistkitError> {
