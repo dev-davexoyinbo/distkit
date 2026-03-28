@@ -17,6 +17,9 @@ pub use error::*;
 
 use crate::RedisKey;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Debug, Clone)]
 pub struct Counter {
     lax: Arc<LaxCounter>,
