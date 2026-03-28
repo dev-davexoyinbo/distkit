@@ -115,7 +115,14 @@ impl LaxCounter {
 impl CounterTrait for LaxCounter {
     async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
         let store = match self.store.get(key) {
-            Some(store) => store,
+            Some(store) if store.last_updated.elapsed() < self.allowed_lag => store,
+            Some(store) => {
+                drop(store);
+
+                self.ensure_valid_state(key).await?;
+
+                self.store.get(key).expect("store should be present here")
+            }
             None => {
                 self.ensure_valid_state(key).await?;
 
@@ -139,7 +146,26 @@ impl CounterTrait for LaxCounter {
     } // end function dec
 
     async fn get(&self, key: &RedisKey) -> Result<i64, DistkitError> {
-        todo!()
+        let store = match self.store.get(key) {
+            Some(store) if store.last_updated.elapsed() < self.allowed_lag => store,
+            Some(store) => {
+                drop(store);
+
+                self.ensure_valid_state(key).await?;
+
+                self.store.get(key).expect("store should be present here")
+            }
+            None => {
+                self.ensure_valid_state(key).await?;
+
+                self.store.get(key).expect("store should be present here")
+            }
+        };
+
+        let delta = store.delta.load(Ordering::Acquire);
+        let total = store.remote_total + delta;
+
+        Ok(total)
     } // end function get
 
     async fn set(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
