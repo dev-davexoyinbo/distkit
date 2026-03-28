@@ -45,7 +45,7 @@ const CLEAR_LUA: &str = r#"
     redis.call('DEL', container_key)
 "#;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct StrictCounter {
     connection_manager: ConnectionManager,
     key_generator: RedisKeyGenerator,
