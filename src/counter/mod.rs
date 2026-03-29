@@ -34,9 +34,9 @@ mod tests;
 /// considered fresh before re-fetching from Redis.
 #[derive(Debug, Clone)]
 pub struct CounterOptions {
-    pub(crate) prefix: RedisKey,
-    pub(crate) connection_manager: ConnectionManager,
-    pub(crate) allowed_lag: Duration,
+    pub prefix: RedisKey,
+    pub connection_manager: ConnectionManager,
+    pub allowed_lag: Duration,
 }
 
 impl CounterOptions {
