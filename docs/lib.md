@@ -7,15 +7,15 @@ currently offers two modules:
   implementations that share a common async trait, letting you choose between
   immediate consistency and high-throughput eventual consistency.
 - **Rate limiting** (`trypema` feature, opt-in) -- re-exports the
-  [`trypema`](http://trypema.davidoyinbo.com/) crate, providing sliding-window rate
+  [`trypema`](https://docs.rs/trypema) crate, providing sliding-window rate
   limiting with local, Redis-backed, and hybrid providers.
 
 # Feature flags
 
-| Feature | Default | Description |
-|---|---|---|
-| `counter` | **yes** | Distributed counters ([`StrictCounter`], [`LaxCounter`]) |
-| `trypema` | no | Rate limiting via the [`trypema`](http://trypema.davidoyinbo.com/) crate |
+| Feature   | Default | Description                                                      |
+| --------- | ------- | ---------------------------------------------------------------- |
+| `counter` | **yes** | Distributed counters ([`StrictCounter`], [`LaxCounter`])         |
+| `trypema` | no      | Rate limiting via the [`trypema`](https://docs.rs/trypema) crate |
 
 # Quick start
 
@@ -42,12 +42,12 @@ let approx = counter.lax().get(&key).await?;
 
 # Choosing a counter
 
-| | [`StrictCounter`] | [`LaxCounter`] |
-|---|---|---|
-| **Consistency** | Immediate | Eventual (~20 ms lag) |
-| **Latency** | Redis round-trip per call | Sub-microsecond (warm path) |
-| **Redis I/O** | Every operation | Batched on interval |
-| **Use case** | Billing, inventory, anything where accuracy is critical | Analytics, rate limiting, high-throughput metrics |
+|                 | [`StrictCounter`]                                       | [`LaxCounter`]                                    |
+| --------------- | ------------------------------------------------------- | ------------------------------------------------- |
+| **Consistency** | Immediate                                               | Eventual (~20 ms lag)                             |
+| **Latency**     | Redis round-trip per call                               | Sub-microsecond (warm path)                       |
+| **Redis I/O**   | Every operation                                         | Batched on interval                               |
+| **Use case**    | Billing, inventory, anything where accuracy is critical | Analytics, rate limiting, high-throughput metrics |
 
 Both types implement [`CounterTrait`], so you can write generic code that
 works with either:
@@ -112,7 +112,7 @@ Enable the `trypema` feature to access distributed rate limiting:
 distkit = { version = "0.1", features = ["trypema"] }
 ```
 
-All public types from the [`trypema`](http://trypema.davidoyinbo.com/) crate are
+All public types from the [`trypema`](https://docs.rs/trypema) crate are
 re-exported under `distkit::trypema`. The module provides:
 
 - **Sliding-window rate limiting** with configurable window size and rate.
@@ -256,7 +256,7 @@ let decision = rl.hybrid().absolute().inc(&key, &rate, 1).await?;
 # }
 ```
 
-See the [`trypema` documentation](http://trypema.davidoyinbo.com/) for full API
+See the [`trypema` documentation](https://docs.rs/trypema) for full API
 details and advanced configuration.
 
 [`StrictCounter`]: counter::StrictCounter
