@@ -1,5 +1,5 @@
 use std::{
-    ops::{Deref, DerefMut},
+    ops::Deref,
     sync::{
         Arc, Mutex,
         atomic::{AtomicI64, Ordering},
@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use dashmap::{DashMap, mapref::one::Ref};
+use dashmap::DashMap;
 use redis::{Script, aio::ConnectionManager};
 use tokio::time::Instant;
 
@@ -46,7 +46,6 @@ struct SingleStore {
 
 #[derive(Debug)]
 pub struct LaxCounter {
-    prefix: RedisKey,
     connection_manager: ConnectionManager,
     key_generator: RedisKeyGenerator,
     store: DashMap<RedisKey, SingleStore>,
@@ -58,14 +57,12 @@ pub struct LaxCounter {
 
 impl LaxCounter {
     pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Arc<Self> {
-        let key_generator =
-            RedisKeyGenerator::new(prefix.clone(), RedisKeyGeneratorTypeKey::LaxCounter);
+        let key_generator = RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::LaxCounter);
 
         let get_script = Script::new(GET_LUA);
         let commit_state_script = Script::new(COMMIT_STATE_LUA);
 
         let counter = Self {
-            prefix,
             connection_manager,
             key_generator,
             store: DashMap::default(),
