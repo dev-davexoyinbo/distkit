@@ -2,11 +2,23 @@
 name = "distkit"
 version = "0.1.0"
 edition = "2024"
+description = "A toolkit of distributed systems primitives for Rust, backed by Redis"
+authors = ["Oyinbo David Bayode <dev.davexoyinbo@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/davidoyinbo/distkit"
+documentation = "https://docs.rs/distkit"
+readme = "README.md"
+categories = ["algorithms", "concurrency", "data-structures"]
+keywords = ["distributed", "counter", "redis", "async", "eventual-consistency"]
 
 [dependencies]
 async-trait = "0.1.89"
 dashmap = "6.1.0"
-redis = { version = "1.1.0", features = ["aio", "connection-manager", "tokio-comp"] }
+redis = { version = "1.1.0", features = [
+  "aio",
+  "connection-manager",
+  "tokio-comp",
+] }
 strum = "0.28.0"
 strum_macros = "0.28.0"
 thiserror = "2.0.18"
@@ -14,7 +26,7 @@ tokio = { version = "1.50.0", features = ["full"] }
 tracing = "0.1.44"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 
 [[bench]]
 name = "strict_counter"
