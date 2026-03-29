@@ -105,7 +105,9 @@ Both counter types sharing the same prefix occupy **separate** hash keys
 
 # Rate limiting (trypema)
 
-Enable the `trypema` feature to access distributed rate limiting:
+Enable the `trypema` feature to access distributed rate limiting.
+
+Trypema documentation website: <https://trypema.davidoyinbo.com>
 
 ```toml
 [dependencies]

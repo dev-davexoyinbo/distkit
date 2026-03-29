@@ -28,10 +28,10 @@ distributed counters (strict and lax) and rate limiting, all backed by Redis.
 
 ## Feature flags
 
-| Feature | Default | Description |
-|---|---|---|
-| `counter` | **yes** | Distributed counters (`StrictCounter`, `LaxCounter`) |
-| `trypema` | no | Rate limiting via the [trypema](https://docs.rs/trypema) crate |
+| Feature   | Default | Description                                                    |
+| --------- | ------- | -------------------------------------------------------------- |
+| `counter` | **yes** | Distributed counters (`StrictCounter`, `LaxCounter`)           |
+| `trypema` | no      | Rate limiting via the [trypema](https://docs.rs/trypema) crate |
 
 ## Installation
 
@@ -124,6 +124,8 @@ Enable the `trypema` feature to access sliding-window rate limiting with three
 provider options (local, Redis-backed, hybrid) and two strategies (absolute,
 suppressed). All types from the [trypema](https://docs.rs/trypema)
 crate are re-exported under `distkit::trypema`.
+
+Trypema documentation website: <https://trypema.davidoyinbo.com>
 
 ```rust
 use std::sync::Arc;
