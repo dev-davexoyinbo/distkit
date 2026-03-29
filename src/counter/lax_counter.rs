@@ -32,6 +32,17 @@ const COMMIT_STATE_LUA: &str = r#"
     redis.call('HINCRBY', container_key, key, count)
 "#;
 
+const DEL_LUA: &str = r#"
+    local container_key = KEYS[1]
+    local key = KEYS[2]
+
+    local total = redis.call('HGET', container_key, key) or 0
+
+    redis.call('HDEL', container_key, key)
+
+    return total
+"#;
+
 #[derive(Debug)]
 struct Commit {
     key: RedisKey,
@@ -55,6 +66,10 @@ pub struct LaxCounter {
     get_script: Script,
     allowed_lag: Duration,
     commit_state_script: Script,
+    del_script: Script,
+
+    // Flush states
+    batch: tokio::sync::Mutex<Vec<Commit>>,
 
     // Active flags
     epoch: AtomicU64,
@@ -67,6 +82,7 @@ impl LaxCounter {
         let key_generator = RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::LaxCounter);
 
         let get_script = Script::new(GET_LUA);
+        let del_script = Script::new(DEL_LUA);
         let commit_state_script = Script::new(COMMIT_STATE_LUA);
         let is_active_watch = watch::Sender::new(0u64);
 
@@ -75,9 +91,11 @@ impl LaxCounter {
             key_generator,
             store: DashMap::default(),
             get_script,
+            del_script,
             allowed_lag: Duration::from_millis(20),
             locks: DashMap::default(),
             commit_state_script,
+            batch: tokio::sync::Mutex::new(Vec::new()),
             epoch: AtomicU64::new(0),
             last_commited_epoch: AtomicU64::new(0),
             is_active_watch,
@@ -139,7 +157,7 @@ impl LaxCounter {
             });
 
             async move {
-                let mut batch = Vec::new();
+                // let mut batch = Vec::new();
                 let mut interval = tokio::time::interval(allowed_lag);
                 interval.tick().await;
 
@@ -158,6 +176,8 @@ impl LaxCounter {
                         Some(counter) => counter,
                         None => break,
                     };
+
+                    let mut batch = counter.batch.lock().await;
 
                     for entry in counter.store.iter() {
                         let key = entry.key();
@@ -450,11 +470,35 @@ impl CounterTrait for LaxCounter {
 
     async fn del(&self, key: &RedisKey) -> Result<i64, DistkitError> {
         self.send_epoch_change_if_needed();
-        todo!()
+
+        let lock = self.get_or_create_lock(key).await;
+        let _guard = lock.lock().await;
+
+        {
+            let mut batch = self.batch.lock().await;
+            batch.retain(|commit| commit.key != *key);
+        }
+
+        let Some((_key, store)) = self.store.remove(key) else {
+            return Ok(0);
+        };
+
+        let mut conn = self.connection_manager.clone();
+
+        let total: i64 = self
+            .del_script
+            .key(self.key_generator.container_key())
+            .key(key.to_string())
+            .invoke_async(&mut conn)
+            .await?;
+
+        let total = total + store.delta.swap(0, Ordering::AcqRel);
+
+        Ok(total)
     } // end function delete
 
     async fn clear(&self) -> Result<(), DistkitError> {
         self.send_epoch_change_if_needed();
         todo!()
-    }
+    } // end function clear
 } // end impl CounterTrait for LaxCounter
