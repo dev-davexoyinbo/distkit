@@ -8,6 +8,7 @@ pub enum DistkitError {
     #[error("Invalid Redis key: {0}")]
     InvalidRedisKey(String),
     /// A counter-specific error. See [`CounterError`].
+    #[cfg(feature = "counter")]
     #[error("Counter Error: {0}")]
     CounterError(#[from] CounterError),
     /// A Redis operation failed (connection lost, script error, etc.).

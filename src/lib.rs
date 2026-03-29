@@ -4,7 +4,9 @@
 #![forbid(unsafe_code)]
 
 mod common;
+#[cfg(feature = "counter")]
 pub use common::*;
+#[cfg(feature = "counter")]
 pub mod counter;
 
 mod error;

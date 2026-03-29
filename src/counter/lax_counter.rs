@@ -13,7 +13,7 @@ use tokio::{sync::watch, task::JoinHandle, time::Instant};
 
 use crate::{
     DistkitError, RedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
-    counter::{CounterOptions, CounterTrait, common::EPOCH_CHANGE_INTERVAL},
+    counter::{CounterError, CounterOptions, CounterTrait, common::EPOCH_CHANGE_INTERVAL},
     mutex_lock,
 };
 
@@ -275,9 +275,9 @@ impl LaxCounter {
             let end = (processed + max_batch_size).min(batch.len());
             let chunk = &batch[processed..end];
 
-            self.batch_commit_state(chunk).await.map_err(|err| {
-                DistkitError::CustomError(format!("Failed to commit state: {err:?}"))
-            })?;
+            self.batch_commit_state(chunk)
+                .await
+                .map_err(|err| CounterError::CommitToRedisFailed(format!("{err:?}")))?;
 
             processed = end;
         }

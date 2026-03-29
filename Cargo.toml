@@ -11,6 +11,27 @@ readme = "README.md"
 categories = ["algorithms", "concurrency", "data-structures"]
 keywords = ["distributed", "counter", "redis", "async", "eventual-consistency"]
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+# opt-level = 3
+# opt-level = "z"
+# opt-level = "s"
+opt-level = 3
+# strip = "debuginfo"
+strip = "symbols"
+
+
+[package.metadata.docs.rs]
+# features = ["redis-tokio"]
+default-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["counter"]
+counter = []
+
+
 [dependencies]
 async-trait = "0.1.89"
 dashmap = "6.1.0"
