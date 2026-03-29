@@ -9,6 +9,7 @@ use crate::DistkitError;
 pub struct RedisKey(String);
 
 impl RedisKey {
+    #[cfg(test)]
     pub(crate) fn from(value: String) -> Self {
         Self(value)
     }
@@ -71,10 +72,6 @@ impl RedisKeyGenerator {
 
     pub(crate) fn container_key(&self) -> String {
         format!("{}:{}", *self.prefix, self.key_type)
-    }
-
-    pub(crate) fn member_key(&self, member: &RedisKey) -> String {
-        format!("{}:{}:{}", *self.prefix, self.key_type, **member)
     }
 }
 
