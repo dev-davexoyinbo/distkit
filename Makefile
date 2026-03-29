@@ -1,4 +1,4 @@
-.PHONY: help redis-up redis-down logs test
+.PHONY: help redis-up redis-down logs test bench
 
 REDIS_PORT ?= 16379
 REDIS_URL ?= redis://127.0.0.1:$(REDIS_PORT)/
@@ -37,6 +37,12 @@ test: ## Run tests
 	trap "$(MAKE) -s redis-down" EXIT; \
 	$(MAKE) -s redis-up; \
 	REDIS_URL="$(REDIS_URL)" cargo test
+
+bench: ## Run criterion benchmarks
+	@set -e; \
+	trap "$(MAKE) -s redis-down" EXIT; \
+	$(MAKE) -s redis-up; \
+	REDIS_URL="$(REDIS_URL)" cargo bench
 
 test-example: ## Run example tests
 	REDIS_URL="$(REDIS_URL)" cargo test value_is_eventually_flushed_to_redis -- --show-output

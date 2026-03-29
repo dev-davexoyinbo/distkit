@@ -1,11 +1,10 @@
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use redis::aio::ConnectionManager;
 
-use std::sync::Arc;
-
-use crate::{RedisKey, counter::{LaxCounter, StrictCounter}};
+use crate::{RedisKey, counter::{CounterOptions, LaxCounter, StrictCounter}};
 
 static RUN_ID: OnceLock<u128> = OnceLock::new();
 
@@ -18,34 +17,26 @@ fn run_id() -> u128 {
     })
 }
 
-pub async fn make_strict_counter(prefix: &str) -> StrictCounter {
+async fn make_connection() -> ConnectionManager {
     let url = std::env::var("REDIS_URL")
         .expect("REDIS_URL must be set — run via `make test`");
-
     let client = redis::Client::open(url).expect("valid Redis URL");
-
-    let conn: ConnectionManager = client
+    client
         .get_connection_manager()
         .await
-        .expect("Redis must be reachable");
+        .expect("Redis must be reachable")
+}
 
+pub async fn make_strict_counter(prefix: &str) -> StrictCounter {
+    let conn = make_connection().await;
     let unique_prefix = format!("{}_{}", run_id(), prefix);
-    StrictCounter::new(RedisKey::from(unique_prefix), conn)
+    StrictCounter::new(CounterOptions::new(RedisKey::from(unique_prefix), conn))
 }
 
 pub async fn make_lax_counter(prefix: &str) -> Arc<LaxCounter> {
-    let url = std::env::var("REDIS_URL")
-        .expect("REDIS_URL must be set — run via `make test`");
-
-    let client = redis::Client::open(url).expect("valid Redis URL");
-
-    let conn: ConnectionManager = client
-        .get_connection_manager()
-        .await
-        .expect("Redis must be reachable");
-
+    let conn = make_connection().await;
     let unique_prefix = format!("{}_{}", run_id(), prefix);
-    LaxCounter::new(RedisKey::from(unique_prefix), conn)
+    LaxCounter::new(CounterOptions::new(RedisKey::from(unique_prefix), conn))
 }
 
 pub fn key(name: &str) -> RedisKey {

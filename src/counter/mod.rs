@@ -27,6 +27,16 @@ pub struct CounterOptions {
     allowed_lag: Duration,
 }
 
+impl CounterOptions {
+    pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
+        Self {
+            prefix,
+            connection_manager,
+            allowed_lag: Duration::from_millis(20),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Counter {
     lax: Arc<LaxCounter>,

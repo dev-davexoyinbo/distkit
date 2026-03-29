@@ -12,3 +12,14 @@ strum_macros = "0.28.0"
 thiserror = "2.0.18"
 tokio = { version = "1.50.0", features = ["full"] }
 tracing = "0.1.44"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "strict_counter"
+harness = false
+
+[[bench]]
+name = "lax_counter"
+harness = false
