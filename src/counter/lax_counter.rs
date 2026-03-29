@@ -31,6 +31,7 @@ const COMMIT_STATE_LUA: &str = r#"
     redis.call('HINCRBY', container_key, key, count)
 "#;
 
+#[derive(Debug)]
 struct Commit {
     key: RedisKey,
     delta: i64,
@@ -101,6 +102,10 @@ impl LaxCounter {
                         let key = entry.key();
                         let store = entry.value();
 
+                        if store.delta.load(Ordering::Acquire) == 0 {
+                            continue;
+                        }
+
                         let last_flushed = mutex_lock(&store.last_flushed, "last_flushed")
                             .map(|el| *el)
                             .unwrap_or(None);
@@ -122,9 +127,11 @@ impl LaxCounter {
 
                         batch.push(Commit {
                             key: key.clone(),
-                            delta: store.delta.load(Ordering::Acquire),
+                            delta,
                         });
                     }
+
+                    eprintln!("batch: {batch:?}");
 
                     if let Err(err) = counter.flush_to_redis(&mut batch, 100).await {
                         tracing::error!("Failed to flush to redis: {err:?}");
@@ -359,8 +366,7 @@ impl CounterTrait for LaxCounter {
             }
         };
 
-        let delta = store.delta.load(Ordering::Acquire);
-        let total = store.remote_total.load(Ordering::Acquire) + delta;
+        let total = store.remote_total.load(Ordering::Acquire);
 
         store.delta.store(count - total, Ordering::Release);
 

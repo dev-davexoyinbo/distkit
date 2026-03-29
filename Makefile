@@ -37,3 +37,6 @@ test: ## Run tests
 	trap "$(MAKE) -s redis-down" EXIT; \
 	$(MAKE) -s redis-up; \
 	REDIS_URL="$(REDIS_URL)" cargo test
+
+test-example: ## Run example tests
+	REDIS_URL="$(REDIS_URL)" cargo test value_is_eventually_flushed_to_redis -- --show-output
