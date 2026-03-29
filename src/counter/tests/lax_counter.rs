@@ -227,3 +227,111 @@ async fn value_is_eventually_flushed_to_redis() {
     let fresh = make_lax_counter(prefix).await;
     assert_eq!(fresh.get(&k).await.unwrap(), 42);
 }
+
+// ---------------------------------------------------------------------------
+// del
+// ---------------------------------------------------------------------------
+
+/// A key with no local store entry (never touched) returns 0 without hitting Redis.
+#[tokio::test]
+async fn del_on_never_touched_key_returns_zero() {
+    let counter = make_lax_counter("lax_del_never_touched").await;
+    let result = counter.del(&key("ghost")).await.unwrap();
+    assert_eq!(result, 0);
+}
+
+/// del before the flush runs returns the full value including the unflushed delta.
+#[tokio::test]
+async fn del_returns_value_including_unflushed_delta() {
+    let counter = make_lax_counter("lax_del_unflushed").await;
+    let k = key("val");
+
+    counter.inc(&k, 10).await.unwrap();
+
+    // Delete immediately — Redis still has 0, delta is 10; total must be 10.
+    let returned = counter.del(&k).await.unwrap();
+    assert_eq!(returned, 10);
+}
+
+/// del after the flush has run returns the committed Redis value.
+#[tokio::test]
+async fn del_returns_value_after_flush() {
+    let counter = make_lax_counter("lax_del_after_flush").await;
+    let k = key("val");
+
+    counter.inc(&k, 10).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // After flush: Redis has 10, delta is 0; total must still be 10.
+    let returned = counter.del(&k).await.unwrap();
+    assert_eq!(returned, 10);
+}
+
+/// After del, get re-fetches from Redis and returns 0.
+#[tokio::test]
+async fn del_removes_the_key() {
+    let counter = make_lax_counter("lax_del_removes").await;
+    let k = key("val");
+
+    counter.inc(&k, 5).await.unwrap();
+    counter.del(&k).await.unwrap();
+
+    assert_eq!(counter.get(&k).await.unwrap(), 0);
+}
+
+/// A second del on the same key has no store entry and returns 0.
+#[tokio::test]
+async fn del_twice_returns_zero_on_second_call() {
+    let counter = make_lax_counter("lax_del_twice").await;
+    let k = key("val");
+
+    counter.inc(&k, 7).await.unwrap();
+    counter.del(&k).await.unwrap();
+
+    let second = counter.del(&k).await.unwrap();
+    assert_eq!(second, 0);
+}
+
+/// del purges the pending batch entry so no stale write reaches Redis after deletion.
+#[tokio::test]
+async fn del_cancels_pending_flush() {
+    let prefix = "lax_del_cancel_flush";
+    let k = key("val");
+
+    let counter = make_lax_counter(prefix).await;
+    counter.inc(&k, 42).await.unwrap();
+    counter.del(&k).await.unwrap();
+
+    // Wait for multiple flush cycles — the purged commit must not reach Redis.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let fresh = make_lax_counter(prefix).await;
+    assert_eq!(fresh.get(&k).await.unwrap(), 0);
+}
+
+/// del only removes the targeted key; sibling keys are unaffected.
+#[tokio::test]
+async fn del_does_not_affect_sibling_keys() {
+    let counter = make_lax_counter("lax_del_sibling").await;
+    let k_a = key("a");
+    let k_b = key("b");
+
+    counter.inc(&k_a, 5).await.unwrap();
+    counter.inc(&k_b, 20).await.unwrap();
+    counter.del(&k_a).await.unwrap();
+
+    assert_eq!(counter.get(&k_b).await.unwrap(), 20);
+}
+
+/// After del, inc on the same key starts fresh from 0.
+#[tokio::test]
+async fn del_then_inc_starts_fresh() {
+    let counter = make_lax_counter("lax_del_then_inc").await;
+    let k = key("val");
+
+    counter.inc(&k, 99).await.unwrap();
+    counter.del(&k).await.unwrap();
+
+    let result = counter.inc(&k, 1).await.unwrap();
+    assert_eq!(result, 1);
+}
