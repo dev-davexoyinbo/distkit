@@ -5,6 +5,13 @@ use std::{
 
 use crate::DistkitError;
 
+/// A validated Redis key.
+///
+/// Keys must be non-empty, at most 255 characters, and must not contain
+/// colons (`:`). Construct via [`TryFrom<String>`].
+///
+/// `RedisKey` dereferences to [`String`], so all string methods are
+/// available through auto-deref.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Hash, Eq)]
 pub struct RedisKey(String);
 

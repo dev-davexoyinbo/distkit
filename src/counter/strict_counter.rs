@@ -46,6 +46,11 @@ const CLEAR_LUA: &str = r#"
     redis.call('DEL', container_key)
 "#;
 
+/// Immediately consistent counter backed by Redis Lua scripts.
+///
+/// Every operation executes a single atomic Lua script against a Redis hash,
+/// guaranteeing that reads always reflect the latest write. Latency is
+/// dominated by the network round-trip to Redis.
 #[derive(Debug)]
 pub struct StrictCounter {
     connection_manager: ConnectionManager,
@@ -58,6 +63,7 @@ pub struct StrictCounter {
 }
 
 impl StrictCounter {
+    /// Creates a new strict counter from the given options.
     pub fn new(options: CounterOptions) -> Self {
         let CounterOptions {
             prefix,

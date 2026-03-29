@@ -1,3 +1,10 @@
+//! Distributed counter implementations.
+//!
+//! This module provides [`StrictCounter`] (immediate consistency) and
+//! [`LaxCounter`] (eventual consistency with in-memory buffering). Both
+//! implement [`CounterTrait`]. Use [`Counter`] as a facade to access both
+//! from a single configuration.
+
 mod lax_counter;
 use std::{sync::Arc, time::Duration};
 
@@ -20,14 +27,20 @@ use crate::RedisKey;
 #[cfg(test)]
 mod tests;
 
+/// Configuration for counter construction.
+///
+/// Carries a Redis key prefix, a connection manager, and the `allowed_lag`
+/// duration used by [`LaxCounter`] to control how long local state is
+/// considered fresh before re-fetching from Redis.
 #[derive(Debug, Clone)]
 pub struct CounterOptions {
-    prefix: RedisKey,
-    connection_manager: ConnectionManager,
-    allowed_lag: Duration,
+    pub(crate) prefix: RedisKey,
+    pub(crate) connection_manager: ConnectionManager,
+    pub(crate) allowed_lag: Duration,
 }
 
 impl CounterOptions {
+    /// Creates counter options with a default `allowed_lag` of 20 ms.
     pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
         Self {
             prefix,
@@ -37,6 +50,8 @@ impl CounterOptions {
     }
 }
 
+/// Facade providing access to both [`StrictCounter`] and [`LaxCounter`]
+/// instances that share the same Redis prefix.
 #[derive(Debug, Clone)]
 pub struct Counter {
     lax: Arc<LaxCounter>,
@@ -44,18 +59,21 @@ pub struct Counter {
 }
 
 impl Counter {
+    /// Creates both counter types from the given options.
     pub fn new(options: CounterOptions) -> Self {
         Self {
             strict: Arc::new(StrictCounter::new(options.clone())),
             lax: LaxCounter::new(options.clone()),
         }
-    } // end new
+    }
 
+    /// Returns a reference to the [`LaxCounter`] (eventual consistency).
     pub fn lax(&self) -> &LaxCounter {
         &self.lax
-    } // end function lax
+    }
 
+    /// Returns a reference to the [`StrictCounter`] (immediate consistency).
     pub fn strict(&self) -> &StrictCounter {
         &self.strict
-    } // end function strict
-} // end impl Counter
+    }
+}

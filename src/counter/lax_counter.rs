@@ -62,6 +62,18 @@ struct SingleStore {
     last_flushed: Mutex<Option<Instant>>,
 }
 
+/// Eventually consistent counter with in-memory buffering.
+///
+/// Writes are buffered in a local [`DashMap`] and flushed to Redis in
+/// batched pipelines every `allowed_lag` (default 20 ms). Reads return the
+/// local view (`remote_total + pending_delta`), which is always up-to-date
+/// within the same process.
+///
+/// A background Tokio task handles flushing. It holds a [`Weak`](std::sync::Weak)
+/// reference to the counter, so it stops automatically when the counter is
+/// dropped.
+///
+/// Construct via [`LaxCounter::new`], which returns an `Arc<LaxCounter>`.
 #[derive(Debug)]
 pub struct LaxCounter {
     connection_manager: ConnectionManager,
@@ -84,6 +96,7 @@ pub struct LaxCounter {
 }
 
 impl LaxCounter {
+    /// Creates a new lax counter and spawns its background flush task.
     pub fn new(options: CounterOptions) -> Arc<Self> {
         let CounterOptions {
             prefix,
