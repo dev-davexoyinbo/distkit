@@ -335,3 +335,92 @@ async fn del_then_inc_starts_fresh() {
     let result = counter.inc(&k, 1).await.unwrap();
     assert_eq!(result, 1);
 }
+
+// ---------------------------------------------------------------------------
+// clear
+// ---------------------------------------------------------------------------
+
+/// clear causes all member keys to return 0 afterwards.
+#[tokio::test]
+async fn clear_removes_all_member_keys() {
+    let counter = make_lax_counter("lax_clear_all").await;
+    let k_a = key("x");
+    let k_b = key("y");
+    let k_c = key("z");
+
+    counter.inc(&k_a, 1).await.unwrap();
+    counter.inc(&k_b, 2).await.unwrap();
+    counter.inc(&k_c, 3).await.unwrap();
+
+    counter.clear().await.unwrap();
+
+    assert_eq!(counter.get(&k_a).await.unwrap(), 0);
+    assert_eq!(counter.get(&k_b).await.unwrap(), 0);
+    assert_eq!(counter.get(&k_c).await.unwrap(), 0);
+}
+
+/// clear on a prefix with no written keys does not error.
+#[tokio::test]
+async fn clear_on_empty_prefix_does_not_error() {
+    let counter = make_lax_counter("lax_clear_empty").await;
+    counter.clear().await.unwrap();
+}
+
+/// clear on one prefix does not affect a counter with a different prefix.
+#[tokio::test]
+async fn clear_does_not_affect_other_prefixes() {
+    let counter_a = make_lax_counter("lax_clear_isolation_a").await;
+    let counter_b = make_lax_counter("lax_clear_isolation_b").await;
+    let k = key("val");
+
+    counter_a.inc(&k, 10).await.unwrap();
+    counter_b.inc(&k, 99).await.unwrap();
+
+    counter_a.clear().await.unwrap();
+
+    assert_eq!(counter_b.get(&k).await.unwrap(), 99);
+}
+
+/// clear is reflected immediately on the same instance without waiting for a flush.
+#[tokio::test]
+async fn clear_is_visible_immediately_on_same_instance() {
+    let counter = make_lax_counter("lax_clear_immediate").await;
+    let k_a = key("a");
+    let k_b = key("b");
+
+    counter.inc(&k_a, 5).await.unwrap();
+    counter.inc(&k_b, 20).await.unwrap();
+    counter.clear().await.unwrap();
+
+    assert_eq!(counter.get(&k_a).await.unwrap(), 0);
+    assert_eq!(counter.get(&k_b).await.unwrap(), 0);
+}
+
+/// clear purges the pending batch so no stale write reaches Redis afterwards.
+#[tokio::test]
+async fn clear_cancels_pending_flush() {
+    let prefix = "lax_clear_cancel_flush";
+    let k = key("val");
+
+    let counter = make_lax_counter(prefix).await;
+    counter.inc(&k, 42).await.unwrap();
+    counter.clear().await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let fresh = make_lax_counter(prefix).await;
+    assert_eq!(fresh.get(&k).await.unwrap(), 0);
+}
+
+/// After clear, inc on the same key starts fresh from 0.
+#[tokio::test]
+async fn clear_then_inc_starts_fresh() {
+    let counter = make_lax_counter("lax_clear_then_inc").await;
+    let k = key("val");
+
+    counter.inc(&k, 99).await.unwrap();
+    counter.clear().await.unwrap();
+
+    let result = counter.inc(&k, 1).await.unwrap();
+    assert_eq!(result, 1);
+}
