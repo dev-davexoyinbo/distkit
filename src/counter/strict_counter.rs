@@ -1,7 +1,8 @@
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
-    DistkitError, RedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey, counter::CounterTrait,
+    DistkitError, RedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
+    counter::{CounterOptions, CounterTrait},
 };
 
 const INC_LUA: &str = r#"
@@ -57,7 +58,13 @@ pub struct StrictCounter {
 }
 
 impl StrictCounter {
-    pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
+    pub fn new(options: CounterOptions) -> Self {
+        let CounterOptions {
+            prefix,
+            connection_manager,
+            ..
+        } = options;
+
         let key_generator = RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::StrictCounter);
         let inc_script = Script::new(INC_LUA);
         let get_script = Script::new(GET_LUA);

@@ -13,7 +13,7 @@ use tokio::{sync::watch, task::JoinHandle, time::Instant};
 
 use crate::{
     DistkitError, RedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
-    counter::{CounterTrait, common::EPOCH_CHANGE_INTERVAL},
+    counter::{CounterOptions, CounterTrait, common::EPOCH_CHANGE_INTERVAL},
     mutex_lock,
 };
 
@@ -84,7 +84,12 @@ pub struct LaxCounter {
 }
 
 impl LaxCounter {
-    pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Arc<Self> {
+    pub fn new(options: CounterOptions) -> Arc<Self> {
+        let CounterOptions {
+            prefix,
+            connection_manager,
+            allowed_lag,
+        } = options;
         let key_generator = RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::LaxCounter);
 
         let get_script = Script::new(GET_LUA);
@@ -101,7 +106,7 @@ impl LaxCounter {
             get_script,
             del_script,
             clear_script,
-            allowed_lag: Duration::from_millis(20),
+            allowed_lag,
             locks: DashMap::default(),
             commit_state_script,
             batch: tokio::sync::Mutex::new(Vec::new()),
@@ -508,21 +513,6 @@ impl CounterTrait for LaxCounter {
 
     async fn clear(&self) -> Result<(), DistkitError> {
         self.send_epoch_change_if_needed();
-        // let mut keys: Vec<RedisKey> = Vec::with_capacity(self.store.len());
-        //
-        // for entry in self.store.iter() {
-        //     keys.push(entry.key().clone());
-        // }
-        //
-        // let mut locks = Vec::new();
-        // for key in keys.iter() {
-        //     locks.push(self.get_or_create_lock(key).await);
-        // }
-        //
-        // let mut guards = Vec::new();
-        // for lock in locks.iter() {
-        //     guards.push(lock.lock().await);
-        // }
 
         self.store.clear();
 

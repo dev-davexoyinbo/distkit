@@ -1,5 +1,5 @@
 mod lax_counter;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 pub use lax_counter::*;
 
@@ -21,19 +21,23 @@ use crate::RedisKey;
 mod tests;
 
 #[derive(Debug, Clone)]
+pub struct CounterOptions {
+    prefix: RedisKey,
+    connection_manager: ConnectionManager,
+    allowed_lag: Duration,
+}
+
+#[derive(Debug, Clone)]
 pub struct Counter {
     lax: Arc<LaxCounter>,
     strict: Arc<StrictCounter>,
 }
 
 impl Counter {
-    pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
+    pub fn new(options: CounterOptions) -> Self {
         Self {
-            strict: Arc::new(StrictCounter::new(
-                prefix.clone(),
-                connection_manager.clone(),
-            )),
-            lax: LaxCounter::new(prefix, connection_manager.clone()),
+            strict: Arc::new(StrictCounter::new(options.clone())),
+            lax: LaxCounter::new(options.clone()),
         }
     } // end new
 
