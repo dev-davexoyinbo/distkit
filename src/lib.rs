@@ -9,8 +9,13 @@ pub use common::*;
 #[cfg(feature = "counter")]
 pub mod counter;
 
-/// Trypema integration.
+/// Rate limiting via the [`trypema`](http://trypema.davidoyinbo.com/) crate.
+///
+/// This module re-exports all public types from `trypema`, providing
+/// sliding-window rate limiting with local, Redis-backed, and hybrid
+/// providers. Enable the `trypema` feature to use this module.
 #[cfg(feature = "trypema")]
+#[cfg_attr(docsrs, doc(cfg(feature = "trypema")))]
 pub mod trypema;
 
 mod error;

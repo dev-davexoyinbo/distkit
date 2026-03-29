@@ -8,10 +8,8 @@ A toolkit of distributed systems primitives for Rust, backed by Redis.
 
 ## What is distkit?
 
-distkit provides building blocks for distributed applications. It currently
-ships two counter implementations that share a common async trait, letting you
-choose between immediate consistency and high-throughput eventual consistency
-depending on your use case.
+distkit provides building blocks for distributed applications. It ships
+distributed counters (strict and lax) and rate limiting, all backed by Redis.
 
 ## Features
 
@@ -19,11 +17,21 @@ depending on your use case.
   Reads always reflect the latest write. Best for billing, inventory, or
   anything where accuracy is critical.
 - **LaxCounter** -- buffers increments in memory and flushes to Redis every
-  ~20 ms. Sub-microsecond latency on the hot path. Best for analytics, rate
-  limiting, and high-throughput metrics.
+  ~20 ms. Sub-microsecond latency on the hot path. Best for analytics and
+  high-throughput metrics.
 - **Shared trait** -- both counters implement `CounterTrait`, so generic code
   works with either.
+- **Rate limiting** (opt-in `trypema` feature) -- sliding-window rate limiting
+  with local, Redis-backed, and hybrid providers. Supports absolute and
+  probabilistic suppression strategies.
 - **Safe by default** -- `#![forbid(unsafe_code)]`, no panics in library code.
+
+## Feature flags
+
+| Feature | Default | Description |
+|---|---|---|
+| `counter` | **yes** | Distributed counters (`StrictCounter`, `LaxCounter`) |
+| `trypema` | no | Rate limiting via the [trypema](http://trypema.davidoyinbo.com/) crate |
 
 ## Installation
 
@@ -36,6 +44,13 @@ Or add to `Cargo.toml`:
 ```toml
 [dependencies]
 distkit = "0.1"
+```
+
+To enable rate limiting:
+
+```toml
+[dependencies]
+distkit = { version = "0.1", features = ["trypema"] }
 ```
 
 distkit requires a running Redis instance (5.0+ for Lua script support).
@@ -103,6 +118,47 @@ let val = counter.lax().get(&key).await?; // reads local state, no Redis hit
 A background Tokio task handles flushing. It holds a `Weak` reference to the
 counter, so it stops automatically when the counter is dropped.
 
+### Rate limiting (trypema)
+
+Enable the `trypema` feature to access sliding-window rate limiting with three
+provider options (local, Redis-backed, hybrid) and two strategies (absolute,
+suppressed). All types from the [trypema](http://trypema.davidoyinbo.com/)
+crate are re-exported under `distkit::trypema`.
+
+```rust
+use std::sync::Arc;
+use distkit::trypema::{
+    HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision,
+    RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
+    local::LocalRateLimiterOptions,
+};
+
+let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
+    local: LocalRateLimiterOptions {
+        window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+        rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+        hard_limit_factor: HardLimitFactor::default(),
+        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+    },
+}));
+
+rl.run_cleanup_loop();
+
+let rate = RateLimit::try_from(10.0).unwrap(); // 10 req/s
+
+match rl.local().absolute().inc("user_123", &rate, 1) {
+    RateLimitDecision::Allowed => { /* process request */ }
+    RateLimitDecision::Rejected { retry_after_ms, .. } => {
+        eprintln!("Rate limited, retry in {retry_after_ms} ms");
+    }
+    _ => {}
+}
+```
+
+For distributed enforcement, enable the Redis provider and use
+`rl.redis()` or `rl.hybrid()`. See the
+[trypema documentation](http://trypema.davidoyinbo.com/) for full details.
+
 ## Development
 
 ### Prerequisites
@@ -119,9 +175,8 @@ make redis-up   # Start Redis on port 16379
 make redis-down # Stop Redis and remove volumes
 ```
 
-Tests and benchmarks read the `REDIS_URL` environment variable
-(default: `redis://127.0.0.1:16379/`). The `make` targets handle this
-automatically.
+Tests and benchmarks require the `REDIS_URL` environment variable.
+The `make` targets set this automatically.
 
 ## License
 

@@ -1,5 +1,7 @@
+#[cfg(feature = "trypema")]
 use trypema_crate::TrypemaError;
 
+#[cfg(feature = "counter")]
 use crate::counter::CounterError;
 
 /// Top-level error type for all distkit operations.
@@ -23,8 +25,10 @@ pub enum DistkitError {
     #[error("Custom Error: {0}")]
     CustomError(String),
 
-    /// An error that should never occur.
+    /// A rate-limiting operation failed. See
+    /// [`TrypemaError`](trypema_crate::TrypemaError) for details.
     #[cfg(feature = "trypema")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "trypema")))]
     #[error("Trypema Error: {0}")]
     TrypemaError(#[from] TrypemaError),
 }

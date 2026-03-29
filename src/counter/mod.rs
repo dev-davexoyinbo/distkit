@@ -34,8 +34,12 @@ mod tests;
 /// considered fresh before re-fetching from Redis.
 #[derive(Debug, Clone)]
 pub struct CounterOptions {
+    /// Redis key prefix used to namespace all counter keys.
     pub prefix: RedisKey,
+    /// Redis connection manager for executing commands.
     pub connection_manager: ConnectionManager,
+    /// Maximum acceptable staleness for [`LaxCounter`] reads (default 20 ms).
+    /// Controls how often the background task flushes buffered writes to Redis.
     pub allowed_lag: Duration,
 }
 

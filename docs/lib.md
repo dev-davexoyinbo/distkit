@@ -1,8 +1,21 @@
 A toolkit of distributed systems primitives for Rust, backed by Redis.
 
-`distkit` provides battle-tested building blocks for distributed applications.
-At its core are two counter implementations that let you choose between
-immediate consistency and high-throughput eventual consistency.
+`distkit` provides building blocks for distributed applications. The crate
+currently offers two modules:
+
+- **Counters** (`counter` feature, enabled by default) -- two counter
+  implementations that share a common async trait, letting you choose between
+  immediate consistency and high-throughput eventual consistency.
+- **Rate limiting** (`trypema` feature, opt-in) -- re-exports the
+  [`trypema`](http://trypema.davidoyinbo.com/) crate, providing sliding-window rate
+  limiting with local, Redis-backed, and hybrid providers.
+
+# Feature flags
+
+| Feature | Default | Description |
+|---|---|---|
+| `counter` | **yes** | Distributed counters ([`StrictCounter`], [`LaxCounter`]) |
+| `trypema` | no | Rate limiting via the [`trypema`](http://trypema.davidoyinbo.com/) crate |
 
 # Quick start
 
@@ -65,11 +78,13 @@ All fallible operations return [`DistkitError`]:
   empty, longer than 255 characters, or contains a colon.
 - **`RedisError`** -- A Redis operation failed (connection lost, script error,
   etc.). Wraps [`redis::RedisError`].
-- **`CounterError`** -- Reserved for future counter-specific error variants.
+- **`CounterError`** -- A counter operation failed (e.g., a batch flush could
+  not commit state to Redis).
 - **`MutexPoisoned`** -- An internal lock was poisoned. This indicates a
   previous panic inside a critical section.
-- **`CustomError`** -- Catch-all for internal errors (e.g., batch flush failures
-  in [`LaxCounter`]).
+- **`CustomError`** -- Catch-all for internal errors.
+- **`TrypemaError`** -- A rate-limiting operation failed (only present with the
+  `trypema` feature).
 
 # Redis storage model
 
@@ -87,6 +102,162 @@ deltas to the same hash structure using `HINCRBY` in batched pipelines.
 
 Both counter types sharing the same prefix occupy **separate** hash keys
 (different type suffixes), so they never interfere with each other.
+
+# Rate limiting (trypema)
+
+Enable the `trypema` feature to access distributed rate limiting:
+
+```toml
+[dependencies]
+distkit = { version = "0.1", features = ["trypema"] }
+```
+
+All public types from the [`trypema`](http://trypema.davidoyinbo.com/) crate are
+re-exported under `distkit::trypema`. The module provides:
+
+- **Sliding-window rate limiting** with configurable window size and rate.
+- **Three providers** -- local (in-process via `DashMap`), Redis-backed
+  (distributed enforcement via Lua scripts), and hybrid (local fast-path
+  with periodic Redis sync).
+- **Two strategies** -- absolute (binary allow/reject) and suppressed
+  (probabilistic degradation that smoothly ramps rejection probability).
+
+## Local rate limiting (absolute)
+
+Use the local provider for in-process rate limiting with sub-microsecond
+latency. The absolute strategy gives a deterministic allow/reject decision.
+
+```rust,no_run
+# use std::sync::Arc;
+# use distkit::trypema::{
+#     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision,
+#     RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
+#     local::LocalRateLimiterOptions,
+# };
+# fn example() {
+let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
+    local: LocalRateLimiterOptions {
+        window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+        rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+        hard_limit_factor: HardLimitFactor::default(),
+        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+    },
+}));
+
+// Optional: start background cleanup for stale keys
+rl.run_cleanup_loop();
+
+let rate = RateLimit::try_from(10.0).unwrap(); // 10 requests per second
+
+match rl.local().absolute().inc("user_123", &rate, 1) {
+    RateLimitDecision::Allowed => {
+        // Process the request
+    }
+    RateLimitDecision::Rejected { retry_after_ms, .. } => {
+        // Back off and retry later
+        eprintln!("Rate limited, retry in {retry_after_ms} ms");
+    }
+    _ => {}
+}
+# }
+```
+
+## Local rate limiting (suppressed)
+
+The suppressed strategy smoothly ramps rejection probability as load
+approaches the limit, instead of a hard cutoff.
+
+```rust,no_run
+# use std::sync::Arc;
+# use distkit::trypema::{
+#     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision,
+#     RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
+#     local::LocalRateLimiterOptions,
+# };
+# fn example() {
+# let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
+#     local: LocalRateLimiterOptions {
+#         window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+#         rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+#         hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(),
+#         suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+#     },
+# }));
+let rate = RateLimit::try_from(100.0).unwrap();
+
+match rl.local().suppressed().inc("api_endpoint", &rate, 1) {
+    RateLimitDecision::Allowed => {
+        // Well under the limit
+    }
+    RateLimitDecision::Suppressed { is_allowed, suppression_factor } => {
+        if is_allowed {
+            // Approaching the limit but still admitted
+            tracing::info!("Suppression factor: {suppression_factor:.2}");
+        } else {
+            // Probabilistically rejected
+        }
+    }
+    RateLimitDecision::Rejected { .. } => {
+        // Over the hard limit (rate * hard_limit_factor)
+    }
+}
+# }
+```
+
+## Redis-backed rate limiting
+
+For distributed enforcement across multiple processes or servers, use the
+Redis provider. Each call executes an atomic Lua script.
+
+```rust,no_run
+# use std::sync::Arc;
+# use distkit::trypema::{
+#     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision,
+#     RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
+#     local::LocalRateLimiterOptions,
+#     redis::{RedisKey, RedisRateLimiterOptions},
+#     hybrid::SyncIntervalMs,
+# };
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+# let client = redis::Client::open("redis://127.0.0.1/")?;
+# let conn = client.get_connection_manager().await?;
+let window = WindowSizeSeconds::try_from(60)?;
+let bucket = RateGroupSizeMs::try_from(100)?;
+
+let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
+    local: LocalRateLimiterOptions {
+        window_size_seconds: window,
+        rate_group_size_ms: bucket,
+        hard_limit_factor: HardLimitFactor::default(),
+        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+    },
+    redis: RedisRateLimiterOptions {
+        connection_manager: conn,
+        prefix: None,
+        window_size_seconds: window,
+        rate_group_size_ms: bucket,
+        hard_limit_factor: HardLimitFactor::default(),
+        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+        sync_interval_ms: SyncIntervalMs::default(),
+    },
+}));
+
+rl.run_cleanup_loop();
+
+let key = RedisKey::try_from("user_123".to_string())?;
+let rate = RateLimit::try_from(50.0)?;
+
+// Distributed absolute enforcement
+let decision = rl.redis().absolute().inc(&key, &rate, 1).await?;
+
+// Or use the hybrid provider for local fast-path with Redis sync
+let decision = rl.hybrid().absolute().inc(&key, &rate, 1).await?;
+# Ok(())
+# }
+```
+
+See the [`trypema` documentation](http://trypema.davidoyinbo.com/) for full API
+details and advanced configuration.
 
 [`StrictCounter`]: counter::StrictCounter
 [`LaxCounter`]: counter::LaxCounter

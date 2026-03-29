@@ -26,6 +26,7 @@ strip = "symbols"
 # features = ["redis-tokio"]
 # default-features = true
 all-features = true
+# features = ["counter", "trypema"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
