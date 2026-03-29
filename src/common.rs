@@ -1,4 +1,7 @@
-use std::ops::{Deref, DerefMut};
+use std::{
+    ops::{Deref, DerefMut},
+    sync::Mutex,
+};
 
 use crate::DistkitError;
 
@@ -73,4 +76,11 @@ impl RedisKeyGenerator {
     pub(crate) fn member_key(&self, member: &RedisKey) -> String {
         format!("{}:{}:{}", *self.prefix, self.key_type, **member)
     }
+}
+
+pub(crate) fn mutex_lock<'a, T>(
+    m: &'a Mutex<T>,
+    what: &'static str,
+) -> Result<std::sync::MutexGuard<'a, T>, DistkitError> {
+    m.lock().map_err(|_| DistkitError::MutexPoisoned(what))
 }
