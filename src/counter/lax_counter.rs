@@ -2,17 +2,18 @@ use std::{
     ops::Deref,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use dashmap::DashMap;
 use redis::{Script, aio::ConnectionManager};
-use tokio::time::Instant;
+use tokio::{sync::watch, task::JoinHandle, time::Instant};
 
 use crate::{
-    DistkitError, RedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey, counter::CounterTrait,
+    DistkitError, RedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
+    counter::{CounterTrait, common::EPOCH_CHANGE_INTERVAL},
     mutex_lock,
 };
 
@@ -54,6 +55,11 @@ pub struct LaxCounter {
     get_script: Script,
     allowed_lag: Duration,
     commit_state_script: Script,
+
+    // Active flags
+    epoch: AtomicU64,
+    last_commited_epoch: AtomicU64,
+    is_active_watch: watch::Sender<u64>,
 }
 
 impl LaxCounter {
@@ -62,6 +68,7 @@ impl LaxCounter {
 
         let get_script = Script::new(GET_LUA);
         let commit_state_script = Script::new(COMMIT_STATE_LUA);
+        let is_active_watch = watch::Sender::new(0u64);
 
         let counter = Self {
             connection_manager,
@@ -71,19 +78,65 @@ impl LaxCounter {
             allowed_lag: Duration::from_millis(20),
             locks: DashMap::default(),
             commit_state_script,
+            epoch: AtomicU64::new(0),
+            last_commited_epoch: AtomicU64::new(0),
+            is_active_watch,
         };
 
         let counter = Arc::new(counter);
 
-        counter.clone().run_flush_task();
+        counter.run_flush_task();
+        counter.epoch_change_task();
 
         counter
     }
 
-    fn run_flush_task(self: Arc<Self>) {
+    fn epoch_change_task(self: &Arc<Self>) {
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+        let counter = Arc::downgrade(self);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(EPOCH_CHANGE_INTERVAL).await;
+                let Some(counter) = counter.upgrade() else {
+                    break;
+                };
+                counter.epoch.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
+    fn run_flush_task(self: &Arc<Self>) {
         tokio::spawn({
             let allowed_lag = self.allowed_lag;
-            let counter = Arc::downgrade(&self);
+            let counter = Arc::downgrade(self);
+            let is_active = Arc::new(AtomicBool::new(false));
+            let mut is_active_watch = self.is_active_watch.subscribe();
+
+            let is_active_cancel_task: JoinHandle<()> = tokio::spawn({
+                let is_active = is_active.clone();
+                let sleep_interval = EPOCH_CHANGE_INTERVAL / 2;
+                let mut is_active_watch = is_active_watch.clone();
+
+                async move {
+                    loop {
+                        tokio::time::sleep(sleep_interval).await;
+
+                        tokio::select! {
+                            val = is_active_watch.changed() => {
+                                if val.is_err() {
+                                    break;
+                                }
+
+                                is_active.store(true, Ordering::Release);
+                            }
+                            _ = tokio::time::sleep(sleep_interval) => {
+                                is_active.store(false, Ordering::Release);
+                            }
+                        }
+                    }
+                }
+            });
 
             async move {
                 let mut batch = Vec::new();
@@ -91,6 +144,14 @@ impl LaxCounter {
                 interval.tick().await;
 
                 loop {
+                    if !is_active.load(Ordering::Acquire) {
+                        if is_active_watch.changed().await.is_err() {
+                            break;
+                        }
+
+                        is_active.store(true, Ordering::Release);
+                    }
+
                     interval.tick().await;
 
                     let counter = match counter.upgrade() {
@@ -131,15 +192,25 @@ impl LaxCounter {
                         });
                     }
 
-                    eprintln!("batch: {batch:?}");
-
                     if let Err(err) = counter.flush_to_redis(&mut batch, 100).await {
                         tracing::error!("Failed to flush to redis: {err:?}");
                         continue;
                     }
                 }
+
+                drop(is_active_cancel_task);
             }
         });
+    }
+
+    #[inline(always)]
+    fn send_epoch_change_if_needed(&self) {
+        let epoch = self.epoch.load(Ordering::Relaxed);
+
+        if self.last_commited_epoch.load(Ordering::Relaxed) < epoch {
+            let _ = self.is_active_watch.send(epoch);
+            self.last_commited_epoch.store(epoch, Ordering::Relaxed);
+        }
     }
 
     async fn flush_to_redis(
@@ -280,6 +351,8 @@ impl LaxCounter {
 #[async_trait::async_trait]
 impl CounterTrait for LaxCounter {
     async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+        self.send_epoch_change_if_needed();
+
         let store = match self.store.get(key) {
             Some(store)
                 if mutex_lock(&store.last_updated, "last_updated")?.elapsed()
@@ -317,6 +390,7 @@ impl CounterTrait for LaxCounter {
     } // end function dec
 
     async fn get(&self, key: &RedisKey) -> Result<i64, DistkitError> {
+        self.send_epoch_change_if_needed();
         let store = match self.store.get(key) {
             Some(store)
                 if mutex_lock(&store.last_updated, "last_updated")?.elapsed()
@@ -345,6 +419,7 @@ impl CounterTrait for LaxCounter {
     } // end function get
 
     async fn set(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+        self.send_epoch_change_if_needed();
         let store = match self.store.get(key) {
             Some(store)
                 if mutex_lock(&store.last_updated, "last_updated")?.elapsed()
@@ -374,10 +449,12 @@ impl CounterTrait for LaxCounter {
     } // end function set
 
     async fn del(&self, key: &RedisKey) -> Result<i64, DistkitError> {
+        self.send_epoch_change_if_needed();
         todo!()
     } // end function delete
 
     async fn clear(&self) -> Result<(), DistkitError> {
+        self.send_epoch_change_if_needed();
         todo!()
     }
 } // end impl CounterTrait for LaxCounter
