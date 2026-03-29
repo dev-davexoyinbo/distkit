@@ -43,6 +43,11 @@ const DEL_LUA: &str = r#"
     return total
 "#;
 
+const CLEAR_LUA: &str = r#"
+    local container_key = KEYS[1]
+    redis.call('DEL', container_key)
+"#;
+
 #[derive(Debug)]
 struct Commit {
     key: RedisKey,
@@ -67,6 +72,7 @@ pub struct LaxCounter {
     allowed_lag: Duration,
     commit_state_script: Script,
     del_script: Script,
+    clear_script: Script,
 
     // Flush states
     batch: tokio::sync::Mutex<Vec<Commit>>,
@@ -83,6 +89,8 @@ impl LaxCounter {
 
         let get_script = Script::new(GET_LUA);
         let del_script = Script::new(DEL_LUA);
+        let clear_script = Script::new(CLEAR_LUA);
+
         let commit_state_script = Script::new(COMMIT_STATE_LUA);
         let is_active_watch = watch::Sender::new(0u64);
 
@@ -92,6 +100,7 @@ impl LaxCounter {
             store: DashMap::default(),
             get_script,
             del_script,
+            clear_script,
             allowed_lag: Duration::from_millis(20),
             locks: DashMap::default(),
             commit_state_script,
@@ -499,6 +508,37 @@ impl CounterTrait for LaxCounter {
 
     async fn clear(&self) -> Result<(), DistkitError> {
         self.send_epoch_change_if_needed();
-        todo!()
+        // let mut keys: Vec<RedisKey> = Vec::with_capacity(self.store.len());
+        //
+        // for entry in self.store.iter() {
+        //     keys.push(entry.key().clone());
+        // }
+        //
+        // let mut locks = Vec::new();
+        // for key in keys.iter() {
+        //     locks.push(self.get_or_create_lock(key).await);
+        // }
+        //
+        // let mut guards = Vec::new();
+        // for lock in locks.iter() {
+        //     guards.push(lock.lock().await);
+        // }
+
+        self.store.clear();
+
+        {
+            let mut batch = self.batch.lock().await;
+            batch.clear();
+        }
+
+        let mut conn = self.connection_manager.clone();
+
+        let _: () = self
+            .clear_script
+            .key(self.key_generator.container_key())
+            .invoke_async(&mut conn)
+            .await?;
+
+        Ok(())
     } // end function clear
 } // end impl CounterTrait for LaxCounter
