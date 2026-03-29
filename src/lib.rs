@@ -9,5 +9,9 @@ pub use common::*;
 #[cfg(feature = "counter")]
 pub mod counter;
 
+/// Trypema integration.
+#[cfg(feature = "trypema")]
+pub mod trypema;
+
 mod error;
 pub use error::*;

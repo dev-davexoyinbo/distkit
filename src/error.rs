@@ -1,7 +1,9 @@
+use trypema_crate::TrypemaError;
+
 use crate::counter::CounterError;
 
 /// Top-level error type for all distkit operations.
-#[derive(Debug, thiserror::Error, PartialEq, Clone)]
+#[derive(Debug, thiserror::Error, PartialEq)]
 pub enum DistkitError {
     /// A [`RedisKey`](crate::RedisKey) failed validation (empty, too long, or
     /// contains a colon).
@@ -20,4 +22,9 @@ pub enum DistkitError {
     /// Catch-all for internal errors such as batch flush failures.
     #[error("Custom Error: {0}")]
     CustomError(String),
+
+    /// An error that should never occur.
+    #[cfg(feature = "trypema")]
+    #[error("Trypema Error: {0}")]
+    TrypemaError(#[from] TrypemaError),
 }
