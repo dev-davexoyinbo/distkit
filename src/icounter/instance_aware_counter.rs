@@ -309,9 +309,46 @@ pub struct InstanceAwareCounter {
     del_on_instance_script: Script,
     clear_script: Script,
     clear_on_instance_script: Script,
+    mark_alive_script: Script,
+    activity: Arc<ActivityTracker>,
 }
 
 impl InstanceAwareCounter {
+    pub fn new(options: InstanceAwareCounterOptions) -> Arc<Self> {
+        let InstanceAwareCounterOptions {
+            prefix,
+            connection_manager,
+            dead_instance_threshold_ms,
+        } = options;
+
+        let key_generator =
+            RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::InstanceAwareCounter);
+        let instance_id = generate_instance_id();
+
+        let counter = Arc::new(Self {
+            connection_manager,
+            key_generator,
+            instance_id,
+            dead_instance_threshold_ms,
+            local_epochs: DashMap::default(),
+            inc_script: Script::new(&format!("{HELPERS_LUA}\n{INC_LUA}")),
+            set_script: Script::new(&format!("{HELPERS_LUA}\n{SET_LUA}")),
+            set_on_instance_script: Script::new(&format!("{HELPERS_LUA}\n{SET_ON_INSTANCE_LUA}")),
+            get_script: Script::new(&format!("{HELPERS_LUA}\n{GET_LUA}")),
+            del_script: Script::new(&format!("{HELPERS_LUA}\n{DEL_LUA}")),
+            del_on_instance_script: Script::new(&format!("{HELPERS_LUA}\n{DEL_ON_INSTANCE_LUA}")),
+            clear_script: Script::new(CLEAR_LUA),
+            clear_on_instance_script: Script::new(&format!(
+                "{HELPERS_LUA}\n{CLEAR_ON_INSTANCE_LUA}"
+            )),
+            mark_alive_script: Script::new(&format!("{HELPERS_LUA}\n{MARK_ALIVE_LUA}")),
+            activity: ActivityTracker::new(EPOCH_CHANGE_INTERVAL),
+        });
+
+        counter.run_heartbeat_task();
+
+        counter
+    }
     fn epoch_key(&self) -> String {
         format!("{}:epoch", self.key_generator.container_key())
     }
@@ -357,6 +394,51 @@ impl InstanceAwareCounter {
                     .or_insert_with(|| AtomicU64::new(epoch));
             }
         }
+    }
+    fn run_heartbeat_task(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let mut activity_watch = self.activity.subscribe();
+
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(EPOCH_CHANGE_INTERVAL);
+            tick.tick().await; // skip first immediate tick
+
+            loop {
+                tokio::select! {
+                    changed = activity_watch.changed() => {
+                        if changed.is_err() { break; }
+                        let Some(c) = weak.upgrade() else { break; };
+                        if !c.activity.get_is_active() {
+                            let _ = c.mark_alive().await;
+                        }
+                    }
+                    _ = tick.tick() => {
+                        let Some(c) = weak.upgrade() else { break; };
+                        if !c.activity.get_is_active() {
+                            let _ = c.mark_alive().await;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    async fn mark_alive(&self) -> Result<(), DistkitError> {
+        let mut conn = self.connection_manager.clone();
+
+        let _: () = self
+            .mark_alive_script
+            .key(self.instances_key())
+            .key(self.epoch_key())
+            .key(self.cumulative_key())
+            .key(self.keys_key())
+            .arg(self.dead_instance_threshold_ms)
+            .arg(self.prefix_str())
+            .arg(&self.instance_id)
+            .invoke_async(&mut conn)
+            .await?;
+
+        Ok(())
     }
     pub fn instance_id(&self) -> &str {
         &self.instance_id
