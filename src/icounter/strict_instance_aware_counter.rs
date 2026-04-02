@@ -15,7 +15,8 @@ use redis::{Script, aio::ConnectionManager};
 
 use crate::{
     ActivityTracker, EPOCH_CHANGE_INTERVAL, RedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
-    error::DistkitError, icounter::generate_instance_id,
+    error::DistkitError,
+    icounter::{InstanceAwareCounterTrait, generate_instance_id},
 };
 
 // ---------------------------------------------------------------------------
@@ -757,5 +758,52 @@ impl StrictInstanceAwareCounter {
             .await?;
 
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trait impl
+// ---------------------------------------------------------------------------
+
+#[async_trait::async_trait]
+impl InstanceAwareCounterTrait for StrictInstanceAwareCounter {
+    fn instance_id(&self) -> &str {
+        self.instance_id()
+    }
+
+    async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+        self.inc(key, count).await
+    }
+
+    async fn set(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+        self.set(key, count).await
+    }
+
+    async fn set_on_instance(
+        &self,
+        key: &RedisKey,
+        count: i64,
+    ) -> Result<(i64, i64), DistkitError> {
+        self.set_on_instance(key, count).await
+    }
+
+    async fn get(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
+        self.get(key).await
+    }
+
+    async fn del(&self, key: &RedisKey) -> Result<i64, DistkitError> {
+        self.del(key).await
+    }
+
+    async fn del_on_instance(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
+        self.del_on_instance(key).await
+    }
+
+    async fn clear(&self) -> Result<(), DistkitError> {
+        self.clear().await
+    }
+
+    async fn clear_on_instance(&self) -> Result<(), DistkitError> {
+        self.clear_on_instance().await
     }
 }

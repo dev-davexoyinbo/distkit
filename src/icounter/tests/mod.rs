@@ -1,2 +1,2 @@
 pub mod common;
-mod instance_aware_counter;
+mod strict_instance_aware_counter;
