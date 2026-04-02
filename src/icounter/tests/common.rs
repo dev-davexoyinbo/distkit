@@ -82,6 +82,38 @@ pub async fn make_pair_with_opts(
     (c1, c2)
 }
 
+/// Creates `n` counters sharing the same Redis prefix (each with a unique instance ID).
+pub async fn make_n_counters(prefix: &str, n: usize) -> Vec<Arc<InstanceAwareCounter>> {
+    let unique_prefix = format!("{}_{}", run_id(), prefix);
+    let mut counters = Vec::with_capacity(n);
+    for _ in 0..n {
+        let conn = make_connection().await;
+        counters.push(InstanceAwareCounter::new(InstanceAwareCounterOptions::new(
+            RedisKey::from(unique_prefix.clone()),
+            conn,
+        )));
+    }
+    counters
+}
+
+pub async fn make_n_counters_with_opts(
+    prefix: &str,
+    n: usize,
+    threshold_ms: u64,
+) -> Vec<Arc<InstanceAwareCounter>> {
+    let unique_prefix = format!("{}_{}", run_id(), prefix);
+    let mut counters = Vec::with_capacity(n);
+    for _ in 0..n {
+        let conn = make_connection().await;
+        counters.push(InstanceAwareCounter::new(InstanceAwareCounterOptions {
+            prefix: RedisKey::from(unique_prefix.clone()),
+            connection_manager: conn,
+            dead_instance_threshold_ms: threshold_ms,
+        }));
+    }
+    counters
+}
+
 pub fn key(name: &str) -> RedisKey {
     RedisKey::from(name.to_string())
 }

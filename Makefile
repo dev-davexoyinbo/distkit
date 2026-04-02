@@ -36,13 +36,10 @@ test: ## Run tests
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
 	$(MAKE) -s redis-up; \
-	REDIS_URL="$(REDIS_URL)" cargo test
+	REDIS_URL="$(REDIS_URL)" cargo test --all-features -- --show-output
 
 bench: ## Run criterion benchmarks
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
 	$(MAKE) -s redis-up; \
-	REDIS_URL="$(REDIS_URL)" cargo bench
-
-test-example: ## Run example tests
-	REDIS_URL="$(REDIS_URL)" cargo test value_is_eventually_flushed_to_redis -- --show-output
+	REDIS_URL="$(REDIS_URL)" cargo bench --all-features
