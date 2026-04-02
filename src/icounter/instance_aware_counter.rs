@@ -130,6 +130,29 @@ redis.call('SADD', keys_key, counter_key)
 
 return {new_cumulative, count, redis_epoch}
 "#;
+const GET_LUA: &str = r#"
+local epoch_key      = KEYS[1]
+local instances_key  = KEYS[2]
+local cumulative_key = KEYS[3]
+local keys_key       = KEYS[4]
+local inst_count_key = KEYS[5]
+
+local counter_key    = ARGV[1]
+local local_epoch    = tonumber(ARGV[2])
+local dead_threshold = tonumber(ARGV[3])
+local prefix         = ARGV[4]
+local instance_id    = ARGV[5]
+
+local ts = now_ms()
+redis.call('ZADD', instances_key, ts, instance_id)
+delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts, instance_id)
+
+local redis_epoch = tonumber(redis.call('HGET', epoch_key, counter_key) or 0) or 0
+local cumulative  = tonumber(redis.call('HGET', cumulative_key, counter_key) or 0) or 0
+local inst_count  = tonumber(redis.call('HGET', inst_count_key, counter_key) or 0) or 0
+
+return {cumulative, inst_count, redis_epoch}
+"#;
 #[derive(Debug, Clone)]
 pub struct InstanceAwareCounterOptions {
     /// Redis key prefix used to namespace all counter keys.
@@ -162,6 +185,7 @@ pub struct InstanceAwareCounter {
     inc_script: Script,
     set_script: Script,
     set_on_instance_script: Script,
+    get_script: Script,
 }
 
 impl InstanceAwareCounter {
@@ -210,6 +234,9 @@ impl InstanceAwareCounter {
                     .or_insert_with(|| AtomicU64::new(epoch));
             }
         }
+    }
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
     }
     pub async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
         self.activity.signal();
@@ -300,4 +327,33 @@ impl InstanceAwareCounter {
 
         Ok((cumulative, inst_count))
     }
+    pub async fn get(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
+        self.activity.signal();
+
+        let mut conn = self.connection_manager.clone();
+        let local_epoch = self.get_local_epoch(key);
+
+        let result: Vec<i64> = self
+            .get_script
+            .key(self.epoch_key())
+            .key(self.instances_key())
+            .key(self.cumulative_key())
+            .key(self.keys_key())
+            .key(self.inst_count_key())
+            .arg(key.as_str())
+            .arg(local_epoch)
+            .arg(self.dead_instance_threshold_ms)
+            .arg(self.prefix_str())
+            .arg(&self.instance_id)
+            .invoke_async(&mut conn)
+            .await?;
+
+        let cumulative = result[0];
+        let inst_count = result[1];
+        let redis_epoch = result[2] as u64;
+        self.set_local_epoch(key, redis_epoch);
+
+        Ok((cumulative, inst_count))
+    }
+
 }
