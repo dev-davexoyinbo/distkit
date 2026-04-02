@@ -7,7 +7,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicI64, AtomicU64, Ordering},
 };
 
 use dashmap::DashMap;
@@ -18,6 +18,30 @@ use crate::{
     error::DistkitError,
     icounter::{InstanceAwareCounterTrait, generate_instance_id},
 };
+
+// ---------------------------------------------------------------------------
+// Per-key in-memory state
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct SingleStore {
+    /// Last-seen Redis epoch for this key.
+    epoch: AtomicU64,
+    /// Last-seen cumulative total for this key.
+    cumulative: AtomicI64,
+    /// This instance's contribution to the counter for this key.
+    local_count: AtomicI64,
+}
+
+impl SingleStore {
+    fn new(epoch: u64, cumulative: i64, local_count: i64) -> Self {
+        Self {
+            epoch: AtomicU64::new(epoch),
+            cumulative: AtomicI64::new(cumulative),
+            local_count: AtomicI64::new(local_count),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Lua helpers — prepended to all scripts except `clear`
@@ -49,6 +73,15 @@ local function delete_dead_instances(prefix, instances_key, cumulative_key, keys
         redis.call('ZREM', instances_key, inst_id)
     end
 end
+
+-- Returns 1 if the instance was not previously in the ZSET (newly created or
+-- was cleaned up as dead), 0 if it was already live.
+local function check_and_zadd(instances_key, instance_id, ts)
+    local prev = redis.call('ZSCORE', instances_key, instance_id)
+    local created = (prev == false or prev == nil) and 1 or 0
+    redis.call('ZADD', instances_key, ts, instance_id)
+    return created
+end
 "#;
 
 // ---------------------------------------------------------------------------
@@ -70,24 +103,24 @@ local prefix         = ARGV[5]
 local instance_id    = ARGV[6]
 
 local ts = now_ms()
-
-redis.call('ZADD', instances_key, ts, instance_id)
-delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts, instance_id)
+local instance_created = check_and_zadd(instances_key, instance_id, ts)
+delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts)
 
 local redis_epoch = tonumber(redis.call('HGET', epoch_key, counter_key) or 0) or 0
 local is_stale    = (local_epoch ~= redis_epoch)
 
+local new_inst_count
 if is_stale then
-    local old_count = tonumber(redis.call('HGET', inst_count_key, counter_key) or 0) or 0
     redis.call('HSET', inst_count_key, counter_key, delta)
+    new_inst_count = delta
 else
-    redis.call('HINCRBY', inst_count_key, counter_key, delta)
+    new_inst_count = tonumber(redis.call('HINCRBY', inst_count_key, counter_key, delta))
 end
 
 local new_cumulative = tonumber(redis.call('HINCRBY', cumulative_key, counter_key, delta))
 redis.call('SADD', keys_key, counter_key)
 
-return {new_cumulative, redis_epoch}
+return {new_cumulative, new_inst_count, redis_epoch, instance_created}
 "#;
 
 const SET_LUA: &str = r#"
@@ -105,8 +138,8 @@ local prefix         = ARGV[5]
 local instance_id    = ARGV[6]
 
 local ts = now_ms()
-redis.call('ZADD', instances_key, ts, instance_id)
-delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts, instance_id)
+local instance_created = check_and_zadd(instances_key, instance_id, ts)
+delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts)
 
 local old_epoch = tonumber(redis.call('HGET', epoch_key, counter_key) or 0) or 0
 local new_epoch = old_epoch + 1
@@ -116,7 +149,7 @@ redis.call('HSET', cumulative_key, counter_key, count)
 redis.call('HSET', inst_count_key, counter_key, count)
 redis.call('SADD', keys_key,       counter_key)
 
-return {count, new_epoch}
+return {count, count, new_epoch, instance_created}
 "#;
 
 const SET_ON_INSTANCE_LUA: &str = r#"
@@ -134,8 +167,8 @@ local prefix         = ARGV[5]
 local instance_id    = ARGV[6]
 
 local ts = now_ms()
-redis.call('ZADD', instances_key, ts, instance_id)
-delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts, instance_id)
+local instance_created = check_and_zadd(instances_key, instance_id, ts)
+delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts)
 
 local redis_epoch = tonumber(redis.call('HGET', epoch_key, counter_key) or 0) or 0
 local inst_count  = tonumber(redis.call('HGET', inst_count_key, counter_key) or 0) or 0
@@ -148,7 +181,7 @@ redis.call('HSET', inst_count_key, counter_key, count)
 local new_cumulative = tonumber(redis.call('HINCRBY', cumulative_key, counter_key, delta))
 redis.call('SADD', keys_key, counter_key)
 
-return {new_cumulative, count, redis_epoch}
+return {new_cumulative, count, redis_epoch, instance_created}
 "#;
 
 const GET_LUA: &str = r#"
@@ -165,14 +198,14 @@ local prefix         = ARGV[4]
 local instance_id    = ARGV[5]
 
 local ts = now_ms()
-redis.call('ZADD', instances_key, ts, instance_id)
-delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts, instance_id)
+local instance_created = check_and_zadd(instances_key, instance_id, ts)
+delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts)
 
 local redis_epoch = tonumber(redis.call('HGET', epoch_key, counter_key) or 0) or 0
 local cumulative  = tonumber(redis.call('HGET', cumulative_key, counter_key) or 0) or 0
 local inst_count  = tonumber(redis.call('HGET', inst_count_key, counter_key) or 0) or 0
 
-return {cumulative, inst_count, redis_epoch}
+return {cumulative, inst_count, redis_epoch, instance_created}
 "#;
 
 const DEL_LUA: &str = r#"
@@ -189,8 +222,8 @@ local prefix         = ARGV[4]
 local instance_id    = ARGV[5]
 
 local ts = now_ms()
-redis.call('ZADD', instances_key, ts, instance_id)
-delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts, instance_id)
+local instance_created = check_and_zadd(instances_key, instance_id, ts)
+delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts)
 
 local old_cumulative = tonumber(redis.call('HGET', cumulative_key, counter_key) or 0) or 0
 local old_epoch = tonumber(redis.call('HGET', epoch_key, counter_key) or 0) or 0
@@ -201,7 +234,7 @@ redis.call('HDEL', cumulative_key, counter_key)
 redis.call('SREM', keys_key,       counter_key)
 redis.call('HDEL', inst_count_key, counter_key)
 
-return {old_cumulative, new_epoch}
+return {old_cumulative, new_epoch, instance_created}
 "#;
 
 const DEL_ON_INSTANCE_LUA: &str = r#"
@@ -218,8 +251,8 @@ local prefix         = ARGV[4]
 local instance_id    = ARGV[5]
 
 local ts = now_ms()
-redis.call('ZADD', instances_key, ts, instance_id)
-delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts, instance_id)
+local instance_created = check_and_zadd(instances_key, instance_id, ts)
+delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts)
 
 local redis_epoch = tonumber(redis.call('HGET', epoch_key, counter_key) or 0) or 0
 local inst_count  = tonumber(redis.call('HGET', inst_count_key, counter_key) or 0) or 0
@@ -234,7 +267,7 @@ else
     new_cumulative = tonumber(redis.call('HINCRBY', cumulative_key, counter_key, -inst_count))
 end
 
-return {new_cumulative, inst_count, redis_epoch}
+return {new_cumulative, inst_count, redis_epoch, instance_created}
 "#;
 
 /// Nuclear clear — no helpers prepended; iterates instances ZSET to clean up all count keys.
@@ -264,8 +297,8 @@ local prefix         = ARGV[2]
 local instance_id    = ARGV[3]
 
 local ts = now_ms()
-redis.call('ZADD', instances_key, ts, instance_id)
-delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts, instance_id)
+check_and_zadd(instances_key, instance_id, ts)
+delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts)
 
 local all_keys = redis.call('HKEYS', inst_count_key)
 if #all_keys > 0 then
@@ -291,8 +324,10 @@ local prefix         = ARGV[2]
 local instance_id    = ARGV[3]
 
 local ts = now_ms()
-redis.call('ZADD', instances_key, ts, instance_id)
-delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts, instance_id)
+local instance_created = check_and_zadd(instances_key, instance_id, ts)
+delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts)
+
+return tostring(instance_created)
 "#;
 
 // ---------------------------------------------------------------------------
@@ -343,8 +378,8 @@ pub struct StrictInstanceAwareCounter {
     key_generator: RedisKeyGenerator,
     instance_id: String,
     dead_instance_threshold_ms: u64,
-    /// Per-key epoch last seen in Redis. Sent as ARGV to Lua scripts.
-    local_epochs: DashMap<RedisKey, AtomicU64>,
+    /// Per-key in-memory state: epoch, last-seen cumulative, and this instance's count.
+    local_store: DashMap<RedisKey, SingleStore>,
     inc_script: Script,
     set_script: Script,
     set_on_instance_script: Script,
@@ -375,7 +410,7 @@ impl StrictInstanceAwareCounter {
             key_generator,
             instance_id,
             dead_instance_threshold_ms,
-            local_epochs: DashMap::default(),
+            local_store: DashMap::default(),
             inc_script: Script::new(&format!("{HELPERS_LUA}\n{INC_LUA}")),
             set_script: Script::new(&format!("{HELPERS_LUA}\n{SET_LUA}")),
             set_on_instance_script: Script::new(&format!("{HELPERS_LUA}\n{SET_ON_INSTANCE_LUA}")),
@@ -428,24 +463,39 @@ impl StrictInstanceAwareCounter {
     }
 
     // -----------------------------------------------------------------------
-    // Epoch helpers
+    // local_store helpers
     // -----------------------------------------------------------------------
 
     fn get_local_epoch(&self, key: &RedisKey) -> u64 {
-        self.local_epochs
+        self.local_store
             .get(key)
-            .map(|e| e.load(Ordering::Acquire))
+            .map(|s| s.epoch.load(Ordering::Acquire))
             .unwrap_or(0)
     }
 
-    fn set_local_epoch(&self, key: &RedisKey, epoch: u64) {
-        match self.local_epochs.get(key) {
-            Some(e) => e.store(epoch, Ordering::Release),
+    fn get_local_count(&self, key: &RedisKey) -> i64 {
+        self.local_store
+            .get(key)
+            .map(|s| s.local_count.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    fn update_local_store(&self, key: &RedisKey, epoch: u64, cumulative: i64, local_count: i64) {
+        match self.local_store.get(key) {
+            Some(s) => {
+                s.epoch.store(epoch, Ordering::Release);
+                s.cumulative.store(cumulative, Ordering::Release);
+                s.local_count.store(local_count, Ordering::Release);
+            }
             None => {
-                self.local_epochs
+                self.local_store
                     .entry(key.clone())
-                    .and_modify(|e| e.store(epoch, Ordering::Relaxed))
-                    .or_insert_with(|| AtomicU64::new(epoch));
+                    .and_modify(|s| {
+                        s.epoch.store(epoch, Ordering::Relaxed);
+                        s.cumulative.store(cumulative, Ordering::Relaxed);
+                        s.local_count.store(local_count, Ordering::Relaxed);
+                    })
+                    .or_insert_with(|| SingleStore::new(epoch, cumulative, local_count));
             }
         }
     }
@@ -485,7 +535,7 @@ impl StrictInstanceAwareCounter {
     async fn mark_alive(&self) -> Result<(), DistkitError> {
         let mut conn = self.connection_manager.clone();
 
-        let _: () = self
+        let instance_created: i8 = self
             .mark_alive_script
             .key(self.instances_key())
             .key(self.epoch_key())
@@ -515,7 +565,7 @@ impl StrictInstanceAwareCounter {
     /// count is reset to `count` before incrementing the cumulative.
     ///
     /// Returns the new cumulative total.
-    pub async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+    pub async fn inc(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
         let mut conn = self.connection_manager.clone();
@@ -538,10 +588,19 @@ impl StrictInstanceAwareCounter {
             .await?;
 
         let cumulative = result[0];
-        let redis_epoch = result[1] as u64;
-        self.set_local_epoch(key, redis_epoch);
+        let inst_count = result[1];
+        let redis_epoch = result[2] as u64;
+        let instance_created = result[3] != 0;
+        let should_recover = instance_created && local_epoch == redis_epoch;
 
-        Ok(cumulative)
+        let old_local_count = self.get_local_count(key);
+        self.update_local_store(key, redis_epoch, cumulative, inst_count);
+
+        if should_recover && old_local_count > 0 {
+            return Box::pin(self.inc(key, old_local_count)).await;
+        }
+
+        Ok((cumulative, inst_count))
     }
 
     /// Sets the cumulative total for `key` to `count`, bumping the epoch.
@@ -550,7 +609,7 @@ impl StrictInstanceAwareCounter {
     /// change on their next operation and treat their stored counts as stale.
     ///
     /// Returns the new cumulative total (equal to `count`).
-    pub async fn set(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+    pub async fn set(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
         let mut conn = self.connection_manager.clone();
@@ -573,10 +632,12 @@ impl StrictInstanceAwareCounter {
             .await?;
 
         let cumulative = result[0];
-        let new_epoch = result[1] as u64;
-        self.set_local_epoch(key, new_epoch);
+        let inst_count = result[1];
+        let new_epoch = result[2] as u64;
+        // No recovery: epoch always bumps, so local_epoch != new_epoch
+        self.update_local_store(key, new_epoch, cumulative, inst_count);
 
-        Ok(cumulative)
+        Ok((cumulative, inst_count))
     }
 
     /// Sets only this instance's contribution for `key` to `count`, without bumping the epoch.
@@ -614,7 +675,8 @@ impl StrictInstanceAwareCounter {
         let cumulative = result[0];
         let inst_count = result[1];
         let redis_epoch = result[2] as u64;
-        self.set_local_epoch(key, redis_epoch);
+        // No recovery: caller is explicitly setting their contribution to a specific value.
+        self.update_local_store(key, redis_epoch, cumulative, inst_count);
 
         Ok((cumulative, inst_count))
     }
@@ -647,7 +709,15 @@ impl StrictInstanceAwareCounter {
         let cumulative = result[0];
         let inst_count = result[1];
         let redis_epoch = result[2] as u64;
-        self.set_local_epoch(key, redis_epoch);
+        let instance_created = result[3] != 0;
+        let should_recover = instance_created && local_epoch == redis_epoch;
+
+        let old_local_count = self.get_local_count(key);
+        self.update_local_store(key, redis_epoch, cumulative, inst_count);
+
+        if should_recover && old_local_count > 0 {
+            return self.inc(key, old_local_count).await;
+        }
 
         Ok((cumulative, inst_count))
     }
@@ -655,7 +725,7 @@ impl StrictInstanceAwareCounter {
     /// Deletes `key` globally, bumping the epoch to invalidate all instances.
     ///
     /// Returns the cumulative total before deletion.
-    pub async fn del(&self, key: &RedisKey) -> Result<i64, DistkitError> {
+    pub async fn del(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
         let mut conn = self.connection_manager.clone();
@@ -677,10 +747,13 @@ impl StrictInstanceAwareCounter {
             .await?;
 
         let old_cumulative = result[0];
-        let new_epoch = result[1] as u64;
-        self.set_local_epoch(key, new_epoch);
+        let old_inst_count = self.get_local_count(key);
 
-        Ok(old_cumulative)
+        // Key deleted globally; remove from local store entirely.
+        // No recovery: epoch always bumps.
+        self.local_store.remove(key);
+
+        Ok((old_cumulative, old_inst_count))
     }
 
     /// Removes only this instance's contribution for `key`, without bumping the epoch.
@@ -710,7 +783,8 @@ impl StrictInstanceAwareCounter {
         let new_cumulative = result[0];
         let removed_count = result[1];
         let redis_epoch = result[2] as u64;
-        self.set_local_epoch(key, redis_epoch);
+        // No recovery: explicit removal intent; local_count becomes 0.
+        self.update_local_store(key, redis_epoch, new_cumulative, 0);
 
         Ok((new_cumulative, removed_count))
     }
@@ -732,7 +806,7 @@ impl StrictInstanceAwareCounter {
             .invoke_async(&mut conn)
             .await?;
 
-        self.local_epochs.clear();
+        self.local_store.clear();
 
         Ok(())
     }
@@ -757,6 +831,11 @@ impl StrictInstanceAwareCounter {
             .invoke_async(&mut conn)
             .await?;
 
+        // Zero out local_count for every tracked key; this instance no longer contributes.
+        for entry in self.local_store.iter() {
+            entry.local_count.store(0, Ordering::Release);
+        }
+
         Ok(())
     }
 }
@@ -771,11 +850,11 @@ impl InstanceAwareCounterTrait for StrictInstanceAwareCounter {
         self.instance_id()
     }
 
-    async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+    async fn inc(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.inc(key, count).await
     }
 
-    async fn set(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+    async fn set(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.set(key, count).await
     }
 
@@ -791,7 +870,7 @@ impl InstanceAwareCounterTrait for StrictInstanceAwareCounter {
         self.get(key).await
     }
 
-    async fn del(&self, key: &RedisKey) -> Result<i64, DistkitError> {
+    async fn del(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
         self.del(key).await
     }
 

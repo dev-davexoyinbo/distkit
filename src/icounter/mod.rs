@@ -23,22 +23,19 @@ pub trait InstanceAwareCounterTrait {
     /// Increments the counter for `key` by `count` (stale-aware).
     ///
     /// Returns the new cumulative total.
-    async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError>;
+    async fn inc(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError>;
 
     /// Sets the cumulative total for `key` to `count`, bumping the epoch.
     ///
     /// Returns the new cumulative total.
-    async fn set(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError>;
+    async fn set(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError>;
 
     /// Sets only this instance's contribution for `key` to `count`, without
     /// bumping the epoch.
     ///
     /// Returns `(new_cumulative, instance_count)`.
-    async fn set_on_instance(
-        &self,
-        key: &RedisKey,
-        count: i64,
-    ) -> Result<(i64, i64), DistkitError>;
+    async fn set_on_instance(&self, key: &RedisKey, count: i64)
+    -> Result<(i64, i64), DistkitError>;
 
     /// Returns `(cumulative, instance_count)` for `key`.
     async fn get(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError>;
@@ -46,7 +43,7 @@ pub trait InstanceAwareCounterTrait {
     /// Deletes `key` globally, bumping the epoch to invalidate all instances.
     ///
     /// Returns the cumulative total before deletion.
-    async fn del(&self, key: &RedisKey) -> Result<i64, DistkitError>;
+    async fn del(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError>;
 
     /// Removes only this instance's contribution for `key`, without bumping
     /// the epoch.
