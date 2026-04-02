@@ -13,8 +13,8 @@ async fn inc_returns_cumulative() {
     let c = make_counter("inc_returns_cumulative").await;
     let k = key("x");
 
-    assert_eq!(c.inc(&k, 5).await.unwrap(), 5);
-    assert_eq!(c.inc(&k, 3).await.unwrap(), 8);
+    assert_eq!(c.inc(&k, 5).await.unwrap().0, 5);
+    assert_eq!(c.inc(&k, 3).await.unwrap().0, 8);
 
     c.clear().await.unwrap();
 }
@@ -25,7 +25,7 @@ async fn inc_by_zero_is_noop() {
     let k = key("x");
 
     c.inc(&k, 10).await.unwrap();
-    assert_eq!(c.inc(&k, 0).await.unwrap(), 10);
+    assert_eq!(c.inc(&k, 0).await.unwrap().0, 10);
 
     c.clear().await.unwrap();
 }
@@ -35,7 +35,7 @@ async fn set_returns_count_as_cumulative() {
     let c = make_counter("set_returns_count").await;
     let k = key("x");
 
-    assert_eq!(c.set(&k, 99).await.unwrap(), 99);
+    assert_eq!(c.set(&k, 99).await.unwrap().0, 99);
 
     c.clear().await.unwrap();
 }
@@ -81,7 +81,7 @@ async fn del_returns_old_cumulative() {
     let k = key("x");
 
     c.inc(&k, 42).await.unwrap();
-    assert_eq!(c.del(&k).await.unwrap(), 42);
+    assert_eq!(c.del(&k).await.unwrap().0, 42);
 
     c.clear().await.unwrap();
 }
@@ -190,7 +190,7 @@ async fn three_instances_cumulate_via_inc() {
 
     cs[0].inc(&k, 10).await.unwrap();
     cs[1].inc(&k, 20).await.unwrap();
-    let cum = cs[2].inc(&k, 30).await.unwrap();
+    let (cum, _) = cs[2].inc(&k, 30).await.unwrap();
 
     assert_eq!(cum, 60);
 
@@ -289,13 +289,13 @@ async fn set_by_one_instance_makes_all_others_stale() {
     cs[2].set_on_instance(&k, 100).await.unwrap(); // c2=100, cum=300
 
     // c0 globally sets; epoch bumps; cumulative = 50; c1 and c2 are now stale
-    assert_eq!(cs[0].set(&k, 50).await.unwrap(), 50);
+    assert_eq!(cs[0].set(&k, 50).await.unwrap().0, 50);
 
     // c1 is stale → inst resets to 5, cumulative = 50+5 = 55
-    assert_eq!(cs[1].inc(&k, 5).await.unwrap(), 55);
+    assert_eq!(cs[1].inc(&k, 5).await.unwrap().0, 55);
 
     // c2 is stale → inst resets to 5, cumulative = 55+5 = 60
-    assert_eq!(cs[2].inc(&k, 5).await.unwrap(), 60);
+    assert_eq!(cs[2].inc(&k, 5).await.unwrap().0, 60);
 
     cs[0].clear().await.unwrap();
 }
@@ -314,7 +314,7 @@ async fn del_by_one_instance_makes_all_others_stale() {
 
     // c1 and c2 are stale → each reset inst to 10; cumulative = 0+10+10 = 20
     cs[1].inc(&k, 10).await.unwrap();
-    let cum = cs[2].inc(&k, 10).await.unwrap();
+    let (cum, _) = cs[2].inc(&k, 10).await.unwrap();
     assert_eq!(cum, 20);
 
     cs[0].clear().await.unwrap();
@@ -325,9 +325,9 @@ async fn sequential_epoch_bumps_from_different_instances() {
     let cs = make_n_counters("seq_epoch_bumps", 3).await;
     let k = key("x");
 
-    assert_eq!(cs[0].set(&k, 10).await.unwrap(), 10);
-    assert_eq!(cs[1].set(&k, 20).await.unwrap(), 20);
-    assert_eq!(cs[2].set(&k, 30).await.unwrap(), 30);
+    assert_eq!(cs[0].set(&k, 10).await.unwrap().0, 10);
+    assert_eq!(cs[1].set(&k, 20).await.unwrap().0, 20);
+    assert_eq!(cs[2].set(&k, 30).await.unwrap().0, 30);
 
     // Final cumulative is whatever the last set established
     let (cum, _) = cs[0].get(&k).await.unwrap();
@@ -350,7 +350,7 @@ async fn instance_missed_multiple_epochs_still_resyncs() {
 
     // c2's local_epoch=0, redis_epoch=3 → stale regardless of gap
     // c2 inc(5): stale → inst resets to 5, cumulative = 30+5 = 35
-    let cum = c2.inc(&k, 5).await.unwrap();
+    let (cum, _) = c2.inc(&k, 5).await.unwrap();
     assert_eq!(cum, 35);
 
     c1.clear().await.unwrap();
@@ -362,7 +362,7 @@ async fn brand_new_instance_after_epoch_bump_starts_fresh() {
     let k = key("x");
 
     // c0 sets; epoch = 1; cumulative = 100
-    assert_eq!(cs[0].set(&k, 100).await.unwrap(), 100);
+    assert_eq!(cs[0].set(&k, 100).await.unwrap().0, 100);
 
     // c1 never operated (local_epoch=0); calls set_on_instance(50)
     // → stale (0≠1) → effective_old=0, delta=50 → cumulative = 100+50 = 150
@@ -386,13 +386,13 @@ async fn interleaved_inc_and_set_across_three_instances() {
     cs[1].inc(&k, 5).await.unwrap(); // c1=5,  cum=15
 
     // c0 globally sets to 20; epoch bumps; cumulative=20; c1 is now stale
-    assert_eq!(cs[0].set(&k, 20).await.unwrap(), 20);
+    assert_eq!(cs[0].set(&k, 20).await.unwrap().0, 20);
 
     // c1 stale → inst resets to 3; cumulative = 20+3 = 23
-    assert_eq!(cs[1].inc(&k, 3).await.unwrap(), 23);
+    assert_eq!(cs[1].inc(&k, 3).await.unwrap().0, 23);
 
     // c2 never op'd (local_epoch=0); redis_epoch=1 → stale → inst resets to 7; cumulative = 23+7 = 30
-    assert_eq!(cs[2].inc(&k, 7).await.unwrap(), 30);
+    assert_eq!(cs[2].inc(&k, 7).await.unwrap().0, 30);
 
     cs[0].clear().await.unwrap();
 }
@@ -428,12 +428,12 @@ async fn set_then_all_stale_instances_inc() {
     cs[2].set_on_instance(&k, 300).await.unwrap();
 
     // c0 globally sets to 100; epoch bumps; c1 and c2 are now stale
-    assert_eq!(cs[0].set(&k, 100).await.unwrap(), 100);
+    assert_eq!(cs[0].set(&k, 100).await.unwrap().0, 100);
 
     // c1 stale → inst resets to 10; cumulative = 100+10 = 110
     cs[1].inc(&k, 10).await.unwrap();
     // c2 stale → inst resets to 10; cumulative = 110+10 = 120
-    let cum = cs[2].inc(&k, 10).await.unwrap();
+    let (cum, _) = cs[2].inc(&k, 10).await.unwrap();
     assert_eq!(cum, 120);
 
     // Verify each instance's stored count
@@ -461,7 +461,7 @@ async fn del_then_fresh_inc_from_all() {
     // c1 stale → inst resets to 7; cum = 5+7 = 12
     cs[1].inc(&k, 7).await.unwrap();
     // c2 fresh (did del, local_epoch = new_epoch) → HINCRBY; cum = 12+3 = 15
-    let cum = cs[2].inc(&k, 3).await.unwrap();
+    let (cum, _) = cs[2].inc(&k, 3).await.unwrap();
     assert_eq!(cum, 15);
 
     cs[0].clear().await.unwrap();
@@ -538,7 +538,7 @@ async fn dead_instance_cleaned_then_new_instance_joins() {
     // A new instance joins the same prefix and contributes
     let mut opts = super::common::make_n_counters_with_opts("dead_then_new", 1, 100).await;
     let c3 = opts.pop().unwrap();
-    let cum = c3.inc(&k, 20).await.unwrap();
+    let (cum, _) = c3.inc(&k, 20).await.unwrap();
     assert_eq!(cum, 80);
 
     c2.clear().await.unwrap();
@@ -632,15 +632,15 @@ async fn epoch_bump_on_one_key_does_not_affect_other() {
 
     // c1 and c2 op on k2 — they should not be stale for k2
     // (local_epoch for k2 = 0 = redis_epoch for k2)
-    let cum_k2_after_c1 = cs[1].inc(&k2, 1).await.unwrap();
-    let cum_k2_after_c2 = cs[2].inc(&k2, 1).await.unwrap();
+    let (cum_k2_after_c1, _) = cs[1].inc(&k2, 1).await.unwrap();
+    let (cum_k2_after_c2, _) = cs[2].inc(&k2, 1).await.unwrap();
 
     // k2 was never epoch-bumped; increments are fresh; cumulative = 30+1+1 = 32
     assert_eq!(cum_k2_after_c1, 31);
     assert_eq!(cum_k2_after_c2, 32);
 
     // k1: c1 is stale → reset inst to 7; cumulative = 5+7 = 12
-    let cum_k1 = cs[1].inc(&k1, 7).await.unwrap();
+    let (cum_k1, _) = cs[1].inc(&k1, 7).await.unwrap();
     assert_eq!(cum_k1, 12);
 
     cs[0].clear().await.unwrap();
@@ -726,7 +726,7 @@ async fn inc_stale_ignores_old_instance_count_in_cumulative() {
 
     // c2 is stale → inst resets to 3; cumulative = 5+3 = 8
     // (NOT 5+100+3=108 — old count is not in current cumulative)
-    let cum = c2.inc(&k, 3).await.unwrap();
+    let (cum, _) = c2.inc(&k, 3).await.unwrap();
     assert_eq!(cum, 8);
 
     c1.clear().await.unwrap();
@@ -742,7 +742,7 @@ async fn two_instances_cumulate_via_inc() {
     let k = key("x");
 
     c1.inc(&k, 10).await.unwrap();
-    assert_eq!(c2.inc(&k, 20).await.unwrap(), 30);
+    assert_eq!(c2.inc(&k, 20).await.unwrap().0, 30);
 
     c1.clear().await.unwrap();
 }
@@ -781,10 +781,10 @@ async fn stale_instance_resets_to_delta_after_epoch_bump() {
     c1.set_on_instance(&k, 5).await.unwrap(); // c1=5, cum=5
     c2.set_on_instance(&k, 10).await.unwrap(); // c2=10, cum=15
 
-    assert_eq!(c1.set(&k, 3).await.unwrap(), 3); // epoch bump; cum=3
+    assert_eq!(c1.set(&k, 3).await.unwrap().0, 3); // epoch bump; cum=3
 
     // c2 stale → inst resets to 5; cumulative = 3+5 = 8
-    assert_eq!(c2.inc(&k, 5).await.unwrap(), 8);
+    assert_eq!(c2.inc(&k, 5).await.unwrap().0, 8);
 
     c1.clear().await.unwrap();
 }
@@ -795,7 +795,7 @@ async fn set_increments_epoch_on_each_call() {
     let k = key("x");
 
     c.set(&k, 10).await.unwrap();
-    assert_eq!(c.set(&k, 20).await.unwrap(), 20);
+    assert_eq!(c.set(&k, 20).await.unwrap().0, 20);
     assert_eq!(c.get(&k).await.unwrap().0, 20);
 
     c.clear().await.unwrap();
@@ -816,4 +816,155 @@ async fn dead_instance_counts_removed_from_cumulative() {
     assert_eq!(cum, 60);
 
     c2.clear().await.unwrap();
+}
+
+// ===========================================================================
+// Recovery
+// ===========================================================================
+
+/// An instance that went offline (declared dead, contribution removed) recovers
+/// its prior count via `inc` when it comes back.
+#[tokio::test]
+async fn recovery_via_inc_after_downtime() {
+    let (c1, c2) = make_pair_with_opts("recovery_inc", 100).await;
+    let k = key("x");
+
+    c1.inc(&k, 20).await.unwrap(); // c1 contributes 20; cumulative = 20
+
+    // c1 goes offline: sleep past the dead threshold without refreshing.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // c2 triggers dead-instance cleanup — removes c1's 20.
+    let (cum_after_cleanup, _) = c2.get(&k).await.unwrap();
+    assert_eq!(cum_after_cleanup, 0);
+
+    // c1 comes back. inc(5) detects instance_created and recovers old count (20),
+    // then adds the new delta (5): final cumulative = 25.
+    let (cum, _) = c1.inc(&k, 5).await.unwrap();
+    assert_eq!(cum, 25);
+
+    let (total, c1_inst) = c1.get(&k).await.unwrap();
+    assert_eq!(total, 25);
+    assert_eq!(c1_inst, 25);
+
+    c1.clear().await.unwrap();
+}
+
+/// Recovery also fires from `get` — a read that discovers the instance was cleaned up.
+#[tokio::test]
+async fn recovery_via_get_after_downtime() {
+    let (c1, c2) = make_pair_with_opts("recovery_get", 100).await;
+    let k = key("x");
+
+    c1.inc(&k, 30).await.unwrap(); // cumulative = 30
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // c2 cleans up c1.
+    let (cum_after_cleanup, _) = c2.get(&k).await.unwrap();
+    assert_eq!(cum_after_cleanup, 0);
+
+    // c1 calls get — triggers recovery of its 30.
+    let (cum, inst) = c1.get(&k).await.unwrap();
+    assert_eq!(cum, 30);
+    assert_eq!(inst, 30);
+
+    c1.clear().await.unwrap();
+}
+
+/// If an epoch bump happened while the instance was offline, its prior
+/// contribution is stale — no recovery should occur.
+#[tokio::test]
+async fn no_recovery_when_epoch_bumped_during_downtime() {
+    let (c1, c2) = make_pair_with_opts("no_recovery_epoch", 100).await;
+    let k = key("x");
+
+    c1.inc(&k, 20).await.unwrap(); // c1 contributes 20; cumulative = 20
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // c2 bumps the epoch and cleans up c1.
+    let (cum, _) = c2.set(&k, 100).await.unwrap();
+    assert_eq!(cum, 100);
+
+    // c1 comes back: local_epoch(0) != redis_epoch(1) → stale, no recovery.
+    // The stale path resets inst_count to delta and adds it to cumulative.
+    let (cum, _) = c1.inc(&k, 5).await.unwrap();
+    assert_eq!(cum, 105);
+
+    let (_, c1_inst) = c1.get(&k).await.unwrap();
+    assert_eq!(c1_inst, 5);
+
+    c1.clear().await.unwrap();
+}
+
+/// `mark_alive` (heartbeat path) re-adds the contribution when the instance
+/// was cleaned up but the epoch hasn't changed.
+#[tokio::test]
+async fn mark_alive_recovery_restores_contribution() {
+    let (c1, c2) = make_pair_with_opts("mark_alive_recovery", 100).await;
+    let k = key("x");
+
+    c1.inc(&k, 20).await.unwrap(); // c1 contributes 20; cumulative = 20
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // c2 triggers dead-instance cleanup — c1's 20 is subtracted.
+    let (cum_after_cleanup, _) = c2.get(&k).await.unwrap();
+    assert_eq!(cum_after_cleanup, 0);
+
+    // Simulate the heartbeat firing on c1. mark_alive detects instance_created=1
+    // and runs the batched epoch-safe recovery.
+    c1.trigger_mark_alive().await.unwrap();
+
+    // c1's 20 should be restored.
+    let (cum, _) = c2.get(&k).await.unwrap();
+    assert_eq!(cum, 20);
+
+    c1.clear().await.unwrap();
+}
+
+/// `mark_alive` must NOT restore a stale contribution when the epoch was
+/// bumped while the instance was offline — doing so would double-count.
+#[tokio::test]
+async fn mark_alive_no_recovery_when_epoch_bumped() {
+    let (c1, c2) = make_pair_with_opts("mark_alive_no_recovery_epoch", 100).await;
+    let k = key("x");
+
+    c1.inc(&k, 20).await.unwrap(); // c1 contributes 20; cumulative = 20
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // c2 bumps epoch and triggers cleanup — cumulative = 100, c1's 20 is gone.
+    let (cum, _) = c2.set(&k, 100).await.unwrap();
+    assert_eq!(cum, 100);
+
+    // Heartbeat fires on c1; epoch mismatch means recovery is skipped.
+    c1.trigger_mark_alive().await.unwrap();
+
+    // Cumulative must remain 100, not 120.
+    let (cum, _) = c2.get(&k).await.unwrap();
+    assert_eq!(cum, 100);
+
+    c2.clear().await.unwrap();
+}
+
+/// An instance that is still live (never cleaned up) must NOT trigger
+/// recovery — its contribution must not be double-counted.
+#[tokio::test]
+async fn no_recovery_for_live_instance() {
+    let (c1, c2) = make_pair_with_opts("no_recovery_live", 1_000).await;
+    let k = key("x");
+
+    c1.inc(&k, 20).await.unwrap(); // cumulative = 20
+    c1.inc(&k, 5).await.unwrap();  // instance is still live; no recovery; cumulative = 25
+
+    let (cum, c1_inst) = c2.get(&k).await.unwrap();
+    assert_eq!(cum, 25);
+    assert_eq!(c1_inst, 0); // c2 contributed nothing
+
+    let (_, c1_from_c1) = c1.get(&k).await.unwrap();
+    assert_eq!(c1_from_c1, 25); // c1's own view
+
+    c1.clear().await.unwrap();
 }
