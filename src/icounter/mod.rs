@@ -3,6 +3,9 @@ mod tests;
 
 mod strict_instance_aware_counter;
 pub use strict_instance_aware_counter::*;
+
+mod lax_instance_aware_counter;
+pub use lax_instance_aware_counter::{LaxInstanceAwareCounter, LaxInstanceAwareCounterOptions};
 use uuid::Uuid;
 
 use crate::{DistkitError, RedisKey};

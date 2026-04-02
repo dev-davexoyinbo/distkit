@@ -72,6 +72,8 @@ pub(crate) enum RedisKeyGeneratorTypeKey {
     StrictCounter,
     #[strum(to_string = "instance_aware_counter")]
     InstanceAwareCounter,
+    #[strum(to_string = "lax_instance_aware_counter")]
+    LaxInstanceAwareCounter,
 }
 
 #[derive(Clone, Debug)]
