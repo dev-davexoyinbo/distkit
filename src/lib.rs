@@ -4,10 +4,13 @@
 #![forbid(unsafe_code)]
 
 mod common;
-#[cfg(feature = "counter")]
 pub use common::*;
 #[cfg(feature = "counter")]
 pub mod counter;
+
+/// Counters that are aware of the instance they are running on.
+#[cfg(feature = "instance-aware-counter")]
+pub mod icounter;
 
 /// Rate limiting via the [`trypema`](https://docs.rs/trypema) crate.
 ///
