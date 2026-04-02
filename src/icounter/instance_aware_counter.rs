@@ -216,6 +216,62 @@ end
 return {new_cumulative, inst_count, redis_epoch}
 "#;
 
+const CLEAR_LUA: &str = r#"
+local epoch_key      = KEYS[1]
+local instances_key  = KEYS[2]
+local cumulative_key = KEYS[3]
+local keys_key       = KEYS[4]
+local prefix         = ARGV[1]
+
+local all_instances = redis.call('ZRANGE', instances_key, 0, -1)
+for _, inst_id in ipairs(all_instances) do
+    redis.call('DEL', prefix .. ':count:' .. inst_id)
+end
+redis.call('DEL', epoch_key, instances_key, cumulative_key, keys_key)
+"#;
+
+const CLEAR_ON_INSTANCE_LUA: &str = r#"
+local epoch_key      = KEYS[1]
+local instances_key  = KEYS[2]
+local cumulative_key = KEYS[3]
+local keys_key       = KEYS[4]
+local inst_count_key = KEYS[5]
+
+local dead_threshold = tonumber(ARGV[1])
+local prefix         = ARGV[2]
+local instance_id    = ARGV[3]
+
+local ts = now_ms()
+redis.call('ZADD', instances_key, ts, instance_id)
+delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts, instance_id)
+
+local all_keys = redis.call('HKEYS', inst_count_key)
+if #all_keys > 0 then
+    local values = redis.call('HMGET', inst_count_key, unpack(all_keys))
+    for i = 1, #values do
+        local c = tonumber(values[i] or 0) or 0
+        if c ~= 0 then
+            redis.call('HINCRBY', cumulative_key, all_keys[i], -c)
+        end
+    end
+end
+redis.call('DEL', inst_count_key)
+"#;
+
+const MARK_ALIVE_LUA: &str = r#"
+local instances_key  = KEYS[1]
+local epoch_key      = KEYS[2]
+local cumulative_key = KEYS[3]
+local keys_key       = KEYS[4]
+
+local dead_threshold = tonumber(ARGV[1])
+local prefix         = ARGV[2]
+local instance_id    = ARGV[3]
+
+local ts = now_ms()
+redis.call('ZADD', instances_key, ts, instance_id)
+delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts, instance_id)
+"#;
 #[derive(Debug, Clone)]
 pub struct InstanceAwareCounterOptions {
     /// Redis key prefix used to namespace all counter keys.
@@ -251,6 +307,8 @@ pub struct InstanceAwareCounter {
     get_script: Script,
     del_script: Script,
     del_on_instance_script: Script,
+    clear_script: Script,
+    clear_on_instance_script: Script,
 }
 
 impl InstanceAwareCounter {
@@ -475,5 +533,47 @@ impl InstanceAwareCounter {
         self.set_local_epoch(key, redis_epoch);
 
         Ok((new_cumulative, removed_count))
+    }
+    pub async fn clear(&self) -> Result<(), DistkitError> {
+        self.activity.signal();
+
+        let mut conn = self.connection_manager.clone();
+
+        let _: () = self
+            .clear_script
+            .key(self.epoch_key())
+            .key(self.instances_key())
+            .key(self.cumulative_key())
+            .key(self.keys_key())
+            .arg(self.prefix_str())
+            .invoke_async(&mut conn)
+            .await?;
+
+        self.local_epochs.clear();
+
+        Ok(())
+    }
+
+    /// Removes only this instance's contributions for all keys from the
+    /// cumulative totals, without affecting other instances.
+    pub async fn clear_on_instance(&self) -> Result<(), DistkitError> {
+        self.activity.signal();
+
+        let mut conn = self.connection_manager.clone();
+
+        let _: () = self
+            .clear_on_instance_script
+            .key(self.epoch_key())
+            .key(self.instances_key())
+            .key(self.cumulative_key())
+            .key(self.keys_key())
+            .key(self.inst_count_key())
+            .arg(self.dead_instance_threshold_ms)
+            .arg(self.prefix_str())
+            .arg(&self.instance_id)
+            .invoke_async(&mut conn)
+            .await?;
+
+        Ok(())
     }
 }
