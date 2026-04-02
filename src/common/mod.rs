@@ -1,7 +1,13 @@
 use std::{
     ops::{Deref, DerefMut},
     sync::Mutex,
+    time::Duration,
 };
+
+mod activity_tracker;
+pub(crate) use activity_tracker::*;
+
+pub(crate) const EPOCH_CHANGE_INTERVAL: Duration = Duration::from_secs(15);
 
 use crate::DistkitError;
 

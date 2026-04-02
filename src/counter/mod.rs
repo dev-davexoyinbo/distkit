@@ -17,8 +17,6 @@ pub use strict_counter::*;
 mod counter_trait;
 pub use counter_trait::*;
 
-mod common;
-
 mod error;
 pub use error::*;
 
