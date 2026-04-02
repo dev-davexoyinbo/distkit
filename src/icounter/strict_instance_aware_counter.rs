@@ -300,7 +300,7 @@ delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_thre
 
 /// Options for constructing an [`InstanceAwareCounter`].
 #[derive(Debug, Clone)]
-pub struct InstanceAwareCounterOptions {
+pub struct StrictInstanceAwareCounterOptions {
     /// Redis key prefix used to namespace all counter keys.
     pub prefix: RedisKey,
     /// Redis connection manager.
@@ -310,7 +310,7 @@ pub struct InstanceAwareCounterOptions {
     pub dead_instance_threshold_ms: u64,
 }
 
-impl InstanceAwareCounterOptions {
+impl StrictInstanceAwareCounterOptions {
     /// Creates options with a default `dead_instance_threshold_ms` of 30 000 ms.
     pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
         Self {
@@ -337,7 +337,7 @@ impl InstanceAwareCounterOptions {
 ///
 /// Construct via [`InstanceAwareCounter::new`], which returns an `Arc<Self>`.
 #[derive(Debug)]
-pub struct InstanceAwareCounter {
+pub struct StrictInstanceAwareCounter {
     connection_manager: ConnectionManager,
     key_generator: RedisKeyGenerator,
     instance_id: String,
@@ -356,10 +356,10 @@ pub struct InstanceAwareCounter {
     activity: Arc<ActivityTracker>,
 }
 
-impl InstanceAwareCounter {
+impl StrictInstanceAwareCounter {
     /// Creates a new instance-aware counter and spawns its background heartbeat task.
-    pub fn new(options: InstanceAwareCounterOptions) -> Arc<Self> {
-        let InstanceAwareCounterOptions {
+    pub fn new(options: StrictInstanceAwareCounterOptions) -> Arc<Self> {
+        let StrictInstanceAwareCounterOptions {
             prefix,
             connection_manager,
             dead_instance_threshold_ms,

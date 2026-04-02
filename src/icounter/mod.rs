@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests;
 
-mod instance_aware_counter;
-pub use instance_aware_counter::*;
+mod strict_instance_aware_counter;
+pub use strict_instance_aware_counter::*;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
