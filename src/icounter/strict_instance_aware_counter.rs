@@ -60,6 +60,7 @@ local function delete_dead_instances(prefix, instances_key, cumulative_key, keys
     for _, inst_id in ipairs(to_remove) do
         local inst_count_key = prefix .. ':count:' .. inst_id
         local all_keys = redis.call('SMEMBERS', keys_key)
+
         if #all_keys > 0 then
             local values = redis.call('HMGET', inst_count_key, unpack(all_keys))
             for i = 1, #values do
@@ -69,6 +70,7 @@ local function delete_dead_instances(prefix, instances_key, cumulative_key, keys
                 end
             end
         end
+
         redis.call('DEL', inst_count_key)
         redis.call('ZREM', instances_key, inst_id)
     end
@@ -136,6 +138,7 @@ local local_epoch    = tonumber(ARGV[3])
 local dead_threshold = tonumber(ARGV[4])
 local prefix         = ARGV[5]
 local instance_id    = ARGV[6]
+local max_epoch      = tonumber(ARGV[7])
 
 local ts = now_ms()
 local instance_created = check_and_zadd(instances_key, instance_id, ts)
@@ -143,6 +146,9 @@ delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_thre
 
 local old_epoch = tonumber(redis.call('HGET', epoch_key, counter_key) or 0) or 0
 local new_epoch = old_epoch + 1
+if new_epoch > max_epoch then
+    new_epoch = 0
+end
 
 redis.call('HSET', epoch_key,      counter_key, new_epoch)
 redis.call('HSET', cumulative_key, counter_key, count)
@@ -220,6 +226,7 @@ local local_epoch    = tonumber(ARGV[2])
 local dead_threshold = tonumber(ARGV[3])
 local prefix         = ARGV[4]
 local instance_id    = ARGV[5]
+local max_epoch      = tonumber(ARGV[6])
 
 local ts = now_ms()
 local instance_created = check_and_zadd(instances_key, instance_id, ts)
@@ -228,6 +235,9 @@ delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_thre
 local old_cumulative = tonumber(redis.call('HGET', cumulative_key, counter_key) or 0) or 0
 local old_epoch = tonumber(redis.call('HGET', epoch_key, counter_key) or 0) or 0
 local new_epoch = old_epoch + 1
+if new_epoch > max_epoch then
+    new_epoch = 0
+end
 
 redis.call('HSET', epoch_key,      counter_key, new_epoch)
 redis.call('HDEL', cumulative_key, counter_key)
@@ -330,6 +340,41 @@ delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_thre
 return tostring(instance_created)
 "#;
 
+const INC_IF_EPOCH_MATCHES_LUA: &str = r#"
+local epoch_key      = KEYS[1]
+local instances_key  = KEYS[2]
+local cumulative_key = KEYS[3]
+local keys_key       = KEYS[4]
+local inst_count_key = KEYS[5]
+
+local counter_key    = ARGV[1]
+local recovery_count = tonumber(ARGV[2])
+local local_epoch    = tonumber(ARGV[3])
+local dead_threshold = tonumber(ARGV[4])
+local prefix         = ARGV[5]
+local instance_id    = ARGV[6]
+
+local ts = now_ms()
+check_and_zadd(instances_key, instance_id, ts)
+delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts)
+
+local redis_epoch = tonumber(redis.call('HGET', epoch_key, counter_key) or 0) or 0
+
+if redis_epoch ~= local_epoch then
+    -- Epoch moved while offline; contribution is stale — do not recover.
+    local cumulative = tonumber(redis.call('HGET', cumulative_key, counter_key) or 0) or 0
+    local inst_count = tonumber(redis.call('HGET', inst_count_key, counter_key) or 0) or 0
+    return {counter_key, cumulative, inst_count, redis_epoch}
+end
+
+-- Epoch still matches — safe to restore the contribution.
+local new_inst_count = tonumber(redis.call('HINCRBY', inst_count_key, counter_key, recovery_count))
+local new_cumulative = tonumber(redis.call('HINCRBY', cumulative_key,  counter_key, recovery_count))
+redis.call('SADD', keys_key, counter_key)
+
+return {counter_key, new_cumulative, new_inst_count, redis_epoch}
+"#;
+
 // ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
@@ -380,6 +425,8 @@ pub struct StrictInstanceAwareCounter {
     dead_instance_threshold_ms: u64,
     /// Per-key in-memory state: epoch, last-seen cumulative, and this instance's count.
     local_store: DashMap<RedisKey, SingleStore>,
+    /// Maximum epoch value before wrapping. Set to `u64::MAX / 2`.
+    max_epoch: u64,
     inc_script: Script,
     set_script: Script,
     set_on_instance_script: Script,
@@ -389,6 +436,7 @@ pub struct StrictInstanceAwareCounter {
     clear_script: Script,
     clear_on_instance_script: Script,
     mark_alive_script: Script,
+    inc_if_epoch_matches_script: Script,
     activity: Arc<ActivityTracker>,
 }
 
@@ -411,6 +459,7 @@ impl StrictInstanceAwareCounter {
             instance_id,
             dead_instance_threshold_ms,
             local_store: DashMap::default(),
+            max_epoch: u64::MAX / 2,
             inc_script: Script::new(&format!("{HELPERS_LUA}\n{INC_LUA}")),
             set_script: Script::new(&format!("{HELPERS_LUA}\n{SET_LUA}")),
             set_on_instance_script: Script::new(&format!("{HELPERS_LUA}\n{SET_ON_INSTANCE_LUA}")),
@@ -422,6 +471,9 @@ impl StrictInstanceAwareCounter {
                 "{HELPERS_LUA}\n{CLEAR_ON_INSTANCE_LUA}"
             )),
             mark_alive_script: Script::new(&format!("{HELPERS_LUA}\n{MARK_ALIVE_LUA}")),
+            inc_if_epoch_matches_script: Script::new(&format!(
+                "{HELPERS_LUA}\n{INC_IF_EPOCH_MATCHES_LUA}"
+            )),
             activity: ActivityTracker::new(EPOCH_CHANGE_INTERVAL),
         });
 
@@ -532,6 +584,91 @@ impl StrictInstanceAwareCounter {
         });
     }
 
+    /// Builds a Redis pipeline with one `INC_IF_EPOCH_MATCHES_LUA` invocation per
+    /// item in `chunk`. `load_script = true` prepends a `LOAD SCRIPT` command to
+    /// handle cache misses (mirrors `LaxCounter::build_commit_pipeline`).
+    fn build_recovery_pipeline(
+        &self,
+        chunk: &[(RedisKey, i64, u64)],
+        load_script: bool,
+    ) -> redis::Pipeline {
+        let mut pipe = redis::Pipeline::new();
+        if load_script {
+            pipe.load_script(&self.inc_if_epoch_matches_script).ignore();
+        }
+        for (key, count, local_epoch) in chunk {
+            pipe.invoke_script(
+                self.inc_if_epoch_matches_script
+                    .key(self.epoch_key())
+                    .key(self.instances_key())
+                    .key(self.cumulative_key())
+                    .key(self.keys_key())
+                    .key(self.inst_count_key())
+                    .arg(key.as_str())
+                    .arg(*count)
+                    .arg(*local_epoch)
+                    .arg(self.dead_instance_threshold_ms)
+                    .arg(self.prefix_str())
+                    .arg(&self.instance_id),
+            );
+        }
+        pipe
+    }
+
+    /// Sends recovery increments for all keys in `recoveries` using pipelined
+    /// `INC_IF_EPOCH_MATCHES_LUA` calls, chunked to avoid oversized pipelines.
+    /// After each chunk the returned `(key, cumulative, inst_count, redis_epoch)`
+    /// tuples are used to update `local_store` before the next chunk begins.
+    async fn recover_contributions_batched(
+        &self,
+        recoveries: Vec<(RedisKey, i64, u64)>,
+        chunk_size: usize,
+    ) -> Result<(), DistkitError> {
+        if recoveries.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.connection_manager.clone();
+        let mut processed = 0;
+
+        while processed < recoveries.len() {
+            let end = (processed + chunk_size).min(recoveries.len());
+            let chunk = &recoveries[processed..end];
+
+            let results: Vec<(String, i64, i64, i64)> = {
+                let pipe = self.build_recovery_pipeline(chunk, false);
+                match pipe.query_async(&mut conn).await {
+                    Ok(r) => r,
+                    Err(err) => {
+                        if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript)
+                        {
+                            return Err(DistkitError::RedisError(err));
+                        }
+                        // Script not in cache — reload and retry.
+                        let pipe = self.build_recovery_pipeline(chunk, true);
+                        pipe.query_async(&mut conn).await?
+                    }
+                }
+            };
+
+            // Each result carries its own key — no zip required.
+            for (key_str, cumulative, inst_count, redis_epoch) in results {
+                if let Ok(key) = RedisKey::try_from(key_str) {
+                    self.update_local_store(&key, redis_epoch as u64, cumulative, inst_count);
+                }
+            }
+
+            processed = end;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn trigger_mark_alive(&self) -> Result<(), DistkitError> {
+        self.mark_alive().await
+    }
+
     async fn mark_alive(&self) -> Result<(), DistkitError> {
         let mut conn = self.connection_manager.clone();
 
@@ -546,6 +683,27 @@ impl StrictInstanceAwareCounter {
             .arg(&self.instance_id)
             .invoke_async(&mut conn)
             .await?;
+
+        if instance_created != 0i8 {
+            // The instance was cleaned up while offline. Recover contributions
+            // for all keys that still have a positive local count, but only
+            // when the per-key epoch in Redis still matches — epoch-safe recovery.
+            let recoveries: Vec<(RedisKey, i64, u64)> = self
+                .local_store
+                .iter()
+                .filter_map(|e| {
+                    let count = e.local_count.load(Ordering::Acquire);
+                    let epoch = e.epoch.load(Ordering::Acquire);
+                    if count > 0 {
+                        Some((e.key().clone(), count, epoch))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let _ = self.recover_contributions_batched(recoveries, 50).await;
+        }
 
         Ok(())
     }
@@ -571,26 +729,23 @@ impl StrictInstanceAwareCounter {
         let mut conn = self.connection_manager.clone();
         let local_epoch = self.get_local_epoch(key);
 
-        let result: Vec<i64> = self
-            .inc_script
-            .key(self.epoch_key())
-            .key(self.instances_key())
-            .key(self.cumulative_key())
-            .key(self.keys_key())
-            .key(self.inst_count_key())
-            .arg(key.as_str())
-            .arg(count)
-            .arg(local_epoch)
-            .arg(self.dead_instance_threshold_ms)
-            .arg(self.prefix_str())
-            .arg(&self.instance_id)
-            .invoke_async(&mut conn)
-            .await?;
+        let (cumulative, inst_count, redis_epoch, instance_created_raw): (i64, i64, u64, i64) =
+            self.inc_script
+                .key(self.epoch_key())
+                .key(self.instances_key())
+                .key(self.cumulative_key())
+                .key(self.keys_key())
+                .key(self.inst_count_key())
+                .arg(key.as_str())
+                .arg(count)
+                .arg(local_epoch)
+                .arg(self.dead_instance_threshold_ms)
+                .arg(self.prefix_str())
+                .arg(&self.instance_id)
+                .invoke_async(&mut conn)
+                .await?;
 
-        let cumulative = result[0];
-        let inst_count = result[1];
-        let redis_epoch = result[2] as u64;
-        let instance_created = result[3] != 0;
+        let instance_created = instance_created_raw != 0;
         let should_recover = instance_created && local_epoch == redis_epoch;
 
         let old_local_count = self.get_local_count(key);
@@ -615,7 +770,7 @@ impl StrictInstanceAwareCounter {
         let mut conn = self.connection_manager.clone();
         let local_epoch = self.get_local_epoch(key);
 
-        let result: Vec<i64> = self
+        let (cumulative, inst_count, new_epoch_raw, _): (i64, i64, u64, i64) = self
             .set_script
             .key(self.epoch_key())
             .key(self.instances_key())
@@ -628,14 +783,12 @@ impl StrictInstanceAwareCounter {
             .arg(self.dead_instance_threshold_ms)
             .arg(self.prefix_str())
             .arg(&self.instance_id)
+            .arg(self.max_epoch)
             .invoke_async(&mut conn)
             .await?;
 
-        let cumulative = result[0];
-        let inst_count = result[1];
-        let new_epoch = result[2] as u64;
         // No recovery: epoch always bumps, so local_epoch != new_epoch
-        self.update_local_store(key, new_epoch, cumulative, inst_count);
+        self.update_local_store(key, new_epoch_raw, cumulative, inst_count);
 
         Ok((cumulative, inst_count))
     }
@@ -656,7 +809,7 @@ impl StrictInstanceAwareCounter {
         let mut conn = self.connection_manager.clone();
         let local_epoch = self.get_local_epoch(key);
 
-        let result: Vec<i64> = self
+        let (cumulative, inst_count, redis_epoch_raw, _): (i64, i64, u64, i64) = self
             .set_on_instance_script
             .key(self.epoch_key())
             .key(self.instances_key())
@@ -672,11 +825,8 @@ impl StrictInstanceAwareCounter {
             .invoke_async(&mut conn)
             .await?;
 
-        let cumulative = result[0];
-        let inst_count = result[1];
-        let redis_epoch = result[2] as u64;
         // No recovery: caller is explicitly setting their contribution to a specific value.
-        self.update_local_store(key, redis_epoch, cumulative, inst_count);
+        self.update_local_store(key, redis_epoch_raw, cumulative, inst_count);
 
         Ok((cumulative, inst_count))
     }
@@ -691,25 +841,22 @@ impl StrictInstanceAwareCounter {
         let mut conn = self.connection_manager.clone();
         let local_epoch = self.get_local_epoch(key);
 
-        let result: Vec<i64> = self
-            .get_script
-            .key(self.epoch_key())
-            .key(self.instances_key())
-            .key(self.cumulative_key())
-            .key(self.keys_key())
-            .key(self.inst_count_key())
-            .arg(key.as_str())
-            .arg(local_epoch)
-            .arg(self.dead_instance_threshold_ms)
-            .arg(self.prefix_str())
-            .arg(&self.instance_id)
-            .invoke_async(&mut conn)
-            .await?;
+        let (cumulative, inst_count, redis_epoch, instance_created_raw): (i64, i64, u64, i64) =
+            self.get_script
+                .key(self.epoch_key())
+                .key(self.instances_key())
+                .key(self.cumulative_key())
+                .key(self.keys_key())
+                .key(self.inst_count_key())
+                .arg(key.as_str())
+                .arg(local_epoch)
+                .arg(self.dead_instance_threshold_ms)
+                .arg(self.prefix_str())
+                .arg(&self.instance_id)
+                .invoke_async(&mut conn)
+                .await?;
 
-        let cumulative = result[0];
-        let inst_count = result[1];
-        let redis_epoch = result[2] as u64;
-        let instance_created = result[3] != 0;
+        let instance_created = instance_created_raw != 0;
         let should_recover = instance_created && local_epoch == redis_epoch;
 
         let old_local_count = self.get_local_count(key);
@@ -731,7 +878,7 @@ impl StrictInstanceAwareCounter {
         let mut conn = self.connection_manager.clone();
         let local_epoch = self.get_local_epoch(key);
 
-        let result: Vec<i64> = self
+        let (old_cumulative, _, _): (i64, i64, i64) = self
             .del_script
             .key(self.epoch_key())
             .key(self.instances_key())
@@ -743,10 +890,10 @@ impl StrictInstanceAwareCounter {
             .arg(self.dead_instance_threshold_ms)
             .arg(self.prefix_str())
             .arg(&self.instance_id)
+            .arg(self.max_epoch)
             .invoke_async(&mut conn)
             .await?;
 
-        let old_cumulative = result[0];
         let old_inst_count = self.get_local_count(key);
 
         // Key deleted globally; remove from local store entirely.
@@ -765,7 +912,7 @@ impl StrictInstanceAwareCounter {
         let mut conn = self.connection_manager.clone();
         let local_epoch = self.get_local_epoch(key);
 
-        let result: Vec<i64> = self
+        let (new_cumulative, removed_count, redis_epoch, _): (i64, i64, u64, i64) = self
             .del_on_instance_script
             .key(self.epoch_key())
             .key(self.instances_key())
@@ -780,9 +927,6 @@ impl StrictInstanceAwareCounter {
             .invoke_async(&mut conn)
             .await?;
 
-        let new_cumulative = result[0];
-        let removed_count = result[1];
-        let redis_epoch = result[2] as u64;
         // No recovery: explicit removal intent; local_count becomes 0.
         self.update_local_store(key, redis_epoch, new_cumulative, 0);
 
