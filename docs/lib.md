@@ -1,21 +1,25 @@
 A toolkit of distributed systems primitives for Rust, backed by Redis.
 
 `distkit` provides building blocks for distributed applications. The crate
-currently offers two modules:
+currently offers three modules:
 
 - **Counters** (`counter` feature, enabled by default) -- two counter
   implementations that share a common async trait, letting you choose between
   immediate consistency and high-throughput eventual consistency.
+- **Instance-aware counters** (`instance-aware-counter` feature) -- counters
+  where each running process owns a named slice of the total, with automatic
+  cleanup of contributions from processes that stop heartbeating.
 - **Rate limiting** (`trypema` feature, opt-in) -- re-exports the
   [`trypema`](https://docs.rs/trypema) crate, providing sliding-window rate
   limiting with local, Redis-backed, and hybrid providers.
 
 # Feature flags
 
-| Feature   | Default | Description                                                      |
-| --------- | ------- | ---------------------------------------------------------------- |
-| `counter` | **yes** | Distributed counters ([`StrictCounter`], [`LaxCounter`])         |
-| `trypema` | no      | Rate limiting via the [`trypema`](https://docs.rs/trypema) crate |
+| Feature                    | Default | Description                                                                                           |
+| -------------------------- | ------- | ----------------------------------------------------------------------------------------------------- |
+| `counter`                  | **yes** | Distributed counters ([`StrictCounter`], [`LaxCounter`])                                              |
+| `instance-aware-counter`   | no      | Per-instance counters ([`StrictInstanceAwareCounter`], [`LaxInstanceAwareCounter`])                   |
+| `trypema`                  | no      | Rate limiting via the [`trypema`](https://docs.rs/trypema) crate                                      |
 
 # Quick start
 
@@ -102,6 +106,178 @@ deltas to the same hash structure using `HINCRBY` in batched pipelines.
 
 Both counter types sharing the same prefix occupy **separate** hash keys
 (different type suffixes), so they never interfere with each other.
+
+# Instance-aware counters
+
+Enable the `instance-aware-counter` feature to access per-instance distributed
+counters.
+
+```toml
+[dependencies]
+distkit = { version = "0.1", features = ["instance-aware-counter"] }
+```
+
+Instance-aware counters track each running process's contribution separately.
+The cumulative total is the sum of all **live** instances. When a process stops
+heartbeating for longer than `dead_instance_threshold_ms` (default 30 s), its
+contribution is automatically subtracted from the cumulative on the next
+operation by any surviving instance.
+
+This makes them well-suited for:
+
+- **Connection pool sizing** -- each server reports its active connection count;
+  the cumulative is the cluster-wide total.
+- **Live session counting** -- contributions disappear naturally when a node
+  restarts or crashes.
+- **Per-node metrics** -- see both the global total and each instance's slice.
+
+## StrictInstanceAwareCounter
+
+Every call is immediately consistent with Redis. `set` and `del` bump a
+per-key **epoch** that causes stale instances to reset their stored count on
+their next operation, preventing double-counting.
+
+```rust,no_run
+# use distkit::icounter::{
+#     InstanceAwareCounterTrait,
+#     StrictInstanceAwareCounter, StrictInstanceAwareCounterOptions,
+# };
+# use distkit::RedisKey;
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+# let client = redis::Client::open("redis://127.0.0.1/")?;
+# let conn = client.get_connection_manager().await?;
+let prefix = RedisKey::try_from("my_app".to_string())?;
+let counter = StrictInstanceAwareCounter::new(
+    StrictInstanceAwareCounterOptions::new(prefix, conn),
+);
+
+let key = RedisKey::try_from("connections".to_string())?;
+
+// Increment this instance's contribution; returns (cumulative, instance_count).
+let (total, mine) = counter.inc(&key, 5).await?;
+
+// Read without modifying.
+let (total, mine) = counter.get(&key).await?;
+
+// Set this instance's slice to an exact value without bumping the epoch.
+// Other instances are not affected.
+let (total, mine) = counter.set_on_instance(&key, 10).await?;
+
+// Set the global total to an exact value and bump the epoch, making all
+// other instances' stored counts stale.
+let (total, mine) = counter.set(&key, 100).await?;
+
+// Remove only this instance's contribution (no epoch bump).
+let (total, removed) = counter.del_on_instance(&key).await?;
+
+// Delete the key globally and bump the epoch.
+let (old_total, _) = counter.del(&key).await?;
+# Ok(())
+# }
+```
+
+### Dead-instance cleanup
+
+Each instance sends a heartbeat on every operation. If a process silently dies,
+surviving instances automatically remove its contribution the next time any of
+them touches the same key.
+
+```rust,no_run
+# use distkit::icounter::{
+#     InstanceAwareCounterTrait,
+#     StrictInstanceAwareCounter, StrictInstanceAwareCounterOptions,
+# };
+# use distkit::RedisKey;
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+# let client = redis::Client::open("redis://127.0.0.1/")?;
+# let conn1 = client.get_connection_manager().await?;
+# let conn2 = client.get_connection_manager().await?;
+let prefix = RedisKey::try_from("my_app".to_string())?;
+let key = RedisKey::try_from("connections".to_string())?;
+
+// Two independent instances sharing the same prefix.
+let opts = |conn| StrictInstanceAwareCounterOptions {
+    prefix: prefix.clone(),
+    connection_manager: conn,
+    dead_instance_threshold_ms: 30_000, // 30 s
+};
+let server_a = StrictInstanceAwareCounter::new(opts(conn1));
+let server_b = StrictInstanceAwareCounter::new(opts(conn2));
+
+server_a.inc(&key, 10).await?; // cumulative = 10
+server_b.inc(&key,  5).await?; // cumulative = 15
+
+// server_a goes offline. After 30 s, server_b's next call removes its
+// contribution automatically.
+let (total, _) = server_b.get(&key).await?; // total = 5 once cleaned up
+# Ok(())
+# }
+```
+
+## LaxInstanceAwareCounter
+
+A buffered wrapper around [`StrictInstanceAwareCounter`]. `inc` calls
+accumulate locally and are flushed to the strict counter in bulk every
+`flush_interval` (default 20 ms). Global operations (`set`, `del`, `clear`)
+flush any pending delta first, then delegate immediately.
+
+Use this when you have many `inc`/`dec` calls per second and can tolerate a
+small consistency lag.
+
+```rust,no_run
+# use distkit::icounter::{
+#     InstanceAwareCounterTrait,
+#     LaxInstanceAwareCounter, LaxInstanceAwareCounterOptions,
+# };
+# use distkit::RedisKey;
+# use std::time::Duration;
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+# let client = redis::Client::open("redis://127.0.0.1/")?;
+# let conn = client.get_connection_manager().await?;
+let prefix = RedisKey::try_from("my_app".to_string())?;
+let counter = LaxInstanceAwareCounter::new(LaxInstanceAwareCounterOptions {
+    prefix,
+    connection_manager: conn,
+    dead_instance_threshold_ms: 30_000,
+    flush_interval: Duration::from_millis(20),
+    allowed_lag:    Duration::from_millis(20),
+});
+
+let key = RedisKey::try_from("connections".to_string())?;
+
+// Returns the local estimate immediately — no Redis round-trip on warm path.
+let (local_total, mine) = counter.inc(&key, 1).await?;
+
+// get() also returns the local estimate (cumulative + pending delta).
+// A fresh instance with no local state falls back to the strict counter.
+let (total, mine) = counter.get(&key).await?;
+# Ok(())
+# }
+```
+
+## Choosing between strict and lax instance-aware counters
+
+|                      | [`StrictInstanceAwareCounter`]           | [`LaxInstanceAwareCounter`]                   |
+| -------------------- | ---------------------------------------- | --------------------------------------------- |
+| **Consistency**      | Immediate                                | Eventual (`flush_interval` lag)               |
+| **`inc` latency**    | Redis round-trip                         | Sub-microsecond (warm path)                   |
+| **Redis I/O**        | Every `inc`                              | Batched on interval via `inc_batch`            |
+| **`set` / `del`**    | Immediate                                | Flushes pending delta, then immediate         |
+| **Use case**         | Connection counts, exact live metrics    | High-frequency per-node throughput metrics    |
+
+Both types implement [`InstanceAwareCounterTrait`], allowing generic code:
+
+```rust,no_run
+# use distkit::{DistkitError, RedisKey, icounter::InstanceAwareCounterTrait};
+async fn report_connection<C: InstanceAwareCounterTrait>(
+    counter: &C,
+    key: &RedisKey,
+    delta: i64,
+) -> Result<i64, DistkitError> {
+    let (total, _mine) = counter.inc(key, delta).await?;
+    Ok(total)
+}
+```
 
 # Rate limiting (trypema)
 
@@ -290,3 +466,6 @@ details and advanced configuration.
 [`CounterTrait`]: counter::CounterTrait
 [`CounterOptions`]: counter::CounterOptions
 [`Counter`]: counter::Counter
+[`StrictInstanceAwareCounter`]: icounter::StrictInstanceAwareCounter
+[`LaxInstanceAwareCounter`]: icounter::LaxInstanceAwareCounter
+[`InstanceAwareCounterTrait`]: icounter::InstanceAwareCounterTrait

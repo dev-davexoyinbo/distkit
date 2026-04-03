@@ -379,7 +379,7 @@ return {counter_key, new_cumulative, new_inst_count, redis_epoch}
 // Options
 // ---------------------------------------------------------------------------
 
-/// Options for constructing an [`InstanceAwareCounter`].
+/// Options for constructing a [`StrictInstanceAwareCounter`].
 #[derive(Debug, Clone)]
 pub struct StrictInstanceAwareCounterOptions {
     /// Redis key prefix used to namespace all counter keys.
@@ -392,7 +392,7 @@ pub struct StrictInstanceAwareCounterOptions {
 }
 
 impl StrictInstanceAwareCounterOptions {
-    /// Creates options with a default `dead_instance_threshold_ms` of 30 000 ms.
+    /// Creates options with `dead_instance_threshold_ms` defaulting to 30 000 ms.
     pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
         Self {
             prefix,
@@ -406,17 +406,14 @@ impl StrictInstanceAwareCounterOptions {
 // Counter struct
 // ---------------------------------------------------------------------------
 
-/// Instance-aware distributed counter backed by Redis.
+/// Immediately-consistent instance-aware distributed counter backed by Redis.
 ///
-/// Each `InstanceAwareCounter` represents one running instance. Multiple
-/// instances sharing the same Redis prefix each maintain their own per-key
-/// count; the cumulative total is the sum of all live instances' counts.
+/// Each instance maintains its own per-key contribution; the cumulative total
+/// is the sum of all live instances. When an instance stops heartbeating for
+/// longer than `dead_instance_threshold_ms`, its contribution is automatically
+/// removed by the next surviving instance that touches the same key.
 ///
-/// When an instance stops heartbeating (no call for longer than
-/// `dead_instance_threshold_ms`), its contribution is automatically subtracted
-/// from the cumulative on the next operation by any surviving instance.
-///
-/// Construct via [`InstanceAwareCounter::new`], which returns an `Arc<Self>`.
+/// Construct via [`StrictInstanceAwareCounter::new`], which returns an `Arc<Self>`.
 #[derive(Debug)]
 pub struct StrictInstanceAwareCounter {
     connection_manager: ConnectionManager,
@@ -840,17 +837,15 @@ impl StrictInstanceAwareCounter {
     // Public API
     // -----------------------------------------------------------------------
 
-    /// Returns this instance's unique identifier.
+    /// This instance's unique identifier.
     pub fn instance_id(&self) -> &str {
         &self.instance_id
     }
 
-    /// Increments (or decrements if negative) the counter for `key` by `count`.
+    /// Adds `count` to this instance's contribution for `key`.
     ///
-    /// Stale-aware: if the local epoch is behind Redis, this instance's stored
-    /// count is reset to `count` before incrementing the cumulative.
-    ///
-    /// Returns the new cumulative total.
+    /// If the local epoch is stale, the stored count is reset to `count` before
+    /// incrementing. Returns `(cumulative, instance_count)`.
     pub async fn inc(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
@@ -892,12 +887,10 @@ impl StrictInstanceAwareCounter {
         Ok((cumulative, inst_count))
     }
 
-    /// Sets the cumulative total for `key` to `count`, bumping the epoch.
+    /// Sets the global cumulative for `key` to `count` and bumps the epoch.
     ///
-    /// This is a global operation: all other instances will detect the epoch
-    /// change on their next operation and treat their stored counts as stale.
-    ///
-    /// Returns the new cumulative total (equal to `count`).
+    /// All other instances see their stored count as stale on their next
+    /// operation. Returns `(cumulative, instance_count)`.
     pub async fn set(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
@@ -927,12 +920,10 @@ impl StrictInstanceAwareCounter {
         Ok((cumulative, inst_count))
     }
 
-    /// Sets only this instance's contribution for `key` to `count`, without bumping the epoch.
+    /// Sets this instance's contribution for `key` to `count` without bumping the epoch.
     ///
-    /// If this instance's stored count is stale (epoch mismatch), treats the
-    /// old contribution as 0 when computing the delta applied to the cumulative.
-    ///
-    /// Returns `(new_cumulative, instance_count)`.
+    /// On epoch mismatch the previous contribution is treated as 0.
+    /// Returns `(cumulative, instance_count)`.
     pub async fn set_on_instance(
         &self,
         key: &RedisKey,
@@ -965,10 +956,7 @@ impl StrictInstanceAwareCounter {
         Ok((cumulative, inst_count))
     }
 
-    /// Returns `(cumulative, instance_count)` for `key`.
-    ///
-    /// Also triggers dead-instance cleanup and updates the liveness ZSET for
-    /// this instance.
+    /// Returns `(cumulative, instance_count)` for `key`, triggering dead-instance cleanup.
     pub async fn get(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
@@ -1003,9 +991,7 @@ impl StrictInstanceAwareCounter {
         Ok((cumulative, inst_count))
     }
 
-    /// Deletes `key` globally, bumping the epoch to invalidate all instances.
-    ///
-    /// Returns the cumulative total before deletion.
+    /// Deletes `key` globally and bumps the epoch. Returns `(old_cumulative, instance_count)`.
     pub async fn del(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
@@ -1037,9 +1023,8 @@ impl StrictInstanceAwareCounter {
         Ok((old_cumulative, old_inst_count))
     }
 
-    /// Removes only this instance's contribution for `key`, without bumping the epoch.
-    ///
-    /// Returns `(new_cumulative, removed_count)`.
+    /// Removes this instance's contribution for `key` without bumping the epoch.
+    /// Returns `(cumulative, removed_count)`.
     pub async fn del_on_instance(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
@@ -1067,8 +1052,7 @@ impl StrictInstanceAwareCounter {
         Ok((new_cumulative, removed_count))
     }
 
-    /// Clears all keys and all instance state from Redis, then clears the
-    /// local epoch map.
+    /// Removes all keys and all instance state from Redis.
     pub async fn clear(&self) -> Result<(), DistkitError> {
         self.activity.signal();
 
@@ -1089,8 +1073,7 @@ impl StrictInstanceAwareCounter {
         Ok(())
     }
 
-    /// Removes only this instance's contributions for all keys from the
-    /// cumulative totals, without affecting other instances.
+    /// Removes this instance's contribution from every key without affecting other instances.
     pub async fn clear_on_instance(&self) -> Result<(), DistkitError> {
         self.activity.signal();
 
