@@ -71,7 +71,7 @@ impl StrictCounter {
             ..
         } = options;
 
-        let key_generator = RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::StrictCounter);
+        let key_generator = RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::Strict);
         let inc_script = Script::new(INC_LUA);
         let get_script = Script::new(GET_LUA);
         let set_script = Script::new(SET_LUA);

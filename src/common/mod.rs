@@ -67,13 +67,13 @@ impl TryFrom<String> for RedisKey {
 #[derive(Clone, Debug, strum_macros::Display)]
 pub(crate) enum RedisKeyGeneratorTypeKey {
     #[strum(to_string = "lax_counter")]
-    LaxCounter,
+    Lax,
     #[strum(to_string = "strict_counter")]
-    StrictCounter,
+    Strict,
     #[strum(to_string = "instance_aware_counter")]
-    InstanceAwareCounter,
+    InstanceAware,
     #[strum(to_string = "lax_instance_aware_counter")]
-    LaxInstanceAwareCounter,
+    LaxInstanceAware,
 }
 
 #[derive(Clone, Debug)]

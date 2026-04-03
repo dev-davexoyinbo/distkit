@@ -484,8 +484,7 @@ impl StrictInstanceAwareCounter {
             connection_manager,
             dead_instance_threshold_ms,
         } = options;
-        let key_generator =
-            RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::InstanceAwareCounter);
+        let key_generator = RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::InstanceAware);
         Self::build(
             key_generator,
             connection_manager,
@@ -504,7 +503,7 @@ impl StrictInstanceAwareCounter {
             dead_instance_threshold_ms,
         } = options;
         let key_generator =
-            RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::LaxInstanceAwareCounter);
+            RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::LaxInstanceAware);
         Self::build(
             key_generator,
             connection_manager,

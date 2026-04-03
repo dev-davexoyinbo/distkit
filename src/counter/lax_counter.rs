@@ -101,7 +101,7 @@ impl LaxCounter {
             connection_manager,
             allowed_lag,
         } = options;
-        let key_generator = RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::LaxCounter);
+        let key_generator = RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::Lax);
 
         let get_script = Script::new(GET_LUA);
         let del_script = Script::new(DEL_LUA);
