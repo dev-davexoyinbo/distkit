@@ -957,7 +957,7 @@ async fn no_recovery_for_live_instance() {
     let k = key("x");
 
     c1.inc(&k, 20).await.unwrap(); // cumulative = 20
-    c1.inc(&k, 5).await.unwrap();  // instance is still live; no recovery; cumulative = 25
+    c1.inc(&k, 5).await.unwrap(); // instance is still live; no recovery; cumulative = 25
 
     let (cum, c1_inst) = c2.get(&k).await.unwrap();
     assert_eq!(cum, 25);
