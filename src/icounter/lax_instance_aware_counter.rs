@@ -75,6 +75,27 @@ pub struct LaxInstanceAwareCounterOptions {
 
 impl LaxInstanceAwareCounterOptions {
     /// Creates options with sensible defaults.
+    ///
+    /// Defaults: `dead_instance_threshold_ms = 30_000`, `flush_interval = 20 ms`,
+    /// `allowed_lag = 20 ms`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use distkit::{RedisKey, icounter::LaxInstanceAwareCounterOptions};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let redis_url = std::env::var("REDIS_URL")
+    ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    /// let client = redis::Client::open(redis_url)?;
+    /// let conn = client.get_connection_manager().await?;
+    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let opts = LaxInstanceAwareCounterOptions::new(prefix, conn);
+    /// assert_eq!(opts.dead_instance_threshold_ms, 30_000);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
         Self {
             prefix,
@@ -108,6 +129,29 @@ pub struct LaxInstanceAwareCounter {
 
 impl LaxInstanceAwareCounter {
     /// Creates a new lax instance-aware counter and spawns its background flush task.
+    ///
+    /// `inc` deltas are buffered locally and flushed to the backing
+    /// [`StrictInstanceAwareCounter`] every `flush_interval`. The background
+    /// task holds a [`Weak`](std::sync::Weak) reference and stops automatically
+    /// when the counter is dropped.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use distkit::{RedisKey, icounter::{LaxInstanceAwareCounter, LaxInstanceAwareCounterOptions, InstanceAwareCounterTrait}};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let redis_url = std::env::var("REDIS_URL")
+    ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    /// let client = redis::Client::open(redis_url)?;
+    /// let conn = client.get_connection_manager().await?;
+    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let counter = LaxInstanceAwareCounter::new(LaxInstanceAwareCounterOptions::new(prefix, conn));
+    /// assert!(!counter.instance_id().is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(options: LaxInstanceAwareCounterOptions) -> Arc<Self> {
         let LaxInstanceAwareCounterOptions {
             prefix,
@@ -304,10 +348,48 @@ impl LaxInstanceAwareCounter {
 
 #[async_trait::async_trait]
 impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
+    /// Returns this instance's unique identifier.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_icounter().await?;
+    /// assert!(!counter.instance_id().is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
     fn instance_id(&self) -> &str {
         self.strict.instance_id()
     }
 
+    /// Buffers `count` locally and returns the updated local estimate without
+    /// a Redis round-trip.
+    ///
+    /// On the first call for a key, the current value is fetched from the
+    /// backing [`StrictInstanceAwareCounter`] to seed the local cache. Subsequent
+    /// calls accumulate into a single `inc_batch` that is flushed after
+    /// `flush_interval` (default 20 ms). Returns `(cumulative, instance_count)`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_icounter().await?;
+    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// // All three calls are sub-microsecond; no Redis round-trip until flush.
+    /// let (c1, s1) = counter.inc(&key, 1).await?;
+    /// let (c2, s2) = counter.inc(&key, 1).await?;
+    /// let (c3, s3) = counter.inc(&key, 1).await?;
+    /// assert_eq!(c3, 3);
+    /// assert_eq!(s3, 3);
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn inc(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
@@ -338,10 +420,51 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         Ok((cumulative + delta, instance_count + delta))
     }
 
+    /// Decrements the counter locally. Equivalent to `inc(key, -count)`.
+    ///
+    /// Returns `(cumulative, instance_count)` as a local estimate.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_icounter().await?;
+    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// counter.inc(&key, 10).await?;
+    /// let (cumulative, slice) = counter.dec(&key, 4).await?;
+    /// assert_eq!(cumulative, 6);
+    /// assert_eq!(slice, 6);
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn dec(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.inc(key, -count).await
     }
 
+    /// Flushes any pending delta for `key` to the backing strict counter,
+    /// then calls `strict.set`, which bumps the epoch and makes the change
+    /// immediately visible to all instances.
+    ///
+    /// Returns `(cumulative, instance_count)`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_icounter().await?;
+    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// counter.inc(&key, 5).await?; // buffered locally
+    /// // Pending delta flushed first; then strict.set takes over.
+    /// let (cumulative, slice) = counter.set(&key, 100).await?;
+    /// assert_eq!(cumulative, 100);
+    /// assert_eq!(slice, 100);
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn set(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
@@ -354,6 +477,31 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         Ok((cumulative, instance_count))
     }
 
+    /// Adjusts the local delta so this instance's contribution reaches `count`,
+    /// without a Redis round-trip and without bumping the epoch.
+    ///
+    /// On the first call for a key the current value is fetched from Redis to
+    /// seed the cache. Returns `(cumulative, instance_count)` as a local estimate.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let (server_a, server_b) = distkit::__doctest_helpers::two_lax_icounters().await?;
+    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// server_a.inc(&key, 10).await?;
+    /// server_b.inc(&key, 5).await?;
+    /// // Adjusts server_a's local delta to reach 7; no epoch bump.
+    /// let (cumulative, slice) = server_a.set_on_instance(&key, 7).await?;
+    /// assert_eq!(slice, 7);
+    /// // Local estimate only includes server_a's contribution;
+    /// // server_b's buffered delta has not been flushed to Redis yet.
+    /// assert_eq!(cumulative, 7);
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn set_on_instance(
         &self,
         key: &RedisKey,
@@ -388,6 +536,27 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         Ok((cumulative - instance_count + count, count))
     }
 
+    /// Returns `(cumulative + pending_delta, instance_count + pending_delta)`.
+    ///
+    /// On the first call for a key the current value is fetched from Redis to
+    /// seed the local cache. Subsequent reads return the local estimate without
+    /// a Redis round-trip.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_icounter().await?;
+    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// assert_eq!(counter.get(&key).await?, (0, 0));
+    /// counter.inc(&key, 5).await?;
+    /// // Returns local estimate (buffered delta included).
+    /// assert_eq!(counter.get(&key).await?, (5, 5));
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn get(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
@@ -418,6 +587,26 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         Ok((cumulative + delta, instance_count + delta))
     }
 
+    /// Flushes the pending delta for `key`, then deletes the key globally and
+    /// bumps the epoch. Returns `(old_cumulative, old_instance_count)`.
+    ///
+    /// After deletion, a subsequent `inc` or `get` starts fresh from `0`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_icounter().await?;
+    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// counter.inc(&key, 5).await?; // buffered
+    /// let (old_cumulative, _) = counter.del(&key).await?;
+    /// assert_eq!(old_cumulative, 5);
+    /// assert_eq!(counter.get(&key).await?, (0, 0));
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn del(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
         self.flush_key(key).await?;
@@ -426,6 +615,31 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         Ok(result)
     }
 
+    /// Flushes the pending delta for `key`, then removes only this instance's
+    /// contribution without bumping the epoch.
+    ///
+    /// Returns `(new_cumulative, removed_count)`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let (server_a, server_b) = distkit::__doctest_helpers::two_lax_icounters().await?;
+    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// server_a.inc(&key, 3).await?;
+    /// server_b.inc(&key, 7).await?;
+    /// // Flush server_a's pending delta, then remove only its slice.
+    /// let (new_cumulative, removed) = server_a.del_on_instance(&key).await?;
+    /// assert_eq!(removed, 3);
+    /// // Redis cumulative is 0 — server_b's delta is still buffered locally.
+    /// assert_eq!(new_cumulative, 0);
+    /// // Server_b's local view still shows its own buffered total.
+    /// assert_eq!(server_b.get(&key).await?, (7, 7));
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn del_on_instance(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
         self.flush_key(key).await?;
@@ -434,6 +648,26 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         Ok(result)
     }
 
+    /// Flushes all pending deltas, then removes all keys and instance state from
+    /// Redis. Clears the local store.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_icounter().await?;
+    /// let k1 = RedisKey::try_from("a".to_string())?;
+    /// let k2 = RedisKey::try_from("b".to_string())?;
+    /// counter.inc(&k1, 10).await?;
+    /// counter.inc(&k2, 20).await?;
+    /// counter.clear().await?;
+    /// assert_eq!(counter.get(&k1).await?, (0, 0));
+    /// assert_eq!(counter.get(&k2).await?, (0, 0));
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn clear(&self) -> Result<(), DistkitError> {
         self.activity.signal();
         self.flush_all_keys().await?;
@@ -442,6 +676,25 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         Ok(())
     }
 
+    /// Flushes all pending deltas, then removes only this instance's contributions
+    /// from Redis. Clears the local store for this instance.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let (server_a, server_b) = distkit::__doctest_helpers::two_lax_icounters().await?;
+    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// server_a.inc(&key, 3).await?;
+    /// server_b.inc(&key, 7).await?;
+    /// // Flush + remove only server_a's contributions; server_b's slice survives.
+    /// server_a.clear_on_instance().await?;
+    /// assert_eq!(server_b.get(&key).await?, (7, 7));
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn clear_on_instance(&self) -> Result<(), DistkitError> {
         self.activity.signal();
         self.flush_all_keys().await?;

@@ -393,6 +393,24 @@ pub struct StrictInstanceAwareCounterOptions {
 
 impl StrictInstanceAwareCounterOptions {
     /// Creates options with `dead_instance_threshold_ms` defaulting to 30 000 ms.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use distkit::{RedisKey, icounter::StrictInstanceAwareCounterOptions};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let redis_url = std::env::var("REDIS_URL")
+    ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    /// let client = redis::Client::open(redis_url)?;
+    /// let conn = client.get_connection_manager().await?;
+    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let opts = StrictInstanceAwareCounterOptions::new(prefix, conn);
+    /// assert_eq!(opts.dead_instance_threshold_ms, 30_000);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
         Self {
             prefix,
@@ -475,6 +493,28 @@ impl StrictInstanceAwareCounter {
     }
 
     /// Creates a new instance-aware counter and spawns its background heartbeat task.
+    ///
+    /// Each call returns a distinct `Arc<Self>` with a unique `instance_id`. The
+    /// heartbeat task holds a [`Weak`](std::sync::Weak) reference and stops
+    /// automatically when the counter is dropped.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use distkit::{RedisKey, icounter::{StrictInstanceAwareCounter, StrictInstanceAwareCounterOptions}};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let redis_url = std::env::var("REDIS_URL")
+    ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    /// let client = redis::Client::open(redis_url)?;
+    /// let conn = client.get_connection_manager().await?;
+    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let counter = StrictInstanceAwareCounter::new(StrictInstanceAwareCounterOptions::new(prefix, conn));
+    /// assert!(!counter.instance_id().is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(options: StrictInstanceAwareCounterOptions) -> Arc<Self> {
         let StrictInstanceAwareCounterOptions {
             prefix,
@@ -729,6 +769,24 @@ impl StrictInstanceAwareCounter {
     ///
     /// Returns `(counter_key, cumulative, instance_count)` for every entry that
     /// was committed. Also updates `local_store` from each result.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::RedisKey;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
+    /// let k1 = RedisKey::try_from("a".to_string())?;
+    /// let k2 = RedisKey::try_from("b".to_string())?;
+    /// let mut increments = vec![(k1, 3_i64), (k2, 7_i64)];
+    /// let results = counter.inc_batch(&mut increments, 50).await?;
+    /// // Successful entries are drained from the input vec.
+    /// assert!(increments.is_empty());
+    /// assert_eq!(results.len(), 2);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn inc_batch(
         &self,
         increments: &mut Vec<(RedisKey, i64)>,
@@ -838,6 +896,18 @@ impl StrictInstanceAwareCounter {
     // -----------------------------------------------------------------------
 
     /// This instance's unique identifier.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::RedisKey;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
+    /// assert!(!counter.instance_id().is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn instance_id(&self) -> &str {
         &self.instance_id
     }
@@ -846,6 +916,24 @@ impl StrictInstanceAwareCounter {
     ///
     /// If the local epoch is stale, the stored count is reset to `count` before
     /// incrementing. Returns `(cumulative, instance_count)`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::RedisKey;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
+    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let (cumulative_a, slice_a) = server_a.inc(&key, 3).await?;
+    /// assert_eq!(cumulative_a, 3);
+    /// assert_eq!(slice_a, 3);
+    /// let (cumulative_b, slice_b) = server_b.inc(&key, 5).await?;
+    /// assert_eq!(cumulative_b, 8); // both contributions
+    /// assert_eq!(slice_b, 5);      // only server_b's slice
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn inc(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
@@ -890,7 +978,26 @@ impl StrictInstanceAwareCounter {
     /// Sets the global cumulative for `key` to `count` and bumps the epoch.
     ///
     /// All other instances see their stored count as stale on their next
-    /// operation. Returns `(cumulative, instance_count)`.
+    /// operation. The calling instance becomes sole owner of the entire count.
+    /// Returns `(cumulative, instance_count)`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::RedisKey;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
+    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// server_a.inc(&key, 10).await?;
+    /// server_b.inc(&key, 5).await?;
+    /// // Epoch bumps; all previous per-instance contributions are cleared.
+    /// let (cumulative, slice) = server_a.set(&key, 100).await?;
+    /// assert_eq!(cumulative, 100);
+    /// assert_eq!(slice, 100); // server_a owns the entire count
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn set(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
@@ -922,8 +1029,26 @@ impl StrictInstanceAwareCounter {
 
     /// Sets this instance's contribution for `key` to `count` without bumping the epoch.
     ///
-    /// On epoch mismatch the previous contribution is treated as 0.
-    /// Returns `(cumulative, instance_count)`.
+    /// On epoch mismatch the previous contribution is treated as 0. Other
+    /// instances' slices are preserved. Returns `(cumulative, instance_count)`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::RedisKey;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
+    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// server_a.inc(&key, 10).await?;
+    /// server_b.inc(&key, 5).await?;
+    /// // No epoch bump: server_b's slice is not evicted.
+    /// let (cumulative, slice) = server_a.set_on_instance(&key, 7).await?;
+    /// assert_eq!(slice, 7);
+    /// assert_eq!(cumulative, 12); // server_a: 7 + server_b: 5
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn set_on_instance(
         &self,
         key: &RedisKey,
@@ -957,6 +1082,24 @@ impl StrictInstanceAwareCounter {
     }
 
     /// Returns `(cumulative, instance_count)` for `key`, triggering dead-instance cleanup.
+    ///
+    /// A missing key returns `(0, 0)`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::RedisKey;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
+    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// // A missing key returns (0, 0).
+    /// assert_eq!(counter.get(&key).await?, (0, 0));
+    /// counter.inc(&key, 5).await?;
+    /// assert_eq!(counter.get(&key).await?, (5, 5));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn get(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
@@ -991,7 +1134,28 @@ impl StrictInstanceAwareCounter {
         Ok((cumulative, inst_count))
     }
 
-    /// Deletes `key` globally and bumps the epoch. Returns `(old_cumulative, instance_count)`.
+    /// Deletes `key` globally and bumps the epoch. Returns `(old_cumulative, old_instance_count)`.
+    ///
+    /// All instances start fresh from `0` on their next operation. A non-existent key
+    /// returns `(0, 0)`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::RedisKey;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
+    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// server_a.inc(&key, 3).await?;
+    /// server_b.inc(&key, 7).await?;
+    /// let (old_cumulative, _) = server_a.del(&key).await?;
+    /// assert_eq!(old_cumulative, 10);
+    /// // After deletion both instances start fresh from 0.
+    /// assert_eq!(server_b.inc(&key, 1).await?, (1, 1));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn del(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
@@ -1024,7 +1188,26 @@ impl StrictInstanceAwareCounter {
     }
 
     /// Removes this instance's contribution for `key` without bumping the epoch.
-    /// Returns `(cumulative, removed_count)`.
+    ///
+    /// Other instances' slices are preserved. Returns `(new_cumulative, removed_count)`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::RedisKey;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
+    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// server_a.inc(&key, 3).await?;
+    /// server_b.inc(&key, 7).await?;
+    /// // Only server_a's slice is removed; server_b is unaffected.
+    /// let (new_cumulative, removed) = server_a.del_on_instance(&key).await?;
+    /// assert_eq!(removed, 3);
+    /// assert_eq!(new_cumulative, 7); // server_b's slice remains
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn del_on_instance(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
@@ -1053,6 +1236,24 @@ impl StrictInstanceAwareCounter {
     }
 
     /// Removes all keys and all instance state from Redis.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::RedisKey;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
+    /// let k1 = RedisKey::try_from("a".to_string())?;
+    /// let k2 = RedisKey::try_from("b".to_string())?;
+    /// counter.inc(&k1, 10).await?;
+    /// counter.inc(&k2, 20).await?;
+    /// counter.clear().await?;
+    /// assert_eq!(counter.get(&k1).await?, (0, 0));
+    /// assert_eq!(counter.get(&k2).await?, (0, 0));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn clear(&self) -> Result<(), DistkitError> {
         self.activity.signal();
 

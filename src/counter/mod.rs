@@ -42,6 +42,24 @@ pub struct CounterOptions {
 
 impl CounterOptions {
     /// Creates counter options with a default `allowed_lag` of 20 ms.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use distkit::{RedisKey, counter::CounterOptions};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let redis_url = std::env::var("REDIS_URL")
+    ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    /// let client = redis::Client::open(redis_url)?;
+    /// let conn = client.get_connection_manager().await?;
+    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let options = CounterOptions::new(prefix, conn);
+    /// // options.allowed_lag == Duration::from_millis(20)
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
         Self {
             prefix,

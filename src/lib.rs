@@ -22,3 +22,7 @@ pub mod trypema;
 
 mod error;
 pub use error::*;
+
+#[cfg(all(feature = "counter", feature = "instance-aware-counter"))]
+#[doc(hidden)]
+pub mod __doctest_helpers;

@@ -95,6 +95,27 @@ pub struct LaxCounter {
 
 impl LaxCounter {
     /// Creates a new lax counter and spawns its background flush task.
+    ///
+    /// The background task holds a [`Weak`](std::sync::Weak) reference and
+    /// stops automatically when the counter is dropped.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use distkit::{RedisKey, counter::{LaxCounter, CounterOptions}};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let redis_url = std::env::var("REDIS_URL")
+    ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    /// let client = redis::Client::open(redis_url)?;
+    /// let conn = client.get_connection_manager().await?;
+    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let counter = LaxCounter::new(CounterOptions::new(prefix, conn));
+    /// // The background flush task is now running.
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(options: CounterOptions) -> Arc<Self> {
         let CounterOptions {
             prefix,
@@ -343,6 +364,26 @@ impl LaxCounter {
 
 #[async_trait::async_trait]
 impl CounterTrait for LaxCounter {
+    /// Buffers `count` locally and returns the updated local estimate without
+    /// a Redis round-trip. Multiple `inc` calls accumulate into a single
+    /// `HINCRBY` that is flushed after `allowed_lag` (default 20 ms).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_counter().await?;
+    /// let key = RedisKey::try_from("hits".to_string())?;
+    /// // All three calls are sub-microsecond; no Redis round-trip until flush.
+    /// assert_eq!(counter.inc(&key, 1).await?, 1);
+    /// assert_eq!(counter.inc(&key, 1).await?, 2);
+    /// assert_eq!(counter.inc(&key, 1).await?, 3);
+    /// // After ~20 ms the background task sends a single HINCRBY +3 to Redis.
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
         self.activity.signal();
 
@@ -378,10 +419,48 @@ impl CounterTrait for LaxCounter {
         Ok(total)
     } // end function inc
 
+    /// Buffers `-count` locally and returns the updated local estimate without
+    /// a Redis round-trip. Equivalent to `inc(key, -count)`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_counter().await?;
+    /// let key = RedisKey::try_from("tokens".to_string())?;
+    /// counter.set(&key, 10).await?;
+    /// assert_eq!(counter.dec(&key, 3).await?, 7);
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn dec(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
         self.inc(key, -count).await
     } // end function dec
 
+    /// Returns the local view of the counter: the last remote total plus any
+    /// pending local delta. If the cached remote total is older than
+    /// `allowed_lag`, it is re-fetched from Redis first.
+    ///
+    /// Reads within the same process are always up-to-date. A separate
+    /// process only sees writes after the writing process has flushed and
+    /// the reading process's own cache has expired.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_counter().await?;
+    /// let key = RedisKey::try_from("hits".to_string())?;
+    /// counter.inc(&key, 7).await?;
+    /// // Returns remote_total (0) + pending_delta (7) = 7, no Redis round-trip.
+    /// assert_eq!(counter.get(&key).await?, 7);
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn get(&self, key: &RedisKey) -> Result<i64, DistkitError> {
         self.activity.signal();
         let store = match self.store.get(key) {
@@ -411,6 +490,27 @@ impl CounterTrait for LaxCounter {
         Ok(total)
     } // end function get
 
+    /// Records a target value locally. The background flush task sends a
+    /// corrective `HINCRBY` to Redis so the stored total reaches `count`.
+    /// Until flushed, other processes reading from Redis see the old value.
+    ///
+    /// Returns `count`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_counter().await?;
+    /// let key = RedisKey::try_from("inventory".to_string())?;
+    /// counter.inc(&key, 1000).await?;
+    /// // The write is buffered; this process sees the new value immediately.
+    /// assert_eq!(counter.set(&key, 850).await?, 850);
+    /// assert_eq!(counter.get(&key).await?, 850);
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn set(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
         self.activity.signal();
         let store = match self.store.get(key) {
@@ -441,6 +541,28 @@ impl CounterTrait for LaxCounter {
         Ok(count)
     } // end function set
 
+    /// Cancels any pending local delta for `key`, then immediately deletes
+    /// it from Redis. Returns the final value, including the cancelled delta.
+    ///
+    /// Unlike `inc` and `set`, `del` is **not** buffered — the Redis write
+    /// happens immediately to prevent the key from reappearing on the next
+    /// flush.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_counter().await?;
+    /// let key = RedisKey::try_from("session".to_string())?;
+    /// counter.inc(&key, 10).await?; // buffered, not yet in Redis
+    /// // Pending delta (10) is cancelled; Redis is updated immediately.
+    /// assert_eq!(counter.del(&key).await?, 10);
+    /// assert_eq!(counter.get(&key).await?, 0);
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn del(&self, key: &RedisKey) -> Result<i64, DistkitError> {
         self.activity.signal();
 
@@ -470,6 +592,26 @@ impl CounterTrait for LaxCounter {
         Ok(total)
     } // end function delete
 
+    /// Clears all pending local state and immediately removes all counters
+    /// under the current prefix from Redis.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_counter().await?;
+    /// let k1 = RedisKey::try_from("a".to_string())?;
+    /// let k2 = RedisKey::try_from("b".to_string())?;
+    /// counter.inc(&k1, 5).await?;
+    /// counter.inc(&k2, 10).await?;
+    /// counter.clear().await?;
+    /// assert_eq!(counter.get(&k1).await?, 0);
+    /// assert_eq!(counter.get(&k2).await?, 0);
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn clear(&self) -> Result<(), DistkitError> {
         self.activity.signal();
 
