@@ -4,10 +4,12 @@
 #![forbid(unsafe_code)]
 
 mod common;
-#[cfg(feature = "counter")]
 pub use common::*;
 #[cfg(feature = "counter")]
 pub mod counter;
+
+#[cfg(feature = "instance-aware-counter")]
+pub mod icounter;
 
 /// Rate limiting via the [`trypema`](https://docs.rs/trypema) crate.
 ///
@@ -20,3 +22,7 @@ pub mod trypema;
 
 mod error;
 pub use error::*;
+
+#[cfg(all(feature = "counter", feature = "instance-aware-counter"))]
+#[doc(hidden)]
+pub mod __doctest_helpers;

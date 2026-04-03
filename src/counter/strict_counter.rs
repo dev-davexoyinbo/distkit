@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
@@ -64,21 +66,38 @@ pub struct StrictCounter {
 
 impl StrictCounter {
     /// Creates a new strict counter from the given options.
-    pub fn new(options: CounterOptions) -> Self {
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use distkit::{RedisKey, counter::{StrictCounter, CounterOptions}};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let redis_url = std::env::var("REDIS_URL")
+    ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    /// let client = redis::Client::open(redis_url)?;
+    /// let conn = client.get_connection_manager().await?;
+    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let counter = StrictCounter::new(CounterOptions::new(prefix, conn));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new(options: CounterOptions) -> Arc<Self> {
         let CounterOptions {
             prefix,
             connection_manager,
             ..
         } = options;
 
-        let key_generator = RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::StrictCounter);
+        let key_generator = RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::Strict);
         let inc_script = Script::new(INC_LUA);
         let get_script = Script::new(GET_LUA);
         let set_script = Script::new(SET_LUA);
         let del_script = Script::new(DEL_LUA);
         let clear_script = Script::new(CLEAR_LUA);
 
-        Self {
+        Arc::new(Self {
             connection_manager,
             key_generator,
             inc_script,
@@ -86,7 +105,7 @@ impl StrictCounter {
             set_script,
             del_script,
             clear_script,
-        }
+        })
     }
 }
 

@@ -5,6 +5,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use distkit::counter::{CounterOptions, LaxCounter, StrictCounter};
+use distkit::icounter::{
+    LaxInstanceAwareCounter, LaxInstanceAwareCounterOptions, StrictInstanceAwareCounter,
+    StrictInstanceAwareCounterOptions,
+};
 use distkit::RedisKey;
 use redis::aio::ConnectionManager;
 
@@ -18,9 +22,25 @@ pub async fn make_connection() -> ConnectionManager {
         .expect("could not connect to Redis — is it running?")
 }
 
-pub async fn make_strict_counter(bench_name: &str) -> StrictCounter {
+pub async fn make_strict_counter(bench_name: &str) -> Arc<StrictCounter> {
     let conn = make_connection().await;
     StrictCounter::new(CounterOptions::new(bench_prefix(bench_name), conn))
+}
+
+pub async fn make_strict_icounter(bench_name: &str) -> Arc<StrictInstanceAwareCounter> {
+    let conn = make_connection().await;
+    StrictInstanceAwareCounter::new(StrictInstanceAwareCounterOptions::new(
+        bench_prefix(bench_name),
+        conn,
+    ))
+}
+
+pub async fn make_lax_icounter(bench_name: &str) -> Arc<LaxInstanceAwareCounter> {
+    let conn = make_connection().await;
+    LaxInstanceAwareCounter::new(LaxInstanceAwareCounterOptions::new(
+        bench_prefix(bench_name),
+        conn,
+    ))
 }
 
 pub async fn make_lax_counter(bench_name: &str) -> Arc<LaxCounter> {

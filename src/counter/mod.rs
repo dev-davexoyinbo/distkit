@@ -2,11 +2,10 @@
 //!
 //! This module provides [`StrictCounter`] (immediate consistency) and
 //! [`LaxCounter`] (eventual consistency with in-memory buffering). Both
-//! implement [`CounterTrait`]. Use [`Counter`] as a facade to access both
-//! from a single configuration.
+//! implement [`CounterTrait`] and are constructed directly from [`CounterOptions`].
 
 mod lax_counter;
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 pub use lax_counter::*;
 
@@ -16,8 +15,6 @@ pub use strict_counter::*;
 
 mod counter_trait;
 pub use counter_trait::*;
-
-mod common;
 
 mod error;
 pub use error::*;
@@ -45,39 +42,29 @@ pub struct CounterOptions {
 
 impl CounterOptions {
     /// Creates counter options with a default `allowed_lag` of 20 ms.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use distkit::{RedisKey, counter::CounterOptions};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let redis_url = std::env::var("REDIS_URL")
+    ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    /// let client = redis::Client::open(redis_url)?;
+    /// let conn = client.get_connection_manager().await?;
+    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let options = CounterOptions::new(prefix, conn);
+    /// // options.allowed_lag == Duration::from_millis(20)
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
         Self {
             prefix,
             connection_manager,
             allowed_lag: Duration::from_millis(20),
         }
-    }
-}
-
-/// Facade providing access to both [`StrictCounter`] and [`LaxCounter`]
-/// instances that share the same Redis prefix.
-#[derive(Debug, Clone)]
-pub struct Counter {
-    lax: Arc<LaxCounter>,
-    strict: Arc<StrictCounter>,
-}
-
-impl Counter {
-    /// Creates both counter types from the given options.
-    pub fn new(options: CounterOptions) -> Self {
-        Self {
-            strict: Arc::new(StrictCounter::new(options.clone())),
-            lax: LaxCounter::new(options.clone()),
-        }
-    }
-
-    /// Returns a reference to the [`LaxCounter`] (eventual consistency).
-    pub fn lax(&self) -> &LaxCounter {
-        &self.lax
-    }
-
-    /// Returns a reference to the [`StrictCounter`] (immediate consistency).
-    pub fn strict(&self) -> &StrictCounter {
-        &self.strict
     }
 }

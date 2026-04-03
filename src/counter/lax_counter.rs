@@ -2,18 +2,19 @@ use std::{
     ops::Deref,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+        atomic::{AtomicI64, Ordering},
     },
     time::Duration,
 };
 
 use dashmap::DashMap;
 use redis::{Script, aio::ConnectionManager};
-use tokio::{sync::watch, task::JoinHandle, time::Instant};
+use tokio::time::Instant;
 
 use crate::{
-    DistkitError, RedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
-    counter::{CounterError, CounterOptions, CounterTrait, common::EPOCH_CHANGE_INTERVAL},
+    ActivityTracker, DistkitError, EPOCH_CHANGE_INTERVAL, RedisKey, RedisKeyGenerator,
+    RedisKeyGeneratorTypeKey,
+    counter::{CounterError, CounterOptions, CounterTrait},
     mutex_lock,
 };
 
@@ -89,28 +90,45 @@ pub struct LaxCounter {
     // Flush states
     batch: tokio::sync::Mutex<Vec<Commit>>,
 
-    // Active flags
-    epoch: AtomicU64,
-    last_commited_epoch: AtomicU64,
-    is_active_watch: watch::Sender<u64>,
+    activity: Arc<ActivityTracker>,
 }
 
 impl LaxCounter {
     /// Creates a new lax counter and spawns its background flush task.
+    ///
+    /// The background task holds a [`Weak`](std::sync::Weak) reference and
+    /// stops automatically when the counter is dropped.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use distkit::{RedisKey, counter::{LaxCounter, CounterOptions}};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let redis_url = std::env::var("REDIS_URL")
+    ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    /// let client = redis::Client::open(redis_url)?;
+    /// let conn = client.get_connection_manager().await?;
+    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let counter = LaxCounter::new(CounterOptions::new(prefix, conn));
+    /// // The background flush task is now running.
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(options: CounterOptions) -> Arc<Self> {
         let CounterOptions {
             prefix,
             connection_manager,
             allowed_lag,
         } = options;
-        let key_generator = RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::LaxCounter);
+        let key_generator = RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::Lax);
 
         let get_script = Script::new(GET_LUA);
         let del_script = Script::new(DEL_LUA);
         let clear_script = Script::new(CLEAR_LUA);
 
         let commit_state_script = Script::new(COMMIT_STATE_LUA);
-        let is_active_watch = watch::Sender::new(0u64);
 
         let counter = Self {
             connection_manager,
@@ -123,65 +141,21 @@ impl LaxCounter {
             locks: DashMap::default(),
             commit_state_script,
             batch: tokio::sync::Mutex::new(Vec::new()),
-            epoch: AtomicU64::new(0),
-            last_commited_epoch: AtomicU64::new(0),
-            is_active_watch,
+            activity: ActivityTracker::new(EPOCH_CHANGE_INTERVAL),
         };
 
         let counter = Arc::new(counter);
 
         counter.run_flush_task();
-        counter.epoch_change_task();
 
         counter
-    }
-
-    fn epoch_change_task(self: &Arc<Self>) {
-        self.epoch.fetch_add(1, Ordering::Relaxed);
-        let counter = Arc::downgrade(self);
-
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(EPOCH_CHANGE_INTERVAL).await;
-                let Some(counter) = counter.upgrade() else {
-                    break;
-                };
-                counter.epoch.fetch_add(1, Ordering::Relaxed);
-            }
-        });
     }
 
     fn run_flush_task(self: &Arc<Self>) {
         tokio::spawn({
             let allowed_lag = self.allowed_lag;
             let counter = Arc::downgrade(self);
-            let is_active = Arc::new(AtomicBool::new(false));
-            let mut is_active_watch = self.is_active_watch.subscribe();
-
-            let is_active_cancel_task: JoinHandle<()> = tokio::spawn({
-                let is_active = is_active.clone();
-                let sleep_interval = EPOCH_CHANGE_INTERVAL / 2;
-                let mut is_active_watch = is_active_watch.clone();
-
-                async move {
-                    loop {
-                        tokio::time::sleep(sleep_interval).await;
-
-                        tokio::select! {
-                            val = is_active_watch.changed() => {
-                                if val.is_err() {
-                                    break;
-                                }
-
-                                is_active.store(true, Ordering::Release);
-                            }
-                            _ = tokio::time::sleep(sleep_interval) => {
-                                is_active.store(false, Ordering::Release);
-                            }
-                        }
-                    }
-                }
-            });
+            let mut is_active_watch = self.activity.subscribe();
 
             async move {
                 // let mut batch = Vec::new();
@@ -189,12 +163,17 @@ impl LaxCounter {
                 interval.tick().await;
 
                 loop {
-                    if !is_active.load(Ordering::Acquire) {
-                        if is_active_watch.changed().await.is_err() {
+                    let is_active = {
+                        let Some(counter) = counter.upgrade() else {
                             break;
-                        }
+                        };
 
-                        is_active.store(true, Ordering::Release);
+                        counter.activity.get_is_active()
+                    };
+
+                    // if not active, wait for the watcher to change
+                    if !is_active && is_active_watch.changed().await.is_err() {
+                        break;
                     }
 
                     interval.tick().await;
@@ -244,20 +223,8 @@ impl LaxCounter {
                         continue;
                     }
                 }
-
-                drop(is_active_cancel_task);
             }
         });
-    }
-
-    #[inline(always)]
-    fn send_epoch_change_if_needed(&self) {
-        let epoch = self.epoch.load(Ordering::Relaxed);
-
-        if self.last_commited_epoch.load(Ordering::Relaxed) < epoch {
-            let _ = self.is_active_watch.send(epoch);
-            self.last_commited_epoch.store(epoch, Ordering::Relaxed);
-        }
     }
 
     async fn flush_to_redis(
@@ -397,8 +364,28 @@ impl LaxCounter {
 
 #[async_trait::async_trait]
 impl CounterTrait for LaxCounter {
+    /// Buffers `count` locally and returns the updated local estimate without
+    /// a Redis round-trip. Multiple `inc` calls accumulate into a single
+    /// `HINCRBY` that is flushed after `allowed_lag` (default 20 ms).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_counter().await?;
+    /// let key = RedisKey::try_from("hits".to_string())?;
+    /// // All three calls are sub-microsecond; no Redis round-trip until flush.
+    /// assert_eq!(counter.inc(&key, 1).await?, 1);
+    /// assert_eq!(counter.inc(&key, 1).await?, 2);
+    /// assert_eq!(counter.inc(&key, 1).await?, 3);
+    /// // After ~20 ms the background task sends a single HINCRBY +3 to Redis.
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
-        self.send_epoch_change_if_needed();
+        self.activity.signal();
 
         let store = match self.store.get(key) {
             Some(store)
@@ -432,12 +419,50 @@ impl CounterTrait for LaxCounter {
         Ok(total)
     } // end function inc
 
+    /// Buffers `-count` locally and returns the updated local estimate without
+    /// a Redis round-trip. Equivalent to `inc(key, -count)`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_counter().await?;
+    /// let key = RedisKey::try_from("tokens".to_string())?;
+    /// counter.set(&key, 10).await?;
+    /// assert_eq!(counter.dec(&key, 3).await?, 7);
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn dec(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
         self.inc(key, -count).await
     } // end function dec
 
+    /// Returns the local view of the counter: the last remote total plus any
+    /// pending local delta. If the cached remote total is older than
+    /// `allowed_lag`, it is re-fetched from Redis first.
+    ///
+    /// Reads within the same process are always up-to-date. A separate
+    /// process only sees writes after the writing process has flushed and
+    /// the reading process's own cache has expired.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_counter().await?;
+    /// let key = RedisKey::try_from("hits".to_string())?;
+    /// counter.inc(&key, 7).await?;
+    /// // Returns remote_total (0) + pending_delta (7) = 7, no Redis round-trip.
+    /// assert_eq!(counter.get(&key).await?, 7);
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn get(&self, key: &RedisKey) -> Result<i64, DistkitError> {
-        self.send_epoch_change_if_needed();
+        self.activity.signal();
         let store = match self.store.get(key) {
             Some(store)
                 if mutex_lock(&store.last_updated, "last_updated")?.elapsed()
@@ -465,8 +490,29 @@ impl CounterTrait for LaxCounter {
         Ok(total)
     } // end function get
 
+    /// Records a target value locally. The background flush task sends a
+    /// corrective `HINCRBY` to Redis so the stored total reaches `count`.
+    /// Until flushed, other processes reading from Redis see the old value.
+    ///
+    /// Returns `count`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_counter().await?;
+    /// let key = RedisKey::try_from("inventory".to_string())?;
+    /// counter.inc(&key, 1000).await?;
+    /// // The write is buffered; this process sees the new value immediately.
+    /// assert_eq!(counter.set(&key, 850).await?, 850);
+    /// assert_eq!(counter.get(&key).await?, 850);
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn set(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
-        self.send_epoch_change_if_needed();
+        self.activity.signal();
         let store = match self.store.get(key) {
             Some(store)
                 if mutex_lock(&store.last_updated, "last_updated")?.elapsed()
@@ -495,8 +541,30 @@ impl CounterTrait for LaxCounter {
         Ok(count)
     } // end function set
 
+    /// Cancels any pending local delta for `key`, then immediately deletes
+    /// it from Redis. Returns the final value, including the cancelled delta.
+    ///
+    /// Unlike `inc` and `set`, `del` is **not** buffered — the Redis write
+    /// happens immediately to prevent the key from reappearing on the next
+    /// flush.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_counter().await?;
+    /// let key = RedisKey::try_from("session".to_string())?;
+    /// counter.inc(&key, 10).await?; // buffered, not yet in Redis
+    /// // Pending delta (10) is cancelled; Redis is updated immediately.
+    /// assert_eq!(counter.del(&key).await?, 10);
+    /// assert_eq!(counter.get(&key).await?, 0);
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn del(&self, key: &RedisKey) -> Result<i64, DistkitError> {
-        self.send_epoch_change_if_needed();
+        self.activity.signal();
 
         let lock = self.get_or_create_lock(key).await;
         let _guard = lock.lock().await;
@@ -524,8 +592,28 @@ impl CounterTrait for LaxCounter {
         Ok(total)
     } // end function delete
 
+    /// Clears all pending local state and immediately removes all counters
+    /// under the current prefix from Redis.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::lax_counter().await?;
+    /// let k1 = RedisKey::try_from("a".to_string())?;
+    /// let k2 = RedisKey::try_from("b".to_string())?;
+    /// counter.inc(&k1, 5).await?;
+    /// counter.inc(&k2, 10).await?;
+    /// counter.clear().await?;
+    /// assert_eq!(counter.get(&k1).await?, 0);
+    /// assert_eq!(counter.get(&k2).await?, 0);
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn clear(&self) -> Result<(), DistkitError> {
-        self.send_epoch_change_if_needed();
+        self.activity.signal();
 
         self.store.clear();
 

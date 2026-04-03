@@ -1,7 +1,13 @@
 use std::{
     ops::{Deref, DerefMut},
     sync::Mutex,
+    time::Duration,
 };
+
+mod activity_tracker;
+pub(crate) use activity_tracker::*;
+
+pub(crate) const EPOCH_CHANGE_INTERVAL: Duration = Duration::from_secs(15);
 
 use crate::DistkitError;
 
@@ -61,9 +67,13 @@ impl TryFrom<String> for RedisKey {
 #[derive(Clone, Debug, strum_macros::Display)]
 pub(crate) enum RedisKeyGeneratorTypeKey {
     #[strum(to_string = "lax_counter")]
-    LaxCounter,
+    Lax,
     #[strum(to_string = "strict_counter")]
-    StrictCounter,
+    Strict,
+    #[strum(to_string = "instance_aware_counter")]
+    InstanceAware,
+    #[strum(to_string = "lax_instance_aware_counter")]
+    LaxInstanceAware,
 }
 
 #[derive(Clone, Debug)]
