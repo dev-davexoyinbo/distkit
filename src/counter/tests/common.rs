@@ -27,7 +27,7 @@ async fn make_connection() -> ConnectionManager {
         .expect("Redis must be reachable")
 }
 
-pub async fn make_strict_counter(prefix: &str) -> StrictCounter {
+pub async fn make_strict_counter(prefix: &str) -> Arc<StrictCounter> {
     let conn = make_connection().await;
     let unique_prefix = format!("{}_{}", run_id(), prefix);
     StrictCounter::new(CounterOptions::new(RedisKey::from(unique_prefix), conn))

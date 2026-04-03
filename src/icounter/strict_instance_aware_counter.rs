@@ -762,7 +762,7 @@ impl StrictInstanceAwareCounter {
         pipe
     }
 
-    /// Sends multiple increments in a pipelined batch, chunked to 50 per
+    /// Sends multiple increments in a pipelined batch, chunked to `max_batch_size` per
     /// pipeline. Takes `&mut Vec` so successfully committed entries are drained
     /// in-place; on failure the remaining entries stay in the vector for the
     /// caller to retry.
