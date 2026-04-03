@@ -1,6 +1,6 @@
 [package]
 name = "distkit"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "A toolkit of distributed systems primitives for Rust, backed by Redis"
 authors = ["Oyinbo David Bayode <dev.davexoyinbo@gmail.com>"]
