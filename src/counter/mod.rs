@@ -2,8 +2,7 @@
 //!
 //! This module provides [`StrictCounter`] (immediate consistency) and
 //! [`LaxCounter`] (eventual consistency with in-memory buffering). Both
-//! implement [`CounterTrait`]. Use [`Counter`] as a facade to access both
-//! from a single configuration.
+//! implement [`CounterTrait`] and are constructed directly from [`CounterOptions`].
 
 mod lax_counter;
 use std::time::Duration;

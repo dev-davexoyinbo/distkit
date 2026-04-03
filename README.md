@@ -61,7 +61,7 @@ distkit requires a running Redis instance (5.0+ for Lua script support).
 ## Quick start
 
 ```rust
-use distkit::{RedisKey, counter::{Counter, CounterOptions, CounterTrait}};
+use distkit::{RedisKey, counter::{StrictCounter, LaxCounter, CounterOptions, CounterTrait}};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -70,18 +70,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let prefix = RedisKey::try_from("my_app".to_string())?;
     let options = CounterOptions::new(prefix, conn);
-    let counter = Counter::new(options);
 
     let key = RedisKey::try_from("page_views".to_string())?;
 
     // Strict: immediate consistency
-    counter.strict().inc(&key, 1).await?;
-    let total = counter.strict().get(&key).await?;
+    let strict = StrictCounter::new(options.clone());
+    strict.inc(&key, 1).await?;
+    let total = strict.get(&key).await?;
     println!("strict: {total}");
 
     // Lax: eventual consistency, much faster
-    counter.lax().inc(&key, 1).await?;
-    let approx = counter.lax().get(&key).await?;
+    let lax = LaxCounter::new(options);
+    lax.inc(&key, 1).await?;
+    let approx = lax.get(&key).await?;
     println!("lax: {approx}");
 
     Ok(())

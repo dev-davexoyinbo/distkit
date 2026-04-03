@@ -27,25 +27,24 @@ currently offers three modules and they all run on the tokio runtime:
 # Quick start
 
 ```rust
-# use distkit::{RedisKey, counter::{Counter, CounterOptions, CounterTrait}};
+# use distkit::{RedisKey, counter::{StrictCounter, LaxCounter, CounterOptions, CounterTrait}};
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 # let client = redis::Client::open("redis://127.0.0.1/")?;
 # let conn = client.get_connection_manager().await?;
-// This is the prefix used to namespace all counter keys.
-// other servers for the same prefix (e.g., "my_app") will share the same total
-// and coordination logic.
+// Servers sharing the same prefix coordinate through the same Redis keys.
 let prefix = RedisKey::try_from("my_app".to_string())?;
 let options = CounterOptions::new(prefix, conn);
-let counter = Counter::new(options);
 
 // Strict: every call hits Redis immediately
+let strict = StrictCounter::new(options.clone());
 let key = RedisKey::try_from("page_views".to_string())?;
-counter.strict().inc(&key, 1).await?;
-let total = counter.strict().get(&key).await?;
+strict.inc(&key, 1).await?;
+let total = strict.get(&key).await?;
 
 // Lax: buffered in memory, flushed to Redis every ~20 ms
-counter.lax().inc(&key, 1).await?;
-let approx = counter.lax().get(&key).await?;
+let lax = LaxCounter::new(options);
+lax.inc(&key, 1).await?;
+let approx = lax.get(&key).await?;
 # Ok(())
 # }
 ```
@@ -75,8 +74,7 @@ async fn bump<C: CounterTrait>(counter: &C, key: &RedisKey) -> Result<i64, Distk
   Constructed via `TryFrom<String>`.
 - [`CounterOptions`] -- Configuration bundle for counter construction. Carries
   a prefix, Redis connection, and the `allowed_lag` duration (default 20 ms).
-- [`Counter`] -- Facade that holds both a [`StrictCounter`] and a
-  [`LaxCounter`], created from a single [`CounterOptions`].
+  Implements `Clone`, so the same options can be passed to both counter types.
 - [`CounterTrait`] -- The async trait that both counter types implement:
   `inc`, `dec`, `get`, `set`, `del`, `clear`.
 
@@ -471,7 +469,6 @@ details and advanced configuration.
 [`LaxCounter`]: counter::LaxCounter
 [`CounterTrait`]: counter::CounterTrait
 [`CounterOptions`]: counter::CounterOptions
-[`Counter`]: counter::Counter
 [`StrictInstanceAwareCounter`]: icounter::StrictInstanceAwareCounter
 [`LaxInstanceAwareCounter`]: icounter::LaxInstanceAwareCounter
 [`InstanceAwareCounterTrait`]: icounter::InstanceAwareCounterTrait
