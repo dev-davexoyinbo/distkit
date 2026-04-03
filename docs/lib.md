@@ -1,25 +1,28 @@
 A toolkit of distributed systems primitives for Rust, backed by Redis.
 
-`distkit` provides building blocks for distributed applications. The crate
-currently offers three modules:
+`distkit` (DISTributed system KIT) provides building blocks for distributed applications. The crate
+currently offers three modules and they all run on the tokio runtime:
 
-- **Counters** (`counter` feature, enabled by default) -- two counter
+- **Counters** (`counter` feature, enabled by default) -- two counter (strict and lax)
   implementations that share a common async trait, letting you choose between
   immediate consistency and high-throughput eventual consistency.
 - **Instance-aware counters** (`instance-aware-counter` feature) -- counters
   where each running process owns a named slice of the total, with automatic
-  cleanup of contributions from processes that stop heartbeating.
+  cleanup of contributions from processes that stop heartbeating. For example if you have
+  a cluster of servers where each server reports its active connection count, the cumulative
+  is the cluster-wide total, when a server dies, the contribution is automatically subtracted.
+  If the server was temporarily offline, the contribution is automatically added back when it comes back online.
 - **Rate limiting** (`trypema` feature, opt-in) -- re-exports the
   [`trypema`](https://docs.rs/trypema) crate, providing sliding-window rate
   limiting with local, Redis-backed, and hybrid providers.
 
 # Feature flags
 
-| Feature                    | Default | Description                                                                                           |
-| -------------------------- | ------- | ----------------------------------------------------------------------------------------------------- |
-| `counter`                  | **yes** | Distributed counters ([`StrictCounter`], [`LaxCounter`])                                              |
-| `instance-aware-counter`   | no      | Per-instance counters ([`StrictInstanceAwareCounter`], [`LaxInstanceAwareCounter`])                   |
-| `trypema`                  | no      | Rate limiting via the [`trypema`](https://docs.rs/trypema) crate                                      |
+| Feature                  | Default | Description                                                                                       |
+| ------------------------ | ------- | ------------------------------------------------------------------------------------------------- |
+| `counter`                | **yes** | Distributed counters ([`StrictCounter`], [`LaxCounter`])                                          |
+| `instance-aware-counter` | no      | Instance aware distributed counters ([`StrictInstanceAwareCounter`], [`LaxInstanceAwareCounter`]) |
+| `trypema`                | no      | Rate limiting via the [`trypema`](https://docs.rs/trypema) crate                                  |
 
 # Quick start
 
@@ -28,6 +31,9 @@ currently offers three modules:
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 # let client = redis::Client::open("redis://127.0.0.1/")?;
 # let conn = client.get_connection_manager().await?;
+// This is the prefix used to namespace all counter keys.
+// other servers for the same prefix (e.g., "my_app") will share the same total
+// and coordination logic.
 let prefix = RedisKey::try_from("my_app".to_string())?;
 let options = CounterOptions::new(prefix, conn);
 let counter = Counter::new(options);
@@ -257,13 +263,13 @@ let (total, mine) = counter.get(&key).await?;
 
 ## Choosing between strict and lax instance-aware counters
 
-|                      | [`StrictInstanceAwareCounter`]           | [`LaxInstanceAwareCounter`]                   |
-| -------------------- | ---------------------------------------- | --------------------------------------------- |
-| **Consistency**      | Immediate                                | Eventual (`flush_interval` lag)               |
-| **`inc` latency**    | Redis round-trip                         | Sub-microsecond (warm path)                   |
-| **Redis I/O**        | Every `inc`                              | Batched on interval via `inc_batch`            |
-| **`set` / `del`**    | Immediate                                | Flushes pending delta, then immediate         |
-| **Use case**         | Connection counts, exact live metrics    | High-frequency per-node throughput metrics    |
+|                   | [`StrictInstanceAwareCounter`]        | [`LaxInstanceAwareCounter`]                |
+| ----------------- | ------------------------------------- | ------------------------------------------ |
+| **Consistency**   | Immediate                             | Eventual (`flush_interval` lag)            |
+| **`inc` latency** | Redis round-trip                      | Sub-microsecond (warm path)                |
+| **Redis I/O**     | Every `inc`                           | Batched on interval via `inc_batch`        |
+| **`set` / `del`** | Immediate                             | Flushes pending delta, then immediate      |
+| **Use case**      | Connection counts, exact live metrics | High-frequency per-node throughput metrics |
 
 Both types implement [`InstanceAwareCounterTrait`], allowing generic code:
 

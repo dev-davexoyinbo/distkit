@@ -6,7 +6,7 @@
 //! from a single configuration.
 
 mod lax_counter;
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 pub use lax_counter::*;
 
@@ -49,33 +49,5 @@ impl CounterOptions {
             connection_manager,
             allowed_lag: Duration::from_millis(20),
         }
-    }
-}
-
-/// Facade providing access to both [`StrictCounter`] and [`LaxCounter`]
-/// instances that share the same Redis prefix.
-#[derive(Debug, Clone)]
-pub struct Counter {
-    lax: Arc<LaxCounter>,
-    strict: Arc<StrictCounter>,
-}
-
-impl Counter {
-    /// Creates both counter types from the given options.
-    pub fn new(options: CounterOptions) -> Self {
-        Self {
-            strict: Arc::new(StrictCounter::new(options.clone())),
-            lax: LaxCounter::new(options.clone()),
-        }
-    }
-
-    /// Returns a reference to the [`LaxCounter`] (eventual consistency).
-    pub fn lax(&self) -> &LaxCounter {
-        &self.lax
-    }
-
-    /// Returns a reference to the [`StrictCounter`] (immediate consistency).
-    pub fn strict(&self) -> &StrictCounter {
-        &self.strict
     }
 }

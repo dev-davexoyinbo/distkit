@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
@@ -64,7 +66,7 @@ pub struct StrictCounter {
 
 impl StrictCounter {
     /// Creates a new strict counter from the given options.
-    pub fn new(options: CounterOptions) -> Self {
+    pub fn new(options: CounterOptions) -> Arc<Self> {
         let CounterOptions {
             prefix,
             connection_manager,
@@ -78,7 +80,7 @@ impl StrictCounter {
         let del_script = Script::new(DEL_LUA);
         let clear_script = Script::new(CLEAR_LUA);
 
-        Self {
+        Arc::new(Self {
             connection_manager,
             key_generator,
             inc_script,
@@ -86,7 +88,7 @@ impl StrictCounter {
             set_script,
             del_script,
             clear_script,
-        }
+        })
     }
 }
 
