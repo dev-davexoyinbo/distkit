@@ -135,8 +135,11 @@ latency. The absolute strategy gives a deterministic allow/reject decision.
 #     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision,
 #     RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
 #     local::LocalRateLimiterOptions,
+#     redis::RedisRateLimiterOptions,
+#     hybrid::SyncIntervalMs,
 # };
 # fn example() {
+# let connection_manager: redis::aio::ConnectionManager = todo!();
 let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
     local: LocalRateLimiterOptions {
         window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
@@ -144,6 +147,15 @@ let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
         hard_limit_factor: HardLimitFactor::default(),
         suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
     },
+#        redis: RedisRateLimiterOptions {
+#        connection_manager,
+#        prefix: None,
+#        window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+#        rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+#        hard_limit_factor: HardLimitFactor::default(),
+#        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+#        sync_interval_ms: SyncIntervalMs::default(),
+#    },
 }));
 
 // Optional: start background cleanup for stale keys
@@ -175,14 +187,26 @@ approaches the limit, instead of a hard cutoff.
 #     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision,
 #     RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
 #     local::LocalRateLimiterOptions,
+#     redis::RedisRateLimiterOptions,
+#     hybrid::SyncIntervalMs,
 # };
 # fn example() {
+# let connection_manager: redis::aio::ConnectionManager = todo!();
 # let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
 #     local: LocalRateLimiterOptions {
 #         window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
 #         rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
 #         hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(),
 #         suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+#     },
+#     redis: RedisRateLimiterOptions {
+#         connection_manager,
+#         prefix: None,
+#         window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+#         rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+#         hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(),
+#         suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+#         sync_interval_ms: SyncIntervalMs::default(),
 #     },
 # }));
 let rate = RateLimit::try_from(100.0).unwrap();
