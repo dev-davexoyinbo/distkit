@@ -20,8 +20,8 @@ limiting, all backed by Redis.
 - **LaxCounter** -- buffers increments in memory and flushes to Redis every
   ~20 ms. Sub-microsecond latency on the hot path. Best for analytics and
   high-throughput metrics.
-- **Instance-aware counters** -- each running process owns a named slice of the
-  total, with automatic cleanup of contributions from processes that stop
+- **Instance-aware counters** -- each running instance owns a named slice of the
+  total, with automatic cleanup of contributions from instances that stop
   heartbeating.
 - **Rate limiting** (opt-in `trypema` feature) -- sliding-window rate limiting
   with local, Redis-backed, and hybrid providers. Supports absolute and
@@ -122,16 +122,16 @@ counter, so it stops automatically when the counter is dropped.
 
 ### Choosing a counter
 
-|                           | `StrictCounter`                        | `LaxCounter`                       | `StrictInstanceAwareCounter`                | `LaxInstanceAwareCounter`                      |
-| ------------------------- | -------------------------------------- | ---------------------------------- | ------------------------------------------- | ---------------------------------------------- |
-| **Consistency**           | Immediate                              | Eventual (~20 ms lag)              | Immediate                                   | Eventual (`flush_interval` lag)                |
-| **`inc` latency**         | Redis round-trip                       | Sub-microsecond (warm path)        | Redis round-trip                            | Sub-microsecond (warm path)                    |
-| **Redis I/O**             | Every operation                        | Batched on interval                | Every `inc`                                 | Batched on interval via `inc_batch`            |
-| **`set` / `del`**         | Immediate                              | Immediate                          | Immediate (bumps epoch)                     | Flushes pending delta, then immediate          |
-| **Per-instance tracking** | No                                     | No                                 | Yes                                         | Yes                                            |
-| **Dead-instance cleanup** | No                                     | No                                 | Yes                                         | Yes                                            |
-| **Feature flag**          | `counter` (default)                    | `counter` (default)                | `instance-aware-counter`                    | `instance-aware-counter`                       |
-| **Use case**              | Billing, inventory, exact global count | Analytics, high-throughput metrics | Connection counts, exact live metrics       | High-frequency per-node throughput metrics     |
+|                           | `StrictCounter`                        | `LaxCounter`                       | `StrictInstanceAwareCounter`          | `LaxInstanceAwareCounter`                  |
+| ------------------------- | -------------------------------------- | ---------------------------------- | ------------------------------------- | ------------------------------------------ |
+| **Consistency**           | Immediate                              | Eventual (default: ~20 ms lag)     | Immediate                             | Eventual (`flush_interval` lag)            |
+| **`inc` latency**         | Redis round-trip                       | Sub-microsecond (warm path)        | Redis round-trip                      | Sub-microsecond (warm path)                |
+| **Redis I/O**             | Every operation                        | Batched on interval                | Every `inc`                           | Batched on interval                        |
+| **`set` / `del`**         | Immediate                              | Immediate                          | Immediate (bumps epoch)               | Flushes pending delta, then immediate      |
+| **Per-instance tracking** | No                                     | No                                 | Yes                                   | Yes                                        |
+| **Dead-instance cleanup** | No                                     | No                                 | Yes                                   | Yes                                        |
+| **Feature flag**          | `counter` (default)                    | `counter` (default)                | `instance-aware-counter`              | `instance-aware-counter`                   |
+| **Use case**              | Billing, inventory, exact global count | Analytics, high-throughput metrics | Connection counts, exact live metrics | High-frequency per-node throughput metrics |
 
 ## Instance-aware counters
 
@@ -142,8 +142,8 @@ Enable the `instance-aware-counter` feature:
 distkit = { version = "0.1", features = ["instance-aware-counter"] }
 ```
 
-Instance-aware counters track each running process's contribution separately.
-The cumulative total is the sum of all **live** instances. When a process stops
+Instance-aware counters track each running instance's contribution separately.
+The cumulative total is the sum of all **live** instances. When an instance stops
 heartbeating for longer than `dead_instance_threshold_ms` (default 30 s), its
 contribution is automatically subtracted from the cumulative on the next
 operation by any surviving instance.
@@ -180,6 +180,9 @@ let key = RedisKey::try_from("connections".to_string())?;
 
 // Increment this instance's contribution; returns (cumulative, instance_count).
 let (total, mine) = counter.inc(&key, 5).await?;
+
+// Decrement this instance's contribution.
+let (total, mine) = counter.dec(&key, 2).await?;
 
 // Read without modifying.
 let (total, mine) = counter.get(&key).await?;
@@ -265,6 +268,9 @@ let key = RedisKey::try_from("connections".to_string())?;
 
 // Returns the local estimate immediately — no Redis round-trip on warm path.
 let (local_total, mine) = counter.inc(&key, 1).await?;
+
+// Decrement also stays local until flushed.
+let (local_total, mine) = counter.dec(&key, 1).await?;
 
 // get() also returns the local estimate (cumulative + pending delta).
 let (total, mine) = counter.get(&key).await?;

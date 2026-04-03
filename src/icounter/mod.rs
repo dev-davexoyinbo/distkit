@@ -1,3 +1,9 @@
+//! Instance-aware counters that track each running instance's contribution separately.
+//!
+//! This module provides [`StrictInstanceAwareCounter`] (immediate consistency) and
+//! [`LaxInstanceAwareCounter`] (eventual consistency with in-memory buffering). Both
+//! implement [`InstanceAwareCounterTrait`].
+
 #[cfg(test)]
 mod tests;
 
@@ -5,7 +11,7 @@ mod strict_instance_aware_counter;
 pub use strict_instance_aware_counter::*;
 
 mod lax_instance_aware_counter;
-pub use lax_instance_aware_counter::{LaxInstanceAwareCounter, LaxInstanceAwareCounterOptions};
+pub use lax_instance_aware_counter::*;
 use uuid::Uuid;
 
 use crate::{DistkitError, RedisKey};

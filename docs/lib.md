@@ -160,6 +160,9 @@ let key = RedisKey::try_from("connections".to_string())?;
 // Increment this instance's contribution; returns (cumulative, instance_count).
 let (total, mine) = counter.inc(&key, 5).await?;
 
+// Decrement this instance's contribution.
+let (total, mine) = counter.dec(&key, 2).await?;
+
 // Read without modifying.
 let (total, mine) = counter.get(&key).await?;
 
@@ -239,6 +242,8 @@ small consistency lag.
 # let client = redis::Client::open("redis://127.0.0.1/")?;
 # let conn = client.get_connection_manager().await?;
 let prefix = RedisKey::try_from("my_app".to_string())?;
+
+// options: LaxInstanceAwareCounterOptions::new(prefix, conn) would give the same result.
 let counter = LaxInstanceAwareCounter::new(LaxInstanceAwareCounterOptions {
     prefix,
     connection_manager: conn,
@@ -251,6 +256,9 @@ let key = RedisKey::try_from("connections".to_string())?;
 
 // Returns the local estimate immediately — no Redis round-trip on warm path.
 let (local_total, mine) = counter.inc(&key, 1).await?;
+
+// Decrement also stays local until flushed.
+let (local_total, mine) = counter.dec(&key, 1).await?;
 
 // get() also returns the local estimate (cumulative + pending delta).
 // A fresh instance with no local state falls back to the strict counter.

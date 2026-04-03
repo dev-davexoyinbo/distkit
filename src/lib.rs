@@ -8,7 +8,6 @@ pub use common::*;
 #[cfg(feature = "counter")]
 pub mod counter;
 
-/// Counters that are aware of the instance they are running on.
 #[cfg(feature = "instance-aware-counter")]
 pub mod icounter;
 
