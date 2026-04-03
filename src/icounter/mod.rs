@@ -28,6 +28,11 @@ pub trait InstanceAwareCounterTrait {
     /// Returns the new cumulative total.
     async fn inc(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError>;
 
+    /// Decrements the counter for `key` by `count` (stale-aware).
+    ///
+    /// Returns the new cumulative total.
+    async fn dec(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError>;
+
     /// Sets the cumulative total for `key` to `count`, bumping the epoch.
     ///
     /// Returns the new cumulative total.

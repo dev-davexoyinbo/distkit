@@ -98,10 +98,10 @@ counter value is always authoritative.
 
 ```rust
 let key = RedisKey::try_from("orders".to_string())?;
-counter.strict().inc(&key, 1).await?;   // HINCRBY via Lua
-counter.strict().set(&key, 100).await?; // HSET via Lua
-counter.strict().del(&key).await?;      // HDEL, returns old value
-counter.strict().clear().await?;        // DEL on the hash
+strict.inc(&key, 1).await?;   // HINCRBY via Lua
+strict.set(&key, 100).await?; // HSET via Lua
+strict.del(&key).await?;      // HDEL, returns old value
+strict.clear().await?;        // DEL on the hash
 ```
 
 ### LaxCounter
@@ -113,12 +113,25 @@ process.
 
 ```rust
 let key = RedisKey::try_from("impressions".to_string())?;
-counter.lax().inc(&key, 1).await?;            // local atomic add, sub-microsecond
-let val = counter.lax().get(&key).await?;     // reads local state, no Redis hit
+lax.inc(&key, 1).await?;         // local atomic add, sub-microsecond
+let val = lax.get(&key).await?;  // reads local state, no Redis hit
 ```
 
 A background Tokio task handles flushing. It holds a `Weak` reference to the
 counter, so it stops automatically when the counter is dropped.
+
+### Choosing a counter
+
+|                           | `StrictCounter`                        | `LaxCounter`                       | `StrictInstanceAwareCounter`                | `LaxInstanceAwareCounter`                      |
+| ------------------------- | -------------------------------------- | ---------------------------------- | ------------------------------------------- | ---------------------------------------------- |
+| **Consistency**           | Immediate                              | Eventual (~20 ms lag)              | Immediate                                   | Eventual (`flush_interval` lag)                |
+| **`inc` latency**         | Redis round-trip                       | Sub-microsecond (warm path)        | Redis round-trip                            | Sub-microsecond (warm path)                    |
+| **Redis I/O**             | Every operation                        | Batched on interval                | Every `inc`                                 | Batched on interval via `inc_batch`            |
+| **`set` / `del`**         | Immediate                              | Immediate                          | Immediate (bumps epoch)                     | Flushes pending delta, then immediate          |
+| **Per-instance tracking** | No                                     | No                                 | Yes                                         | Yes                                            |
+| **Dead-instance cleanup** | No                                     | No                                 | Yes                                         | Yes                                            |
+| **Feature flag**          | `counter` (default)                    | `counter` (default)                | `instance-aware-counter`                    | `instance-aware-counter`                       |
+| **Use case**              | Billing, inventory, exact global count | Analytics, high-throughput metrics | Connection counts, exact live metrics       | High-frequency per-node throughput metrics     |
 
 ## Instance-aware counters
 
@@ -255,31 +268,6 @@ let (local_total, mine) = counter.inc(&key, 1).await?;
 
 // get() also returns the local estimate (cumulative + pending delta).
 let (total, mine) = counter.get(&key).await?;
-```
-
-### Choosing between strict and lax instance-aware counters
-
-|                      | `StrictInstanceAwareCounter`          | `LaxInstanceAwareCounter`                  |
-| -------------------- | ------------------------------------- | ------------------------------------------ |
-| **Consistency**      | Immediate                             | Eventual (`flush_interval` lag)            |
-| **`inc` latency**    | Redis round-trip                      | Sub-microsecond (warm path)                |
-| **Redis I/O**        | Every `inc`                           | Batched on interval via `inc_batch`        |
-| **`set` / `del`**    | Immediate                             | Flushes pending delta, then immediate      |
-| **Use case**         | Connection counts, exact live metrics | High-frequency per-node throughput metrics |
-
-Both types implement `InstanceAwareCounterTrait`, allowing generic code:
-
-```rust
-use distkit::{DistkitError, RedisKey, icounter::InstanceAwareCounterTrait};
-
-async fn report_connection<C: InstanceAwareCounterTrait>(
-    counter: &C,
-    key: &RedisKey,
-    delta: i64,
-) -> Result<i64, DistkitError> {
-    let (total, _mine) = counter.inc(key, delta).await?;
-    Ok(total)
-}
 ```
 
 ## Rate limiting (trypema)

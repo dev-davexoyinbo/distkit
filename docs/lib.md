@@ -51,20 +51,37 @@ let approx = lax.get(&key).await?;
 
 # Choosing a counter
 
-|                 | [`StrictCounter`]                                       | [`LaxCounter`]                                    |
-| --------------- | ------------------------------------------------------- | ------------------------------------------------- |
-| **Consistency** | Immediate                                               | Eventual (~20 ms lag)                             |
-| **Latency**     | Redis round-trip per call                               | Sub-microsecond (warm path)                       |
-| **Redis I/O**   | Every operation                                         | Batched on interval                               |
-| **Use case**    | Billing, inventory, anything where accuracy is critical | Analytics, rate limiting, high-throughput metrics |
+|                           | [`StrictCounter`]                      | [`LaxCounter`]                     | [`StrictInstanceAwareCounter`]        | [`LaxInstanceAwareCounter`]                |
+| ------------------------- | -------------------------------------- | ---------------------------------- | ------------------------------------- | ------------------------------------------ |
+| **Consistency**           | Immediate                              | Eventual (default: ~20 ms lag)     | Immediate                             | Eventual (`flush_interval` lag)            |
+| **`inc` latency**         | Redis round-trip                       | Sub-microsecond (warm path)        | Redis round-trip                      | Sub-microsecond (warm path)                |
+| **Redis I/O**             | Every operation                        | Batched on interval                | Every `inc`                           | Batched on interval                        |
+| **`set` / `del`**         | Immediate                              | Immediate                          | Immediate (bumps epoch)               | Flushes pending delta, then immediate      |
+| **Per-instance tracking** | No                                     | No                                 | Yes                                   | Yes                                        |
+| **Dead-instance cleanup** | No                                     | No                                 | Yes                                   | Yes                                        |
+| **Feature flag**          | `counter` (default)                    | `counter` (default)                | `instance-aware-counter`              | `instance-aware-counter`                   |
+| **Use case**              | Billing, inventory, exact global count | Analytics, high-throughput metrics | Connection counts, exact live metrics | High-frequency per-node throughput metrics |
 
-Both types implement [`CounterTrait`], so you can write generic code that
-works with either:
+[`StrictCounter`] and [`LaxCounter`] implement [`CounterTrait`]. Both instance-aware
+types implement [`InstanceAwareCounterTrait`]. Write generic code against either trait:
 
 ```rust
 # use distkit::{DistkitError, RedisKey, counter::CounterTrait};
+// Example: bumping a counter by 1 (strict or lax)
 async fn bump<C: CounterTrait>(counter: &C, key: &RedisKey) -> Result<i64, DistkitError> {
     counter.inc(key, 1).await
+}
+```
+
+```rust,no_run
+# use distkit::{DistkitError, RedisKey, icounter::InstanceAwareCounterTrait};
+async fn report_connection<C: InstanceAwareCounterTrait>(
+    counter: &C,
+    key: &RedisKey,
+    delta: i64,
+) -> Result<i64, DistkitError> {
+    let (total, _mine) = counter.inc(key, delta).await?;
+    Ok(total)
 }
 ```
 
@@ -94,23 +111,6 @@ All fallible operations return [`DistkitError`]:
 - **`TrypemaError`** -- A rate-limiting operation failed (only present with the
   `trypema` feature).
 
-# Redis storage model
-
-Counters use Redis hashes for storage. The hash key is derived from the
-prefix and counter type; each counter member is a field within that hash.
-
-```text
-HSET  {prefix}:strict_counter  page_views  42
-HSET  {prefix}:lax_counter     page_views  40
-```
-
-[`StrictCounter`] operates directly on the hash via Lua scripts.
-[`LaxCounter`] maintains a local in-memory buffer and periodically flushes
-deltas to the same hash structure using `HINCRBY` in batched pipelines.
-
-Both counter types sharing the same prefix occupy **separate** hash keys
-(different type suffixes), so they never interfere with each other.
-
 # Instance-aware counters
 
 Enable the `instance-aware-counter` feature to access per-instance distributed
@@ -121,8 +121,8 @@ counters.
 distkit = { version = "0.1", features = ["instance-aware-counter"] }
 ```
 
-Instance-aware counters track each running process's contribution separately.
-The cumulative total is the sum of all **live** instances. When a process stops
+Instance-aware counters track each running instance's contribution separately.
+The cumulative total is the sum of all **live** instances. When a instance stops
 heartbeating for longer than `dead_instance_threshold_ms` (default 30 s), its
 contribution is automatically subtracted from the cumulative on the next
 operation by any surviving instance.
@@ -257,30 +257,6 @@ let (local_total, mine) = counter.inc(&key, 1).await?;
 let (total, mine) = counter.get(&key).await?;
 # Ok(())
 # }
-```
-
-## Choosing between strict and lax instance-aware counters
-
-|                   | [`StrictInstanceAwareCounter`]        | [`LaxInstanceAwareCounter`]                |
-| ----------------- | ------------------------------------- | ------------------------------------------ |
-| **Consistency**   | Immediate                             | Eventual (`flush_interval` lag)            |
-| **`inc` latency** | Redis round-trip                      | Sub-microsecond (warm path)                |
-| **Redis I/O**     | Every `inc`                           | Batched on interval via `inc_batch`        |
-| **`set` / `del`** | Immediate                             | Flushes pending delta, then immediate      |
-| **Use case**      | Connection counts, exact live metrics | High-frequency per-node throughput metrics |
-
-Both types implement [`InstanceAwareCounterTrait`], allowing generic code:
-
-```rust,no_run
-# use distkit::{DistkitError, RedisKey, icounter::InstanceAwareCounterTrait};
-async fn report_connection<C: InstanceAwareCounterTrait>(
-    counter: &C,
-    key: &RedisKey,
-    delta: i64,
-) -> Result<i64, DistkitError> {
-    let (total, _mine) = counter.inc(key, delta).await?;
-    Ok(total)
-}
 ```
 
 # Rate limiting (trypema)

@@ -1115,6 +1115,10 @@ impl InstanceAwareCounterTrait for StrictInstanceAwareCounter {
         self.inc(key, count).await
     }
 
+    async fn dec(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
+        self.inc(key, -count).await
+    }
+
     async fn set(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.set(key, count).await
     }
