@@ -64,8 +64,6 @@ impl ActivityTracker {
 
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(sleep_interval).await;
-
                 tokio::select! {
                     val = is_active_watch.changed() => {
                         if val.is_err() {
