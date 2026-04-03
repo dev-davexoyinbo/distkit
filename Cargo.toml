@@ -62,3 +62,11 @@ harness = false
 [[bench]]
 name = "lax_counter"
 harness = false
+
+[[bench]]
+name = "strict_instance_aware_counter"
+harness = false
+
+[[bench]]
+name = "lax_instance_aware_counter"
+harness = false
