@@ -1,6 +1,6 @@
 [package]
 name = "distkit"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "A toolkit of distributed systems primitives for Rust, backed by Redis"
 authors = ["Oyinbo David Bayode <dev.davexoyinbo@gmail.com>"]
@@ -31,6 +31,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["counter", "instance-aware-counter"]
+full = ["counter", "instance-aware-counter", "trypema"]
 instance-aware-counter = []
 counter = []
 trypema = ["trypema-crate", "trypema-crate/redis-tokio"]
