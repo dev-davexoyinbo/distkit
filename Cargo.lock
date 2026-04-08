@@ -1315,9 +1315,9 @@ dependencies = [
 
 [[package]]
 name = "trypema"
-version = "1.0.1"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a07eccc94eb06a01d096777b45f3a8e4a8a088d94ea0bdba41954b5a4854e5e1"
+checksum = "5119cbfa9cd567cc463269afc4d3d6022acdcebe46b96a6397a7ebc3018234c5"
 dependencies = [
  "ahash",
  "async-trait",
@@ -1325,6 +1325,7 @@ dependencies = [
  "futures",
  "rand",
  "redis",
+ "regex",
  "strum",
  "strum_macros",
  "thiserror",

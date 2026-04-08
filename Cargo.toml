@@ -50,7 +50,7 @@ strum_macros = "0.28.0"
 thiserror = "2.0.18"
 tokio = { version = "1.51", features = ["full"] }
 tracing = "0.1.44"
-trypema-crate = { package = "trypema", version = "1.0.1", optional = true }
+trypema-crate = { package = "trypema", version = "1.1.0", optional = true }
 uuid = { version = "1.23.0", features = ["v4"] }
 
 [dev-dependencies]
