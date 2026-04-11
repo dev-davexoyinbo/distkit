@@ -424,3 +424,76 @@ async fn clear_then_inc_starts_fresh() {
     let result = counter.inc(&k, 1).await.unwrap();
     assert_eq!(result, 1);
 }
+
+// ---------------------------------------------------------------------------
+// Flush — additional operations
+// ---------------------------------------------------------------------------
+
+/// set is buffered as a corrective delta and eventually reaches Redis.
+#[tokio::test]
+async fn set_is_eventually_visible_to_fresh_instance() {
+    let prefix = "lax_set_flush";
+    let k = key("counter");
+
+    let counter = make_lax_counter(prefix).await;
+    counter.set(&k, 55).await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let fresh = make_lax_counter(prefix).await;
+    assert_eq!(fresh.get(&k).await.unwrap(), 55);
+}
+
+/// dec is buffered and eventually visible to a fresh instance.
+#[tokio::test]
+async fn dec_is_eventually_visible_to_fresh_instance() {
+    let prefix = "lax_dec_flush";
+    let k = key("counter");
+
+    // Seed a value and wait for it to commit to Redis.
+    let counter = make_lax_counter(prefix).await;
+    counter.set(&k, 100).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Now decrement and let the negative delta flush.
+    counter.dec(&k, 30).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let fresh = make_lax_counter(prefix).await;
+    assert_eq!(fresh.get(&k).await.unwrap(), 70);
+}
+
+/// set after a partial flush re-fetches the stale cache and produces the
+/// correct corrective delta so the final Redis value matches the target.
+#[tokio::test]
+async fn set_after_partial_flush_is_correct() {
+    let prefix = "lax_set_after_flush";
+    let k = key("counter");
+
+    let counter = make_lax_counter(prefix).await;
+    counter.inc(&k, 10).await.unwrap();
+
+    // Wait for the flush task to commit inc to Redis and let the cache expire.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // set re-fetches remote_total (now 10) and stores delta = 50 - 10 = 40.
+    counter.set(&k, 50).await.unwrap();
+    assert_eq!(counter.get(&k).await.unwrap(), 50);
+
+    // Wait for the corrective delta to flush.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let fresh = make_lax_counter(prefix).await;
+    assert_eq!(fresh.get(&k).await.unwrap(), 50);
+}
+
+/// del after set (no prior inc) returns the value that was set.
+#[tokio::test]
+async fn del_after_set_returns_correct_value() {
+    let counter = make_lax_counter("lax_del_after_set").await;
+    let k = key("val");
+
+    counter.set(&k, 77).await.unwrap();
+    let returned = counter.del(&k).await.unwrap();
+    assert_eq!(returned, 77);
+}

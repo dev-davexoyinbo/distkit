@@ -212,3 +212,108 @@ async fn clear_on_instance_removes_only_this_instance() {
     let (cum, _) = reader.get(&k).await.unwrap();
     assert_eq!(cum, 10, "only c1's contribution should be removed");
 }
+
+// ---------------------------------------------------------------------------
+// dec
+// ---------------------------------------------------------------------------
+
+/// dec subtracts from the local estimate without a Redis round-trip.
+#[tokio::test]
+async fn dec_returns_local_estimate() {
+    let c = make_lax("dec_returns_local_estimate").await;
+    let k = key("hits");
+
+    c.inc(&k, 10).await.unwrap();
+    let (cum, instance) = c.dec(&k, 3).await.unwrap();
+
+    assert_eq!(cum, 7);
+    assert_eq!(instance, 7);
+}
+
+// ---------------------------------------------------------------------------
+// get on unknown key
+// ---------------------------------------------------------------------------
+
+/// get on a key that was never written returns (0, 0).
+#[tokio::test]
+async fn get_on_unknown_key_returns_zero() {
+    let c = make_lax("get_unknown_zero").await;
+    let k = key("ghost");
+
+    let (cum, instance) = c.get(&k).await.unwrap();
+    assert_eq!(cum, 0);
+    assert_eq!(instance, 0);
+}
+
+// ---------------------------------------------------------------------------
+// del_on_instance
+// ---------------------------------------------------------------------------
+
+/// del_on_instance flushes the pending delta then removes only this instance's
+/// contribution; other instances' slices are unaffected.
+#[tokio::test]
+async fn del_on_instance_removes_only_this_instance_contribution() {
+    let (c1, c2, prefix) = make_lax_pair("del_on_instance_lax").await;
+    let k = key("hits");
+
+    c1.inc(&k, 20).await.unwrap();
+    c2.inc(&k, 10).await.unwrap();
+    // Flush both so strict counter has c1=20, c2=10, cumulative=30.
+    sleep(Duration::from_millis(FLUSH_MS * 5)).await;
+
+    // del_on_instance removes c1's slice (20); c2's contribution (10) survives.
+    let (new_cum, removed) = c1.del_on_instance(&k).await.unwrap();
+    assert_eq!(removed, 20);
+    assert_eq!(new_cum, 10);
+
+    // A fresh reader fetches from strict and sees only c2's slice.
+    let reader = make_lax_from_prefix(&prefix).await;
+    let (cum, _) = reader.get(&k).await.unwrap();
+    assert_eq!(cum, 10);
+}
+
+// ---------------------------------------------------------------------------
+// set_on_instance
+// ---------------------------------------------------------------------------
+
+/// set_on_instance adjusts the local delta so this instance's contribution
+/// reaches the target without bumping the epoch.
+#[tokio::test]
+async fn set_on_instance_adjusts_local_count() {
+    let c = make_lax("set_on_instance_adjusts").await;
+    let k = key("hits");
+
+    // Accumulate a delta, then override the instance slice via set_on_instance.
+    c.inc(&k, 10).await.unwrap();
+    let (cum, instance) = c.set_on_instance(&k, 7).await.unwrap();
+    assert_eq!(instance, 7);
+    assert_eq!(cum, 7);
+
+    // get reflects the overwritten local state.
+    let (get_cum, get_instance) = c.get(&k).await.unwrap();
+    assert_eq!(get_cum, 7);
+    assert_eq!(get_instance, 7);
+}
+
+// ---------------------------------------------------------------------------
+// clear_on_instance with unflushed delta
+// ---------------------------------------------------------------------------
+
+/// clear_on_instance flushes a pending delta before removing this instance's
+/// contributions so the flush and delete cancel out, leaving 0 for readers.
+#[tokio::test]
+async fn clear_on_instance_flushes_pending_delta() {
+    let (c1, _c2, prefix) = make_lax_pair("clear_on_instance_pending_delta").await;
+    let k = key("hits");
+
+    // Accumulate a delta without waiting for the background flush.
+    c1.inc(&k, 50).await.unwrap();
+
+    // clear_on_instance must flush the 50 first, then remove c1's instance slice.
+    c1.clear_on_instance().await.unwrap();
+
+    // The flush committed 50 and the delete immediately removed it — net 0.
+    let reader = make_lax_from_prefix(&prefix).await;
+    let (cum, _) = reader.get(&k).await.unwrap();
+    assert_eq!(cum, 0);
+}
