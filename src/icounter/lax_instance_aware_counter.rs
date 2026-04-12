@@ -9,13 +9,13 @@ use std::sync::{
     Arc,
     atomic::{AtomicI64, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::{collections::HashMap, time::Duration, time::Instant};
 
 use dashmap::DashMap;
 use redis::aio::ConnectionManager;
 
 use crate::{
-    ActivityTracker, EPOCH_CHANGE_INTERVAL, RedisKey,
+    ActivityTracker, CounterComparator, EPOCH_CHANGE_INTERVAL, RedisKey,
     common::mutex_lock,
     error::DistkitError,
     icounter::{
@@ -447,6 +447,15 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # }
     /// ```
     async fn inc(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
+        self.inc_if(key, CounterComparator::Nil, count).await
+    }
+
+    async fn inc_if(
+        &self,
+        key: &RedisKey,
+        comparator: CounterComparator,
+        count: i64,
+    ) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
         let store = match self.local_store.get(key) {
@@ -474,11 +483,20 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
             }
         };
 
-        let delta = store.delta.fetch_add(count, Ordering::AcqRel) + count;
+        let delta_before = store.delta.load(Ordering::Acquire);
+        let current = (
+            store.cumulative.load(Ordering::Acquire) + delta_before,
+            store.instance_count.load(Ordering::Acquire) + delta_before,
+        );
+        if !comparator.matches(current.0) {
+            return Ok(current);
+        }
+
+        let delta_after = store.delta.fetch_add(count, Ordering::AcqRel) + count;
         let cumulative = store.cumulative.load(Ordering::Acquire);
         let instance_count = store.instance_count.load(Ordering::Acquire);
 
-        Ok((cumulative + delta, instance_count + delta))
+        Ok((cumulative + delta_after, instance_count + delta_after))
     }
 
     /// Decrements the counter locally. Equivalent to `inc(key, -count)`.
@@ -527,8 +545,21 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # }
     /// ```
     async fn set(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
-        self.activity.signal();
+        self.set_if(key, CounterComparator::Nil, count).await
+    }
 
+    async fn set_if(
+        &self,
+        key: &RedisKey,
+        comparator: CounterComparator,
+        count: i64,
+    ) -> Result<(i64, i64), DistkitError> {
+        let current = self.get(key).await?;
+        if !comparator.matches(current.0) {
+            return Ok(current);
+        }
+
+        self.activity.signal();
         self.flush_key(key).await?;
 
         let (cumulative, instance_count) = self.strict.set(key, count).await?;
@@ -568,6 +599,16 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         key: &RedisKey,
         count: i64,
     ) -> Result<(i64, i64), DistkitError> {
+        self.set_on_instance_if(key, CounterComparator::Nil, count)
+            .await
+    }
+
+    async fn set_on_instance_if(
+        &self,
+        key: &RedisKey,
+        comparator: CounterComparator,
+        count: i64,
+    ) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
         let store = match self.local_store.get(key) {
@@ -595,9 +636,15 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
             }
         };
 
-        let instance_count = store.instance_count.load(Ordering::Acquire);
-        store.delta.store(count - instance_count, Ordering::Release);
+        let delta = store.delta.load(Ordering::Acquire);
         let cumulative = store.cumulative.load(Ordering::Acquire);
+        let instance_count = store.instance_count.load(Ordering::Acquire);
+        let current = (cumulative + delta, instance_count + delta);
+        if !comparator.matches(current.1) {
+            return Ok(current);
+        }
+
+        store.delta.store(count - instance_count, Ordering::Release);
 
         Ok((cumulative - instance_count + count, count))
     }
@@ -827,25 +874,17 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         &self,
         updates: &[(&'k RedisKey, i64)],
     ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
-        if updates.is_empty() {
-            return Ok(vec![]);
-        }
+        let conditional_updates: Vec<(&RedisKey, CounterComparator, i64)> = updates
+            .iter()
+            .map(|(key, count)| (*key, CounterComparator::Nil, *count))
+            .collect();
 
-        self.activity.signal();
+        self.set_all_if(&conditional_updates).await
+    }
 
-        self.flush().await?;
-
-        let batch = self.strict.set_batch(updates).await?;
-        for (key, cumulative, instance_count) in &batch {
-            self.update_local(key, *cumulative, *instance_count);
-        }
-
-        Ok(batch)
-    } // end function set_all
-
-    async fn set_all_on_instance<'k>(
+    async fn set_all_if<'k>(
         &self,
-        updates: &[(&'k RedisKey, i64)],
+        updates: &[(&'k RedisKey, CounterComparator, i64)],
     ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
@@ -853,22 +892,97 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
 
         self.activity.signal();
 
-        let keys: Vec<&RedisKey> = updates.iter().map(|(key, _)| *key).collect();
+        let keys: Vec<&RedisKey> = updates.iter().map(|(key, _, _)| *key).collect();
+        self.batch_refresh_stale(&keys).await?;
 
+        let mut current_map: HashMap<RedisKey, (i64, i64)> = HashMap::with_capacity(updates.len());
+        let mut matched_updates: Vec<(&RedisKey, i64)> = Vec::new();
+
+        for (key, comparator, count) in updates {
+            let store = self
+                .local_store
+                .get(*key)
+                .expect("store populated after refresh");
+            let delta = store.delta.load(Ordering::Acquire);
+            let current = (
+                store.cumulative.load(Ordering::Acquire) + delta,
+                store.instance_count.load(Ordering::Acquire) + delta,
+            );
+            current_map.insert((*key).clone(), current);
+
+            if comparator.matches(current.0) {
+                matched_updates.push((*key, *count));
+            }
+        }
+
+        let mut applied_map: HashMap<RedisKey, (i64, i64)> =
+            HashMap::with_capacity(matched_updates.len());
+        if !matched_updates.is_empty() {
+            self.flush().await?;
+            let batch = self.strict.set_batch(&matched_updates).await?;
+            for (key, cumulative, instance_count) in &batch {
+                self.update_local(key, *cumulative, *instance_count);
+                applied_map.insert((*key).clone(), (*cumulative, *instance_count));
+            }
+        }
+
+        Ok(updates
+            .iter()
+            .map(|(key, _, _)| {
+                let (cumulative, instance_count) = applied_map
+                    .get(*key)
+                    .copied()
+                    .or_else(|| current_map.get(*key).copied())
+                    .unwrap_or((0, 0));
+                (*key, cumulative, instance_count)
+            })
+            .collect())
+    } // end function set_all_if
+
+    async fn set_all_on_instance<'k>(
+        &self,
+        updates: &[(&'k RedisKey, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&RedisKey, CounterComparator, i64)> = updates
+            .iter()
+            .map(|(key, count)| (*key, CounterComparator::Nil, *count))
+            .collect();
+
+        self.set_all_on_instance_if(&conditional_updates).await
+    }
+
+    async fn set_all_on_instance_if<'k>(
+        &self,
+        updates: &[(&'k RedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        if updates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        self.activity.signal();
+
+        let keys: Vec<&RedisKey> = updates.iter().map(|(key, _, _)| *key).collect();
         self.batch_refresh_stale(&keys).await?;
 
         updates
             .iter()
-            .map(|(key, count)| {
+            .map(|(key, comparator, count)| {
                 let store = self
                     .local_store
                     .get(*key)
                     .expect("store populated after refresh");
-                let instance_count = store.instance_count.load(Ordering::Acquire);
-                store.delta.store(count - instance_count, Ordering::Release);
+                let delta = store.delta.load(Ordering::Acquire);
                 let cumulative = store.cumulative.load(Ordering::Acquire);
-                Ok((*key, cumulative - instance_count + count, *count))
+                let instance_count = store.instance_count.load(Ordering::Acquire);
+                let current = (cumulative + delta, instance_count + delta);
+
+                if comparator.matches(current.1) {
+                    store.delta.store(count - instance_count, Ordering::Release);
+                    Ok((*key, cumulative - instance_count + count, *count))
+                } else {
+                    Ok((*key, current.0, current.1))
+                }
             })
             .collect()
-    } // end function set_all_on_instance
+    } // end function set_all_on_instance_if
 }
