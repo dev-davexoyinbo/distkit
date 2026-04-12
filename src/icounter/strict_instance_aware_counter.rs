@@ -5,9 +5,12 @@
 //! key, contributing to a shared cumulative total. When an instance stops
 //! sending heartbeats, its contribution is automatically removed.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicI64, AtomicU64, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, AtomicU64, Ordering},
+    },
 };
 
 use dashmap::DashMap;
@@ -16,6 +19,7 @@ use redis::{Script, aio::ConnectionManager};
 use crate::{
     ActivityTracker, EPOCH_CHANGE_INTERVAL, RedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
     error::DistkitError,
+    execute_pipeline_with_script_retry,
     icounter::{InstanceAwareCounterTrait, generate_instance_id},
 };
 
@@ -42,6 +46,8 @@ impl SingleStore {
         }
     }
 }
+
+const MAX_BATCH_SIZE: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Lua helpers — prepended to all scripts except `clear`
@@ -211,7 +217,7 @@ local redis_epoch = tonumber(redis.call('HGET', epoch_key, counter_key) or 0) or
 local cumulative  = tonumber(redis.call('HGET', cumulative_key, counter_key) or 0) or 0
 local inst_count  = tonumber(redis.call('HGET', inst_count_key, counter_key) or 0) or 0
 
-return {cumulative, inst_count, redis_epoch, instance_created}
+return {counter_key, cumulative, inst_count, redis_epoch, instance_created}
 "#;
 
 const DEL_LUA: &str = r#"
@@ -650,37 +656,6 @@ impl StrictInstanceAwareCounter {
         });
     }
 
-    /// Builds a Redis pipeline with one `INC_IF_EPOCH_MATCHES_LUA` invocation per
-    /// item in `chunk`. `load_script = true` prepends a `LOAD SCRIPT` command to
-    /// handle cache misses (mirrors `LaxCounter::build_commit_pipeline`).
-    fn build_recovery_pipeline(
-        &self,
-        chunk: &[(RedisKey, i64, u64)],
-        load_script: bool,
-    ) -> redis::Pipeline {
-        let mut pipe = redis::Pipeline::new();
-        if load_script {
-            pipe.load_script(&self.inc_if_epoch_matches_script).ignore();
-        }
-        for (key, count, local_epoch) in chunk {
-            pipe.invoke_script(
-                self.inc_if_epoch_matches_script
-                    .key(self.epoch_key())
-                    .key(self.instances_key())
-                    .key(self.cumulative_key())
-                    .key(self.keys_key())
-                    .key(self.inst_count_key())
-                    .arg(key.as_str())
-                    .arg(*count)
-                    .arg(*local_epoch)
-                    .arg(self.dead_instance_threshold_ms)
-                    .arg(self.prefix_str())
-                    .arg(&self.instance_id),
-            );
-        }
-        pipe
-    }
-
     /// Sends recovery increments for all keys in `recoveries` using pipelined
     /// `INC_IF_EPOCH_MATCHES_LUA` calls, chunked to avoid oversized pipelines.
     /// After each chunk the returned `(key, cumulative, inst_count, redis_epoch)`
@@ -700,22 +675,25 @@ impl StrictInstanceAwareCounter {
         while processed < recoveries.len() {
             let end = (processed + chunk_size).min(recoveries.len());
             let chunk = &recoveries[processed..end];
+            let script = &self.inc_if_epoch_matches_script;
 
-            let results: Vec<(String, i64, i64, i64)> = {
-                let pipe = self.build_recovery_pipeline(chunk, false);
-                match pipe.query_async(&mut conn).await {
-                    Ok(r) => r,
-                    Err(err) => {
-                        if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript)
-                        {
-                            return Err(DistkitError::RedisError(err));
-                        }
-                        // Script not in cache — reload and retry.
-                        let pipe = self.build_recovery_pipeline(chunk, true);
-                        pipe.query_async(&mut conn).await?
-                    }
-                }
-            };
+            let results: Vec<(String, i64, i64, i64)> =
+                execute_pipeline_with_script_retry(&mut conn, script, chunk, |item| {
+                    let (key, count, local_epoch) = item;
+                    let mut inv = script.key(self.epoch_key());
+                    inv.key(self.instances_key());
+                    inv.key(self.cumulative_key());
+                    inv.key(self.keys_key());
+                    inv.key(self.inst_count_key());
+                    inv.arg(key.as_str());
+                    inv.arg(*count);
+                    inv.arg(*local_epoch);
+                    inv.arg(self.dead_instance_threshold_ms);
+                    inv.arg(self.prefix_str());
+                    inv.arg(&self.instance_id);
+                    inv
+                })
+                .await?;
 
             // Each result carries its own key — no zip required.
             for (key_str, cumulative, inst_count, redis_epoch) in results {
@@ -728,38 +706,6 @@ impl StrictInstanceAwareCounter {
         }
 
         Ok(())
-    }
-
-    /// Builds a Redis pipeline with one `inc_script` invocation per item in
-    /// `chunk`. Because `INC_LUA` now echoes `counter_key` as its first return
-    /// element, results are self-identifying — no zip required.
-    fn build_inc_batch_pipeline(
-        &self,
-        chunk: &[(RedisKey, i64)],
-        load_script: bool,
-    ) -> redis::Pipeline {
-        let mut pipe = redis::Pipeline::new();
-        if load_script {
-            pipe.load_script(&self.inc_script).ignore();
-        }
-        for (key, delta) in chunk {
-            let local_epoch = self.get_local_epoch(key);
-            pipe.invoke_script(
-                self.inc_script
-                    .key(self.epoch_key())
-                    .key(self.instances_key())
-                    .key(self.cumulative_key())
-                    .key(self.keys_key())
-                    .key(self.inst_count_key())
-                    .arg(key.as_str())
-                    .arg(*delta)
-                    .arg(local_epoch)
-                    .arg(self.dead_instance_threshold_ms)
-                    .arg(self.prefix_str())
-                    .arg(&self.instance_id),
-            );
-        }
-        pipe
     }
 
     /// Sends multiple increments in a pipelined batch, chunked to `max_batch_size` per
@@ -806,30 +752,26 @@ impl StrictInstanceAwareCounter {
             let end = (processed + max_batch_size).min(increments.len());
             let chunk = &increments[processed..end];
 
-            // Build and run the pipeline inside a block so the `chunk` slice
-            // borrow ends before we potentially drain `increments`.
             // Results: (counter_key, cumulative, inst_count, redis_epoch, instance_created)
-            let first_attempt = {
-                let pipe = self.build_inc_batch_pipeline(chunk, false);
-                pipe.query_async::<Vec<(String, i64, i64, u64, i64)>>(&mut conn)
-                    .await
-            };
-
-            let chunk_results: Vec<(String, i64, i64, u64, i64)> = match first_attempt {
-                Ok(r) => r,
-                Err(err) => {
-                    if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) {
-                        return Err(DistkitError::RedisError(err));
-                    }
-                    // Script not cached — reload and retry. After the drain the
-                    // current chunk is now at indices [0..chunk_len].
-                    let pipe = self.build_inc_batch_pipeline(chunk, true);
-                    match pipe.query_async(&mut conn).await {
-                        Ok(r) => r,
-                        Err(e) => return Err(DistkitError::RedisError(e)),
-                    }
-                }
-            };
+            let script = &self.inc_script;
+            let chunk_results: Vec<(String, i64, i64, u64, i64)> =
+                execute_pipeline_with_script_retry(&mut conn, script, chunk, |item| {
+                    let (key, delta) = item;
+                    let local_epoch = self.get_local_epoch(key);
+                    let mut inv = script.key(self.epoch_key());
+                    inv.key(self.instances_key());
+                    inv.key(self.cumulative_key());
+                    inv.key(self.keys_key());
+                    inv.key(self.inst_count_key());
+                    inv.arg(key.as_str());
+                    inv.arg(*delta);
+                    inv.arg(local_epoch);
+                    inv.arg(self.dead_instance_threshold_ms);
+                    inv.arg(self.prefix_str());
+                    inv.arg(&self.instance_id);
+                    inv
+                })
+                .await?;
 
             for (key_str, cumulative, inst_count, redis_epoch, _) in chunk_results {
                 if let Ok(key) = RedisKey::try_from(key_str.clone()) {
@@ -845,6 +787,76 @@ impl StrictInstanceAwareCounter {
         increments.drain(..processed);
 
         Ok(output)
+    }
+
+    pub(crate) async fn get_batch<'k>(
+        &self,
+        keys: &[&'k RedisKey],
+    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        self.activity.signal();
+
+        let mut conn = self.connection_manager.clone();
+        let mut map: HashMap<String, (i64, i64)> = HashMap::with_capacity(keys.len());
+        let mut recovery_keys: Vec<(RedisKey, i64)> = Vec::new();
+
+        let mut processed = 0;
+        while processed < keys.len() {
+            let end = (processed + MAX_BATCH_SIZE).min(keys.len());
+            let chunk = &keys[processed..end];
+            let script = &self.get_script;
+
+            let chunk_results: Vec<(String, i64, i64, u64, i64)> =
+                execute_pipeline_with_script_retry(&mut conn, script, chunk, |key| {
+                    let local_epoch = self.get_local_epoch(key);
+                    let mut inv = script.key(self.epoch_key());
+                    inv.key(self.instances_key());
+                    inv.key(self.cumulative_key());
+                    inv.key(self.keys_key());
+                    inv.key(self.inst_count_key());
+                    inv.arg(key.as_str());
+                    inv.arg(local_epoch);
+                    inv.arg(self.dead_instance_threshold_ms);
+                    inv.arg(self.prefix_str());
+                    inv.arg(&self.instance_id);
+                    inv
+                })
+                .await?;
+
+            for (key_str, cumulative, inst_count, redis_epoch, instance_created_raw) in
+                chunk_results
+            {
+                if let Ok(key) = RedisKey::try_from(key_str.clone()) {
+                    let instance_created = instance_created_raw != 0;
+                    let local_epoch = self.get_local_epoch(&key);
+                    let old_local_count = self.get_local_count(&key);
+                    self.update_local_store(&key, redis_epoch, cumulative, inst_count);
+                    if instance_created && local_epoch == redis_epoch && old_local_count > 0 {
+                        recovery_keys.push((key.clone(), old_local_count));
+                    }
+                    map.insert(key_str, (cumulative, inst_count));
+                }
+            }
+
+            processed = end;
+        }
+
+        // Sequential recovery fallback (rare: instance was cleaned up as dead).
+        for (key, old_count) in recovery_keys {
+            let (cumulative, inst_count) = self.inc(&key, old_count).await?;
+            map.insert(key.to_string(), (cumulative, inst_count));
+        }
+
+        Ok(keys
+            .iter()
+            .map(|k| {
+                let (cum, inst) = map.get(k.as_str()).copied().unwrap_or((0, 0));
+                (*k, cum, inst)
+            })
+            .collect())
     }
 
     #[cfg(test)]
