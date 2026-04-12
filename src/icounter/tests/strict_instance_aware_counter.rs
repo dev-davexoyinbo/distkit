@@ -1,5 +1,8 @@
 use std::time::Duration;
 
+use crate::CounterComparator;
+use crate::icounter::InstanceAwareCounterTrait;
+
 use super::common::{
     key, make_counter, make_n_counters, make_n_counters_with_opts, make_pair, make_pair_with_opts,
 };
@@ -965,6 +968,111 @@ async fn no_recovery_for_live_instance() {
 
     let (_, c1_from_c1) = c1.get(&k).await.unwrap();
     assert_eq!(c1_from_c1, 25); // c1's own view
+
+    c1.clear().await.unwrap();
+}
+
+#[tokio::test]
+async fn inc_if_uses_all_comparators_against_cumulative() {
+    let cases = [
+        ("eq", CounterComparator::Eq(10), true),
+        ("lt", CounterComparator::Lt(11), true),
+        ("gt", CounterComparator::Gt(10), false),
+        ("ne", CounterComparator::Ne(9), true),
+        ("nil", CounterComparator::Nil, true),
+    ];
+
+    for (suffix, comparator, should_apply) in cases {
+        let c = make_counter(&format!("strict_inc_if_{suffix}")).await;
+        let k = key("hits");
+        c.set(&k, 10).await.unwrap();
+
+        let (cum, inst) = c.inc_if(&k, comparator, 2).await.unwrap();
+        let expected = if should_apply { (12, 12) } else { (10, 10) };
+
+        assert_eq!((cum, inst), expected);
+        assert_eq!(c.get(&k).await.unwrap(), expected);
+        c.clear().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn set_on_instance_if_compares_against_instance_slice() {
+    let (c1, c2) = make_pair("strict_set_on_instance_if").await;
+    let k = key("hits");
+
+    c1.set_on_instance(&k, 7).await.unwrap();
+    c2.set_on_instance(&k, 5).await.unwrap();
+
+    let result = c1
+        .set_on_instance_if(&k, CounterComparator::Gt(6), 9)
+        .await
+        .unwrap();
+    assert_eq!(result, (14, 9));
+
+    let failed = c1
+        .set_on_instance_if(&k, CounterComparator::Eq(8), 50)
+        .await
+        .unwrap();
+    assert_eq!(failed, (14, 9));
+
+    let unconditional = c1
+        .set_on_instance_if(&k, CounterComparator::Nil, 11)
+        .await
+        .unwrap();
+    assert_eq!(unconditional, (16, 11));
+
+    c1.clear().await.unwrap();
+}
+
+#[tokio::test]
+async fn set_all_if_supports_partial_success_and_missing_keys() {
+    let c = make_counter("strict_set_all_if_partial").await;
+    let k1 = key("a");
+    let k2 = key("b");
+    let k3 = key("c");
+
+    c.set(&k1, 10).await.unwrap();
+    c.set(&k2, 20).await.unwrap();
+
+    let results = c
+        .set_all_if(&[
+            (&k3, CounterComparator::Nil, 30),
+            (&k1, CounterComparator::Gt(5), 11),
+            (&k2, CounterComparator::Lt(10), 99),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(results, vec![(&k3, 30, 30), (&k1, 11, 11), (&k2, 20, 20)]);
+    assert_eq!(c.get(&k1).await.unwrap(), (11, 11));
+    assert_eq!(c.get(&k2).await.unwrap(), (20, 20));
+    assert_eq!(c.get(&k3).await.unwrap(), (30, 30));
+
+    c.clear().await.unwrap();
+}
+
+#[tokio::test]
+async fn set_all_on_instance_if_supports_partial_success() {
+    let (c1, c2) = make_pair("strict_set_all_on_instance_if").await;
+    let k1 = key("a");
+    let k2 = key("b");
+
+    c1.set_on_instance(&k1, 4).await.unwrap();
+    c2.set_on_instance(&k1, 5).await.unwrap();
+    c2.set_on_instance(&k2, 3).await.unwrap();
+
+    let results = c1
+        .set_all_on_instance_if(&[
+            (&k2, CounterComparator::Eq(1), 10),
+            (&k1, CounterComparator::Nil, 7),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(results, vec![(&k2, 3, 0), (&k1, 12, 7)]);
+    assert_eq!(c2.get(&k1).await.unwrap().0, 12);
+    assert_eq!(c2.get(&k2).await.unwrap(), (3, 3));
 
     c1.clear().await.unwrap();
 }
