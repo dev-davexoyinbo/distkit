@@ -4,7 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use redis::aio::ConnectionManager;
 
-use crate::{RedisKey, counter::{CounterOptions, LaxCounter, StrictCounter}};
+use crate::{
+    RedisKey,
+    counter::{CounterOptions, LaxCounter, StrictCounter},
+};
 
 static RUN_ID: OnceLock<u128> = OnceLock::new();
 
@@ -18,8 +21,7 @@ fn run_id() -> u128 {
 }
 
 async fn make_connection() -> ConnectionManager {
-    let url = std::env::var("REDIS_URL")
-        .expect("REDIS_URL must be set — run via `make test`");
+    let url = std::env::var("REDIS_URL").expect("REDIS_URL must be set — run via `make test`");
     let client = redis::Client::open(url).expect("valid Redis URL");
     client
         .get_connection_manager()

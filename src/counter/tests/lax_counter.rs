@@ -1,4 +1,4 @@
-use crate::counter::CounterTrait;
+use crate::{CounterComparator, counter::CounterTrait};
 
 use super::common::{key, make_lax_counter};
 
@@ -159,9 +159,9 @@ async fn chained_inc_and_dec() {
     let k = key("score");
 
     counter.inc(&k, 10).await.unwrap(); // 10
-    counter.dec(&k, 3).await.unwrap();  // 7
-    counter.inc(&k, 5).await.unwrap();  // 12
-    counter.dec(&k, 2).await.unwrap();  // 10
+    counter.dec(&k, 3).await.unwrap(); // 7
+    counter.inc(&k, 5).await.unwrap(); // 12
+    counter.dec(&k, 2).await.unwrap(); // 10
 
     assert_eq!(counter.get(&k).await.unwrap(), 10);
 }
@@ -513,7 +513,10 @@ async fn get_all_unknown_keys_return_zero() {
     let counter = make_lax_counter("lax_get_all_unknown").await;
     let k1 = key("a");
     let k2 = key("b");
-    assert_eq!(counter.get_all(&[&k1, &k2]).await.unwrap(), vec![(&k1, 0), (&k2, 0)]);
+    assert_eq!(
+        counter.get_all(&[&k1, &k2]).await.unwrap(),
+        vec![(&k1, 0), (&k2, 0)]
+    );
 }
 
 #[tokio::test]
@@ -523,7 +526,10 @@ async fn get_all_returns_correct_values_after_inc() {
     let k2 = key("b");
     counter.inc(&k1, 5).await.unwrap();
     counter.inc(&k2, 10).await.unwrap();
-    assert_eq!(counter.get_all(&[&k1, &k2]).await.unwrap(), vec![(&k1, 5), (&k2, 10)]);
+    assert_eq!(
+        counter.get_all(&[&k1, &k2]).await.unwrap(),
+        vec![(&k1, 5), (&k2, 10)]
+    );
 }
 
 #[tokio::test]
@@ -594,7 +600,10 @@ async fn set_all_subsequent_get_all_is_consistent() {
     let k1 = key("a");
     let k2 = key("b");
     counter.set_all(&[(&k1, 100), (&k2, 200)]).await.unwrap();
-    assert_eq!(counter.get_all(&[&k1, &k2]).await.unwrap(), vec![(&k1, 100), (&k2, 200)]);
+    assert_eq!(
+        counter.get_all(&[&k1, &k2]).await.unwrap(),
+        vec![(&k1, 100), (&k2, 200)]
+    );
 }
 
 /// set_all is eventually visible to a fresh reader after the flush interval.
@@ -609,7 +618,10 @@ async fn set_all_is_eventually_flushed_to_redis() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let reader = make_lax_counter(prefix).await;
-    assert_eq!(reader.get_all(&[&k1, &k2]).await.unwrap(), vec![(&k1, 55), (&k2, 77)]);
+    assert_eq!(
+        reader.get_all(&[&k1, &k2]).await.unwrap(),
+        vec![(&k1, 55), (&k2, 77)]
+    );
 }
 
 #[tokio::test]
@@ -620,7 +632,10 @@ async fn set_all_on_new_keys_uses_zero_remote_total() {
     // Keys have never been written; remote_total is 0. delta = count - 0 = count.
     let results = counter.set_all(&[(&k1, 30), (&k2, 40)]).await.unwrap();
     assert_eq!(results, vec![(&k1, 30), (&k2, 40)]);
-    assert_eq!(counter.get_all(&[&k1, &k2]).await.unwrap(), vec![(&k1, 30), (&k2, 40)]);
+    assert_eq!(
+        counter.get_all(&[&k1, &k2]).await.unwrap(),
+        vec![(&k1, 30), (&k2, 40)]
+    );
 }
 
 #[tokio::test]
@@ -634,4 +649,86 @@ async fn set_all_preserves_input_order() {
         .await
         .unwrap();
     assert_eq!(results, vec![(&k3, 30), (&k1, 10), (&k2, 20)]);
+}
+
+#[tokio::test]
+async fn inc_if_uses_all_comparators_against_local_view() {
+    let cases = [
+        ("eq", CounterComparator::Eq(10), true),
+        ("lt", CounterComparator::Lt(11), true),
+        ("gt", CounterComparator::Gt(10), false),
+        ("ne", CounterComparator::Ne(9), true),
+        ("nil", CounterComparator::Nil, true),
+    ];
+
+    for (suffix, comparator, should_apply) in cases {
+        let counter = make_lax_counter(&format!("lax_inc_if_{suffix}")).await;
+        let k = key("conditional");
+        counter.set(&k, 10).await.unwrap();
+
+        let result = counter.inc_if(&k, comparator, 2).await.unwrap();
+        let expected = if should_apply { 12 } else { 10 };
+
+        assert_eq!(result, expected);
+        assert_eq!(counter.get(&k).await.unwrap(), expected);
+    }
+}
+
+#[tokio::test]
+async fn inc_if_refreshes_stale_value_before_comparing() {
+    let prefix = "lax_inc_if_refresh";
+    let k = key("hits");
+
+    let writer = make_lax_counter(prefix).await;
+    writer.set(&k, 7).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let reader = make_lax_counter(prefix).await;
+    let result = reader
+        .inc_if(&k, CounterComparator::Eq(7), 3)
+        .await
+        .unwrap();
+
+    assert_eq!(result, 10);
+    assert_eq!(reader.get(&k).await.unwrap(), 10);
+}
+
+#[tokio::test]
+async fn set_all_if_returns_current_values_for_failed_conditions() {
+    let counter = make_lax_counter("lax_set_all_if_failed").await;
+    let k = key("hits");
+
+    counter.inc(&k, 5).await.unwrap();
+    let results = counter
+        .set_all_if(&[(&k, CounterComparator::Gt(10), 20)])
+        .await
+        .unwrap();
+
+    assert_eq!(results, vec![(&k, 5)]);
+    assert_eq!(counter.get(&k).await.unwrap(), 5);
+}
+
+#[tokio::test]
+async fn set_all_if_is_eventually_flushed_for_successful_updates() {
+    let prefix = "lax_set_all_if_flush";
+    let k1 = key("a");
+    let k2 = key("b");
+
+    let counter = make_lax_counter(prefix).await;
+    let results = counter
+        .set_all_if(&[
+            (&k1, CounterComparator::Nil, 55),
+            (&k2, CounterComparator::Gt(0), 77),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(results, vec![(&k1, 55), (&k2, 0)]);
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let reader = make_lax_counter(prefix).await;
+    assert_eq!(
+        reader.get_all(&[&k1, &k2]).await.unwrap(),
+        vec![(&k1, 55), (&k2, 0)]
+    );
 }
