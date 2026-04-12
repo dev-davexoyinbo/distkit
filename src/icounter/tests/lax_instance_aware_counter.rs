@@ -411,7 +411,9 @@ async fn early_flusher_sees_stale_cumulative_from_reversed_flush_order() {
 
     // Step 4: c1 flushes. strict: c1=1, c2=2, cum=3; c1.local: cum=3, inst=1.
     // c2 is idle (δ=0) — the flush task skips it every tick.
-    sleep(Duration::from_millis(FLUSH_MS * 5)).await;
+    // Use a longer wait so c1's contribution is definitely visible in Redis
+    // before c2.get() triggers a staleness re-fetch.
+    sleep(Duration::from_millis(FLUSH_MS * 15)).await;
 
     // Step 5: c2's cache is ~100 ms old (>>  allowed_lag=10 ms).
     // get() must re-fetch from strict and return the current ground-truth cumulative.
@@ -429,4 +431,204 @@ async fn early_flusher_sees_stale_cumulative_from_reversed_flush_order() {
     let (reader_cum, reader_inst) = reader.get(&k).await.unwrap();
     assert_eq!(reader_cum, 3, "fresh reader sees ground-truth total");
     assert_eq!(reader_inst, 0);
+}
+
+// ---------------------------------------------------------------------------
+// get_all
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_all_empty_returns_empty() {
+    let c = make_lax("get_all_empty").await;
+    assert_eq!(c.get_all(&[]).await.unwrap(), vec![]);
+}
+
+#[tokio::test]
+async fn get_all_unknown_keys_return_zero_zero() {
+    let c = make_lax("get_all_unknown").await;
+    let k1 = key("a");
+    let k2 = key("b");
+    assert_eq!(c.get_all(&[&k1, &k2]).await.unwrap(), vec![(&k1, 0, 0), (&k2, 0, 0)]);
+}
+
+#[tokio::test]
+async fn get_all_returns_correct_values_after_inc() {
+    let c = make_lax("get_all_after_inc").await;
+    let k1 = key("a");
+    let k2 = key("b");
+    c.inc(&k1, 5).await.unwrap();
+    c.inc(&k2, 10).await.unwrap();
+    let results = c.get_all(&[&k1, &k2]).await.unwrap();
+    assert_eq!(results, vec![(&k1, 5, 5), (&k2, 10, 10)]);
+}
+
+#[tokio::test]
+async fn get_all_preserves_input_order() {
+    let c = make_lax("get_all_order").await;
+    let k1 = key("a");
+    let k2 = key("b");
+    let k3 = key("c");
+    c.inc(&k1, 1).await.unwrap();
+    c.inc(&k2, 2).await.unwrap();
+    c.inc(&k3, 3).await.unwrap();
+    let results = c.get_all(&[&k3, &k1, &k2]).await.unwrap();
+    assert_eq!(results, vec![(&k3, 3, 3), (&k1, 1, 1), (&k2, 2, 2)]);
+}
+
+/// A fresh reader with no local cache must batch-fetch from the strict counter
+/// and return the written values — not stale zeros.
+#[tokio::test]
+async fn get_all_fetches_stale_keys_from_redis() {
+    let (writer, _, prefix) = make_lax_pair("get_all_stale").await;
+    let k = key("hits");
+
+    writer.inc(&k, 42).await.unwrap();
+    sleep(Duration::from_millis(FLUSH_MS * 5)).await;
+
+    let reader = make_lax_from_prefix(&prefix).await;
+    let results = reader.get_all(&[&k]).await.unwrap();
+    assert_eq!(results[0].1, 42);
+}
+
+// ---------------------------------------------------------------------------
+// get_all_on_instance
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_all_on_instance_empty_returns_empty() {
+    let c = make_lax("goi_empty").await;
+    assert_eq!(c.get_all_on_instance(&[]).await.unwrap(), vec![]);
+}
+
+#[tokio::test]
+async fn get_all_on_instance_unknown_keys_return_zero() {
+    let c = make_lax("goi_unknown").await;
+    let k1 = key("a");
+    let k2 = key("b");
+    // No Redis call — purely local; missing keys are 0.
+    assert_eq!(c.get_all_on_instance(&[&k1, &k2]).await.unwrap(), vec![(&k1, 0), (&k2, 0)]);
+}
+
+#[tokio::test]
+async fn get_all_on_instance_returns_instance_count_plus_delta() {
+    let c = make_lax("goi_delta").await;
+    let k = key("hits");
+    c.inc(&k, 5).await.unwrap();
+    // instance_count is seeded from strict (0) + delta (5) = 5.
+    assert_eq!(c.get_all_on_instance(&[&k]).await.unwrap(), vec![(&k, 5)]);
+}
+
+#[tokio::test]
+async fn get_all_on_instance_unaffected_by_other_instances() {
+    let (c1, c2, _) = make_lax_pair("goi_isolation").await;
+    let k = key("hits");
+
+    c2.inc(&k, 100).await.unwrap();
+    sleep(Duration::from_millis(FLUSH_MS * 5)).await;
+
+    // c1 has no local contribution for this key; result must be 0.
+    assert_eq!(c1.get_all_on_instance(&[&k]).await.unwrap(), vec![(&k, 0)]);
+}
+
+// ---------------------------------------------------------------------------
+// set_all_on_instance
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn set_all_on_instance_empty_returns_empty() {
+    let c = make_lax("soi_empty").await;
+    assert_eq!(c.set_all_on_instance(&[]).await.unwrap(), vec![]);
+}
+
+#[tokio::test]
+async fn set_all_on_instance_basic_correctness() {
+    let c = make_lax("soi_basic").await;
+    let k1 = key("a");
+    let k2 = key("b");
+    let results = c.set_all_on_instance(&[(&k1, 7), (&k2, 3)]).await.unwrap();
+    assert_eq!(results, vec![(&k1, 7, 7), (&k2, 3, 3)]);
+}
+
+/// Other instances' slices must not be overwritten by set_all_on_instance.
+#[tokio::test]
+async fn set_all_on_instance_preserves_other_slices() {
+    let (c1, c2, prefix) = make_lax_pair("soi_preserves").await;
+    let k = key("hits");
+
+    c2.inc(&k, 10).await.unwrap();
+    sleep(Duration::from_millis(FLUSH_MS * 10)).await;
+
+    // c1 sets its own slice to 4. c2's slice (10) must survive.
+    c1.set_all_on_instance(&[(&k, 4)]).await.unwrap();
+    // Long enough for c1 to flush delta=4 but well under the 300 ms dead-instance
+    // threshold (c2 last heartbeat ~10 ms ago, c1 last heartbeat ~105 ms ago).
+    sleep(Duration::from_millis(FLUSH_MS * 10)).await;
+
+    // A fresh reader sees both contributions.
+    let reader = make_lax_from_prefix(&prefix).await;
+    let (cum, _) = reader.get(&k).await.unwrap();
+    assert_eq!(cum, 14);
+}
+
+/// Stale keys are batch-refreshed before computing the delta.
+#[tokio::test]
+async fn set_all_on_instance_stale_keys_are_batch_refreshed() {
+    let (c1, c2, _) = make_lax_pair("soi_stale_refresh").await;
+    let k = key("hits");
+
+    c2.inc(&k, 5).await.unwrap();
+    sleep(Duration::from_millis(FLUSH_MS * 5)).await;
+
+    // c1 has never touched this key — it is seeded from strict during set_all_on_instance.
+    let results = c1.set_all_on_instance(&[(&k, 3)]).await.unwrap();
+    // instance_count for c1 = 0 (fresh), cumulative from strict = 5.
+    // Expected: (5 - 0 + 3, 3) = (8, 3).
+    assert_eq!(results[0].2, 3, "instance slice set correctly");
+}
+
+// ---------------------------------------------------------------------------
+// set_all
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn set_all_empty_returns_empty() {
+    let c = make_lax("sa_empty").await;
+    assert_eq!(c.set_all(&[]).await.unwrap(), vec![]);
+}
+
+#[tokio::test]
+async fn set_all_basic_correctness() {
+    let c = make_lax("sa_basic").await;
+    let k1 = key("a");
+    let k2 = key("b");
+    let results = c.set_all(&[(&k1, 10), (&k2, 20)]).await.unwrap();
+    assert_eq!(results, vec![(&k1, 10, 10), (&k2, 20, 20)]);
+}
+
+/// After set_all the new values must be visible to another instance immediately.
+#[tokio::test]
+async fn set_all_visible_to_other_instances() {
+    let (c1, c2, _) = make_lax_pair("sa_visible").await;
+    let k = key("hits");
+
+    c1.set_all(&[(&k, 99)]).await.unwrap();
+
+    let (cum, _) = c2.get(&k).await.unwrap();
+    assert_eq!(cum, 99);
+}
+
+/// set_all flushes any pending delta for the affected keys before calling strict.set.
+#[tokio::test]
+async fn set_all_flushes_pending_delta_first() {
+    let (c1, c2, _) = make_lax_pair("sa_flush_first").await;
+    let k = key("hits");
+
+    // c1 accumulates delta=5 (not yet flushed).
+    c1.inc(&k, 5).await.unwrap();
+    // set_all must flush the pending delta before set, then set to 20.
+    c1.set_all(&[(&k, 20)]).await.unwrap();
+
+    // c2 must see 20, not 20+5.
+    let (cum, _) = c2.get(&k).await.unwrap();
+    assert_eq!(cum, 20);
 }

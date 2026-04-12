@@ -497,3 +497,141 @@ async fn del_after_set_returns_correct_value() {
     let returned = counter.del(&k).await.unwrap();
     assert_eq!(returned, 77);
 }
+
+// ---------------------------------------------------------------------------
+// get_all / set_all
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_all_empty_returns_empty() {
+    let counter = make_lax_counter("lax_get_all_empty").await;
+    assert_eq!(counter.get_all(&[]).await.unwrap(), vec![]);
+}
+
+#[tokio::test]
+async fn get_all_unknown_keys_return_zero() {
+    let counter = make_lax_counter("lax_get_all_unknown").await;
+    let k1 = key("a");
+    let k2 = key("b");
+    assert_eq!(counter.get_all(&[&k1, &k2]).await.unwrap(), vec![(&k1, 0), (&k2, 0)]);
+}
+
+#[tokio::test]
+async fn get_all_returns_correct_values_after_inc() {
+    let counter = make_lax_counter("lax_get_all_after_inc").await;
+    let k1 = key("a");
+    let k2 = key("b");
+    counter.inc(&k1, 5).await.unwrap();
+    counter.inc(&k2, 10).await.unwrap();
+    assert_eq!(counter.get_all(&[&k1, &k2]).await.unwrap(), vec![(&k1, 5), (&k2, 10)]);
+}
+
+#[tokio::test]
+async fn get_all_preserves_input_order() {
+    let counter = make_lax_counter("lax_get_all_order").await;
+    let k1 = key("a");
+    let k2 = key("b");
+    let k3 = key("c");
+    counter.inc(&k1, 1).await.unwrap();
+    counter.inc(&k2, 2).await.unwrap();
+    counter.inc(&k3, 3).await.unwrap();
+    assert_eq!(
+        counter.get_all(&[&k3, &k1, &k2]).await.unwrap(),
+        vec![(&k3, 3), (&k1, 1), (&k2, 2)]
+    );
+}
+
+/// A fresh reader with no local cache must re-fetch from Redis and return the
+/// value written by the first instance, not stale zeros.
+#[tokio::test]
+async fn get_all_fetches_stale_keys_from_redis() {
+    let prefix = "lax_get_all_stale";
+    let k = key("counter");
+
+    let writer = make_lax_counter(prefix).await;
+    writer.inc(&k, 42).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let reader = make_lax_counter(prefix).await;
+    assert_eq!(reader.get_all(&[&k]).await.unwrap(), vec![(&k, 42)]);
+}
+
+#[tokio::test]
+async fn get_all_mixed_fresh_and_stale() {
+    let prefix = "lax_get_all_mixed";
+    let k1 = key("a");
+    let k2 = key("b");
+
+    let counter = make_lax_counter(prefix).await;
+    counter.inc(&k1, 7).await.unwrap();
+    counter.inc(&k2, 13).await.unwrap();
+    // Wait for flush + cache expiry so both keys are stale on a fresh instance.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let reader = make_lax_counter(prefix).await;
+    let results = reader.get_all(&[&k1, &k2]).await.unwrap();
+    assert_eq!(results, vec![(&k1, 7), (&k2, 13)]);
+}
+
+#[tokio::test]
+async fn set_all_empty_returns_empty() {
+    let counter = make_lax_counter("lax_set_all_empty").await;
+    assert_eq!(counter.set_all(&[]).await.unwrap(), vec![]);
+}
+
+#[tokio::test]
+async fn set_all_returns_target_values() {
+    let counter = make_lax_counter("lax_set_all_returns").await;
+    let k1 = key("a");
+    let k2 = key("b");
+    let results = counter.set_all(&[(&k1, 10), (&k2, 20)]).await.unwrap();
+    assert_eq!(results, vec![(&k1, 10), (&k2, 20)]);
+}
+
+#[tokio::test]
+async fn set_all_subsequent_get_all_is_consistent() {
+    let counter = make_lax_counter("lax_set_all_consistent").await;
+    let k1 = key("a");
+    let k2 = key("b");
+    counter.set_all(&[(&k1, 100), (&k2, 200)]).await.unwrap();
+    assert_eq!(counter.get_all(&[&k1, &k2]).await.unwrap(), vec![(&k1, 100), (&k2, 200)]);
+}
+
+/// set_all is eventually visible to a fresh reader after the flush interval.
+#[tokio::test]
+async fn set_all_is_eventually_flushed_to_redis() {
+    let prefix = "lax_set_all_flush";
+    let k1 = key("a");
+    let k2 = key("b");
+
+    let counter = make_lax_counter(prefix).await;
+    counter.set_all(&[(&k1, 55), (&k2, 77)]).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let reader = make_lax_counter(prefix).await;
+    assert_eq!(reader.get_all(&[&k1, &k2]).await.unwrap(), vec![(&k1, 55), (&k2, 77)]);
+}
+
+#[tokio::test]
+async fn set_all_on_new_keys_uses_zero_remote_total() {
+    let counter = make_lax_counter("lax_set_all_new_keys").await;
+    let k1 = key("x");
+    let k2 = key("y");
+    // Keys have never been written; remote_total is 0. delta = count - 0 = count.
+    let results = counter.set_all(&[(&k1, 30), (&k2, 40)]).await.unwrap();
+    assert_eq!(results, vec![(&k1, 30), (&k2, 40)]);
+    assert_eq!(counter.get_all(&[&k1, &k2]).await.unwrap(), vec![(&k1, 30), (&k2, 40)]);
+}
+
+#[tokio::test]
+async fn set_all_preserves_input_order() {
+    let counter = make_lax_counter("lax_set_all_order").await;
+    let k1 = key("a");
+    let k2 = key("b");
+    let k3 = key("c");
+    let results = counter
+        .set_all(&[(&k3, 30), (&k1, 10), (&k2, 20)])
+        .await
+        .unwrap();
+    assert_eq!(results, vec![(&k3, 30), (&k1, 10), (&k2, 20)]);
+}
