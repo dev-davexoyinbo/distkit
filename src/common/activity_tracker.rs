@@ -94,6 +94,7 @@ impl ActivityTracker {
     pub(crate) fn signal(&self) {
         let epoch = self.epoch.load(Ordering::Relaxed);
         if self.last_commited_epoch.load(Ordering::Relaxed) < epoch {
+            self.is_active.store(true, Ordering::Release);
             let _ = self.is_active_watch.send(epoch);
             self.last_commited_epoch.store(epoch, Ordering::Relaxed);
         }
