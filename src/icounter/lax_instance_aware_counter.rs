@@ -352,8 +352,6 @@ impl LaxInstanceAwareCounter {
             return Ok(());
         }
 
-        self.flush_all_keys().await?;
-
         let (cumulative, instance_count) = self.strict.get(key).await?;
 
         self.update_local(key, cumulative, instance_count);
