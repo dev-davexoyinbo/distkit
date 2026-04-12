@@ -340,6 +340,26 @@ impl LaxInstanceAwareCounter {
             }
         }
     } // end function update_local
+
+    async fn refresh_local_if_needed(&self, key: &RedisKey) -> Result<(), DistkitError> {
+        let lock = self.get_or_create_reset_lock(key);
+        let _guard = lock.lock().await;
+
+        if let Some(store) = self.local_store.get(key)
+            && mutex_lock(&store.last_flush, "lax_icounter:last_flush")?.elapsed()
+                < self.allowed_lag
+        {
+            return Ok(());
+        }
+
+        self.flush_all_keys().await?;
+
+        let (cumulative, instance_count) = self.strict.get(key).await?;
+
+        self.update_local(key, cumulative, instance_count);
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -394,18 +414,23 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         self.activity.signal();
 
         let store = match self.local_store.get(key) {
-            Some(store) => store,
+            Some(store)
+                if mutex_lock(&store.last_flush, "lax_icounter:last_flush")?.elapsed()
+                    < self.allowed_lag =>
+            {
+                store
+            }
+            Some(store) => {
+                drop(store);
+
+                self.refresh_local_if_needed(key).await?;
+
+                self.local_store
+                    .get(key)
+                    .expect("key should be in local_store")
+            }
             None => {
-                let lock = self.get_or_create_reset_lock(key);
-                let _guard = lock.lock().await;
-
-                if !self.local_store.contains_key(key) {
-                    let (cumulative, instance_count) = self.strict.get(key).await?;
-
-                    self.local_store
-                        .entry(key.clone())
-                        .or_insert_with(|| SingleStore::new(cumulative, instance_count));
-                }
+                self.refresh_local_if_needed(key).await?;
 
                 self.local_store
                     .get(key)
@@ -510,18 +535,23 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         self.activity.signal();
 
         let store = match self.local_store.get(key) {
-            Some(store) => store,
+            Some(store)
+                if mutex_lock(&store.last_flush, "lax_icounter:last_flush")?.elapsed()
+                    < self.allowed_lag =>
+            {
+                store
+            }
+            Some(store) => {
+                drop(store);
+
+                self.refresh_local_if_needed(key).await?;
+
+                self.local_store
+                    .get(key)
+                    .expect("key should be in local_store")
+            }
             None => {
-                let lock = self.get_or_create_reset_lock(key);
-                let _guard = lock.lock().await;
-
-                if !self.local_store.contains_key(key) {
-                    let (cumulative, instance_count) = self.strict.get(key).await?;
-
-                    self.local_store
-                        .entry(key.clone())
-                        .or_insert_with(|| SingleStore::new(cumulative, instance_count));
-                }
+                self.refresh_local_if_needed(key).await?;
 
                 self.local_store
                     .get(key)
@@ -561,18 +591,23 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         self.activity.signal();
 
         let store = match self.local_store.get(key) {
-            Some(store) => store,
+            Some(store)
+                if mutex_lock(&store.last_flush, "lax_icounter:last_flush")?.elapsed()
+                    < self.allowed_lag =>
+            {
+                store
+            }
+            Some(store) => {
+                drop(store);
+
+                self.refresh_local_if_needed(key).await?;
+
+                self.local_store
+                    .get(key)
+                    .expect("key should be in local_store")
+            }
             None => {
-                let lock = self.get_or_create_reset_lock(key);
-                let _guard = lock.lock().await;
-
-                if !self.local_store.contains_key(key) {
-                    let (cumulative, instance_count) = self.strict.get(key).await?;
-
-                    self.local_store
-                        .entry(key.clone())
-                        .or_insert_with(|| SingleStore::new(cumulative, instance_count));
-                }
+                self.refresh_local_if_needed(key).await?;
 
                 self.local_store
                     .get(key)

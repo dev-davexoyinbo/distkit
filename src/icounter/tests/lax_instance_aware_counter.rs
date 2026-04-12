@@ -40,7 +40,11 @@ async fn make_lax(name: &str) -> Arc<LaxInstanceAwareCounter> {
 /// Two lax counters sharing the same Redis prefix (different instance IDs).
 async fn make_lax_pair(
     name: &str,
-) -> (Arc<LaxInstanceAwareCounter>, Arc<LaxInstanceAwareCounter>, String) {
+) -> (
+    Arc<LaxInstanceAwareCounter>,
+    Arc<LaxInstanceAwareCounter>,
+    String,
+) {
     let prefix = unique_prefix(name);
     let c1 = make_lax_from_prefix(&prefix).await;
     let c2 = make_lax_from_prefix(&prefix).await;
