@@ -126,7 +126,6 @@ pub struct LaxInstanceAwareCounter {
     allowed_lag: Duration,
     reset_locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>>,
     pending_flushed: tokio::sync::Mutex<Vec<(RedisKey, i64)>>,
-    instance_wide_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl LaxInstanceAwareCounter {
@@ -178,7 +177,6 @@ impl LaxInstanceAwareCounter {
             allowed_lag,
             reset_locks: DashMap::default(),
             pending_flushed: tokio::sync::Mutex::new(Vec::new()),
-            instance_wide_lock: Arc::new(tokio::sync::Mutex::new(())),
         });
 
         counter.run_flush_task();
@@ -371,28 +369,6 @@ impl LaxInstanceAwareCounter {
             return Ok(());
         }
 
-        let keys: Vec<&RedisKey> = keys
-            .iter()
-            .filter(|key| {
-                self.local_store
-                    .get(*key)
-                    .and_then(|s| {
-                        mutex_lock(&s.last_flush, "lax_icounter:last_flush")
-                            .ok()
-                            .map(|g| g.elapsed() >= self.allowed_lag)
-                    })
-                    .unwrap_or(true)
-            })
-            .copied()
-            .collect();
-
-        if keys.is_empty() {
-            return Ok(());
-        }
-
-        let _guard = self.instance_wide_lock.lock().await;
-
-        // recheck if we have stale keys
         let keys: Vec<&RedisKey> = keys
             .iter()
             .filter(|key| {
@@ -856,8 +832,6 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         }
 
         self.activity.signal();
-
-        let _guard = self.instance_wide_lock.lock().await;
 
         self.flush().await?;
 
