@@ -1,4 +1,4 @@
-use crate::{DistkitError, RedisKey};
+use crate::{CounterComparator, DistkitError, RedisKey};
 
 /// Async interface for distributed counter operations.
 ///
@@ -28,6 +28,41 @@ pub trait CounterTrait {
     /// # }
     /// ```
     async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError>;
+
+    /// Conditionally increments the counter by `count` when the current value
+    /// satisfies `comparator` against `compare_against`.
+    ///
+    /// Returns the updated total on success, or the current total unchanged
+    /// when the condition fails.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{CounterComparator, RedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::strict_counter().await?;
+    /// let key = RedisKey::try_from("inventory".to_string())?;
+    /// counter.set(&key, 10).await?;
+    ///
+    /// assert_eq!(
+    ///     counter.inc_if(&key, CounterComparator::Eq, 10, 5).await?,
+    ///     15
+    /// );
+    /// assert_eq!(
+    ///     counter.inc_if(&key, CounterComparator::Lt, 10, 5).await?,
+    ///     15
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn inc_if(
+        &self,
+        key: &RedisKey,
+        comparator: CounterComparator,
+        compare_against: i64,
+        count: i64,
+    ) -> Result<i64, DistkitError>;
 
     /// Decrements the counter by `count` and returns the new total.
     ///
@@ -90,6 +125,41 @@ pub trait CounterTrait {
     /// ```
     async fn set(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError>;
 
+    /// Conditionally sets the counter to `count` when the current value
+    /// satisfies `comparator` against `compare_against`.
+    ///
+    /// Returns the value after evaluation: `count` when the write applied, or
+    /// the current total unchanged when the condition failed.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{CounterComparator, RedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::strict_counter().await?;
+    /// let key = RedisKey::try_from("inventory".to_string())?;
+    /// counter.set(&key, 10).await?;
+    ///
+    /// assert_eq!(
+    ///     counter.set_if(&key, CounterComparator::Gt, 5, 25).await?,
+    ///     25
+    /// );
+    /// assert_eq!(
+    ///     counter.set_if(&key, CounterComparator::Eq, 10, 50).await?,
+    ///     25
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn set_if(
+        &self,
+        key: &RedisKey,
+        comparator: CounterComparator,
+        compare_against: i64,
+        count: i64,
+    ) -> Result<i64, DistkitError>;
+
     /// Deletes the counter and returns the value it held before deletion.
     /// Returns `0` if the key did not exist.
     ///
@@ -135,9 +205,48 @@ pub trait CounterTrait {
 
     /// Returns `(key, value)` for each key in `keys`, in the same order.
     /// A missing key returns `(key, 0)`.
-    async fn get_all<'k>(&self, keys: &[&'k RedisKey]) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError>;
+    async fn get_all<'k>(
+        &self,
+        keys: &[&'k RedisKey],
+    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError>;
 
     /// Sets each `(key, count)` pair and returns `(key, count)` in the same
     /// order. Semantics match `set` for each individual key.
-    async fn set_all<'k>(&self, updates: &[(&'k RedisKey, i64)]) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError>;
+    async fn set_all<'k>(
+        &self,
+        updates: &[(&'k RedisKey, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError>;
+
+    /// Conditionally sets each `(key, count)` pair when the current value
+    /// satisfies the corresponding comparator against `compare_against`.
+    ///
+    /// Each tuple is `(key, comparator, compare_against, count)`. Evaluation is
+    /// per-item and results preserve input order.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{CounterComparator, RedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::strict_counter().await?;
+    /// let k1 = RedisKey::try_from("a".to_string())?;
+    /// let k2 = RedisKey::try_from("b".to_string())?;
+    /// counter.set(&k1, 10).await?;
+    ///
+    /// let results = counter
+    ///     .set_all_if(&[
+    ///         (&k1, CounterComparator::Eq, 10, 15),
+    ///         (&k2, CounterComparator::Eq, 0, 20),
+    ///     ])
+    ///     .await?;
+    ///
+    /// assert_eq!(results, vec![(&k1, 15), (&k2, 20)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn set_all_if<'k>(
+        &self,
+        updates: &[(&'k RedisKey, CounterComparator, i64, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError>;
 }
