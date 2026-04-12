@@ -5,6 +5,8 @@
 
 mod common;
 pub use common::*;
+mod comparator;
+pub use comparator::*;
 #[cfg(feature = "counter")]
 pub mod counter;
 
