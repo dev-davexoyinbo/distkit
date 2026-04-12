@@ -1118,20 +1118,26 @@ impl StrictInstanceAwareCounter {
         let mut conn = self.connection_manager.clone();
         let local_epoch = self.get_local_epoch(key);
 
-        let (cumulative, inst_count, redis_epoch, instance_created_raw): (i64, i64, u64, i64) =
-            self.get_script
-                .key(self.epoch_key())
-                .key(self.instances_key())
-                .key(self.cumulative_key())
-                .key(self.keys_key())
-                .key(self.inst_count_key())
-                .arg(key.as_str())
-                .arg(local_epoch)
-                .arg(self.dead_instance_threshold_ms)
-                .arg(self.prefix_str())
-                .arg(&self.instance_id)
-                .invoke_async(&mut conn)
-                .await?;
+        let (_, cumulative, inst_count, redis_epoch, instance_created_raw): (
+            String,
+            i64,
+            i64,
+            u64,
+            i64,
+        ) = self
+            .get_script
+            .key(self.epoch_key())
+            .key(self.instances_key())
+            .key(self.cumulative_key())
+            .key(self.keys_key())
+            .key(self.inst_count_key())
+            .arg(key.as_str())
+            .arg(local_epoch)
+            .arg(self.dead_instance_threshold_ms)
+            .arg(self.prefix_str())
+            .arg(&self.instance_id)
+            .invoke_async(&mut conn)
+            .await?;
 
         let instance_created = instance_created_raw != 0;
         let should_recover = instance_created && local_epoch == redis_epoch;
