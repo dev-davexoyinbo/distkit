@@ -997,6 +997,56 @@ async fn inc_if_uses_all_comparators_against_cumulative() {
 }
 
 #[tokio::test]
+async fn inc_all_empty_and_inc_all_if_empty_return_empty() {
+    let c = make_counter("strict_inc_all_empty").await;
+    assert_eq!(c.inc_all(&[]).await.unwrap(), vec![]);
+    assert_eq!(c.inc_all_if(&[]).await.unwrap(), vec![]);
+    c.clear().await.unwrap();
+}
+
+#[tokio::test]
+async fn inc_all_returns_ordered_results_and_supports_duplicates() {
+    let c = make_counter("strict_inc_all_duplicates").await;
+    let k = key("hits");
+
+    let results = c.inc_all(&[(&k, 1), (&k, 2)]).await.unwrap();
+
+    assert_eq!(results, vec![(&k, 1, 1), (&k, 3, 3)]);
+    assert_eq!(c.get(&k).await.unwrap(), (3, 3));
+    c.clear().await.unwrap();
+}
+
+#[tokio::test]
+async fn inc_all_if_compares_against_cumulative_and_processes_duplicates_sequentially() {
+    let (c1, c2) = make_pair("strict_inc_all_if_ordered").await;
+    let k1 = key("a");
+    let k2 = key("b");
+
+    c2.inc(&k2, 5).await.unwrap();
+    c1.set(&k1, 0).await.unwrap();
+
+    let results = c1
+        .inc_all_if(&[
+            (&k1, CounterComparator::Eq(0), 1),
+            (&k1, CounterComparator::Eq(1), 2),
+            (&k2, CounterComparator::Gt(10), 4),
+            (&k2, CounterComparator::Eq(5), 3),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        results,
+        vec![(&k1, 1, 1), (&k1, 3, 3), (&k2, 5, 0), (&k2, 8, 3)]
+    );
+    assert_eq!(c1.get(&k1).await.unwrap(), (3, 3));
+    assert_eq!(c1.get(&k2).await.unwrap(), (8, 3));
+    assert_eq!(c2.get(&k2).await.unwrap(), (8, 5));
+
+    c1.clear().await.unwrap();
+}
+
+#[tokio::test]
 async fn set_on_instance_if_compares_against_instance_slice() {
     let (c1, c2) = make_pair("strict_set_on_instance_if").await;
     let k = key("hits");

@@ -694,6 +694,72 @@ async fn inc_if_refreshes_stale_value_before_comparing() {
 }
 
 #[tokio::test]
+async fn inc_all_empty_and_inc_all_if_empty_return_empty() {
+    let counter = make_lax_counter("lax_inc_all_empty").await;
+    assert_eq!(counter.inc_all(&[]).await.unwrap(), vec![]);
+    assert_eq!(counter.inc_all_if(&[]).await.unwrap(), vec![]);
+}
+
+#[tokio::test]
+async fn inc_all_updates_local_view_immediately_and_supports_duplicates() {
+    let counter = make_lax_counter("lax_inc_all_duplicates").await;
+    let k = key("hits");
+
+    let results = counter.inc_all(&[(&k, 1), (&k, 2)]).await.unwrap();
+
+    assert_eq!(results, vec![(&k, 1), (&k, 3)]);
+    assert_eq!(counter.get(&k).await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn inc_all_if_refreshes_stale_values_and_processes_entries_sequentially() {
+    let prefix = "lax_inc_all_if_refresh";
+    let k = key("hits");
+
+    let writer = make_lax_counter(prefix).await;
+    writer.set(&k, 0).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let reader = make_lax_counter(prefix).await;
+    let results = reader
+        .inc_all_if(&[
+            (&k, CounterComparator::Eq(0), 1),
+            (&k, CounterComparator::Eq(1), 2),
+            (&k, CounterComparator::Gt(10), 5),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(results, vec![(&k, 1), (&k, 3), (&k, 3)]);
+    assert_eq!(reader.get(&k).await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn inc_all_if_is_eventually_flushed_for_successful_updates() {
+    let prefix = "lax_inc_all_if_flush";
+    let k1 = key("a");
+    let k2 = key("b");
+
+    let counter = make_lax_counter(prefix).await;
+    let results = counter
+        .inc_all_if(&[
+            (&k1, CounterComparator::Nil, 4),
+            (&k2, CounterComparator::Gt(0), 7),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(results, vec![(&k1, 4), (&k2, 0)]);
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let reader = make_lax_counter(prefix).await;
+    assert_eq!(
+        reader.get_all(&[&k1, &k2]).await.unwrap(),
+        vec![(&k1, 4), (&k2, 0)]
+    );
+}
+
+#[tokio::test]
 async fn set_all_if_returns_current_values_for_failed_conditions() {
     let counter = make_lax_counter("lax_set_all_if_failed").await;
     let k = key("hits");

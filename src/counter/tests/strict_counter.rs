@@ -332,6 +332,48 @@ async fn inc_if_uses_all_comparators() {
 }
 
 #[tokio::test]
+async fn inc_all_empty_and_inc_all_if_empty_return_empty() {
+    let counter = make_strict_counter("test_inc_all_empty").await;
+    assert_eq!(counter.inc_all(&[]).await.unwrap(), vec![]);
+    assert_eq!(counter.inc_all_if(&[]).await.unwrap(), vec![]);
+}
+
+#[tokio::test]
+async fn inc_all_supports_duplicate_keys_sequentially() {
+    let counter = make_strict_counter("test_inc_all_duplicates").await;
+    let k = key("hits");
+
+    let results = counter.inc_all(&[(&k, 1), (&k, 2)]).await.unwrap();
+
+    assert_eq!(results, vec![(&k, 1), (&k, 3)]);
+    assert_eq!(counter.get(&k).await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn inc_all_if_supports_partial_success_missing_keys_and_duplicates() {
+    let counter = make_strict_counter("test_inc_all_if_ordered").await;
+    let k1 = key("a");
+    let k2 = key("b");
+
+    counter.set(&k1, 0).await.unwrap();
+    counter.set(&k2, 10).await.unwrap();
+
+    let results = counter
+        .inc_all_if(&[
+            (&k1, CounterComparator::Eq(0), 1),
+            (&k1, CounterComparator::Eq(1), 2),
+            (&k2, CounterComparator::Gt(20), 5),
+            (&k2, CounterComparator::Nil, 3),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(results, vec![(&k1, 1), (&k1, 3), (&k2, 10), (&k2, 13)]);
+    assert_eq!(counter.get(&k1).await.unwrap(), 3);
+    assert_eq!(counter.get(&k2).await.unwrap(), 13);
+}
+
+#[tokio::test]
 async fn set_if_uses_all_comparators() {
     let cases = [
         ("eq", CounterComparator::Eq(10), true),

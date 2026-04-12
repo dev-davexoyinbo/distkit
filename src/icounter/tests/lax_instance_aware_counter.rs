@@ -676,6 +676,67 @@ async fn set_if_success_is_visible_to_other_instances_immediately() {
 }
 
 #[tokio::test]
+async fn inc_all_empty_and_inc_all_if_empty_return_empty() {
+    let c = make_lax("lax_inc_all_empty").await;
+    assert_eq!(c.inc_all(&[]).await.unwrap(), vec![]);
+    assert_eq!(c.inc_all_if(&[]).await.unwrap(), vec![]);
+}
+
+#[tokio::test]
+async fn inc_all_updates_local_view_immediately_and_supports_duplicates() {
+    let c = make_lax("lax_inc_all_duplicates").await;
+    let k = key("hits");
+
+    let results = c.inc_all(&[(&k, 1), (&k, 2)]).await.unwrap();
+
+    assert_eq!(results, vec![(&k, 1, 1), (&k, 3, 3)]);
+    assert_eq!(c.get(&k).await.unwrap(), (3, 3));
+}
+
+#[tokio::test]
+async fn inc_all_if_uses_stale_aware_local_cumulative_and_is_sequential() {
+    let (c1, c2, _) = make_lax_pair("lax_inc_all_if_ordered").await;
+    let k = key("hits");
+
+    c2.inc(&k, 5).await.unwrap();
+    sleep(Duration::from_millis(FLUSH_MS * 5)).await;
+
+    let results = c1
+        .inc_all_if(&[
+            (&k, CounterComparator::Eq(5), 1),
+            (&k, CounterComparator::Eq(6), 2),
+            (&k, CounterComparator::Gt(20), 4),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(results, vec![(&k, 6, 1), (&k, 8, 3), (&k, 8, 3)]);
+    assert_eq!(c1.get(&k).await.unwrap(), (8, 3));
+}
+
+#[tokio::test]
+async fn inc_all_if_successes_are_eventually_visible_after_flush() {
+    let (c1, c2, _) = make_lax_pair("lax_inc_all_if_flush").await;
+    let k1 = key("a");
+    let k2 = key("b");
+
+    let results = c1
+        .inc_all_if(&[
+            (&k1, CounterComparator::Nil, 4),
+            (&k2, CounterComparator::Gt(0), 7),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(results, vec![(&k1, 4, 4), (&k2, 0, 0)]);
+
+    sleep(Duration::from_millis(FLUSH_MS * 5)).await;
+
+    assert_eq!(c2.get(&k1).await.unwrap().0, 4);
+    assert_eq!(c2.get(&k2).await.unwrap().0, 0);
+}
+
+#[tokio::test]
 async fn set_all_if_supports_partial_success() {
     let (c1, c2, _) = make_lax_pair("lax_set_all_if_partial").await;
     let k1 = key("a");
