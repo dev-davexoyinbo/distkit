@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use tokio::time::sleep;
 
+use crate::CounterComparator;
 use crate::icounter::{
     InstanceAwareCounterTrait, LaxInstanceAwareCounter, LaxInstanceAwareCounterOptions,
 };
@@ -448,7 +449,10 @@ async fn get_all_unknown_keys_return_zero_zero() {
     let c = make_lax("get_all_unknown").await;
     let k1 = key("a");
     let k2 = key("b");
-    assert_eq!(c.get_all(&[&k1, &k2]).await.unwrap(), vec![(&k1, 0, 0), (&k2, 0, 0)]);
+    assert_eq!(
+        c.get_all(&[&k1, &k2]).await.unwrap(),
+        vec![(&k1, 0, 0), (&k2, 0, 0)]
+    );
 }
 
 #[tokio::test]
@@ -506,7 +510,10 @@ async fn get_all_on_instance_unknown_keys_return_zero() {
     let k1 = key("a");
     let k2 = key("b");
     // No Redis call — purely local; missing keys are 0.
-    assert_eq!(c.get_all_on_instance(&[&k1, &k2]).await.unwrap(), vec![(&k1, 0), (&k2, 0)]);
+    assert_eq!(
+        c.get_all_on_instance(&[&k1, &k2]).await.unwrap(),
+        vec![(&k1, 0), (&k2, 0)]
+    );
 }
 
 #[tokio::test]
@@ -631,4 +638,77 @@ async fn set_all_flushes_pending_delta_first() {
     // c2 must see 20, not 20+5.
     let (cum, _) = c2.get(&k).await.unwrap();
     assert_eq!(cum, 20);
+}
+
+#[tokio::test]
+async fn inc_if_uses_all_comparators_against_local_view() {
+    let cases = [
+        ("eq", CounterComparator::Eq(10), true),
+        ("lt", CounterComparator::Lt(11), true),
+        ("gt", CounterComparator::Gt(10), false),
+        ("ne", CounterComparator::Ne(9), true),
+        ("nil", CounterComparator::Nil, true),
+    ];
+
+    for (suffix, comparator, should_apply) in cases {
+        let c = make_lax(&format!("lax_inc_if_{suffix}")).await;
+        let k = key("hits");
+        c.set(&k, 10).await.unwrap();
+
+        let (cum, inst) = c.inc_if(&k, comparator, 2).await.unwrap();
+        let expected = if should_apply { (12, 12) } else { (10, 10) };
+
+        assert_eq!((cum, inst), expected);
+        assert_eq!(c.get(&k).await.unwrap(), expected);
+    }
+}
+
+#[tokio::test]
+async fn set_if_success_is_visible_to_other_instances_immediately() {
+    let (c1, c2, _) = make_lax_pair("lax_set_if_visible").await;
+    let k = key("hits");
+
+    c1.inc(&k, 5).await.unwrap();
+    let result = c1.set_if(&k, CounterComparator::Eq(5), 20).await.unwrap();
+
+    assert_eq!(result, (20, 20));
+    assert_eq!(c2.get(&k).await.unwrap().0, 20);
+}
+
+#[tokio::test]
+async fn set_all_if_supports_partial_success() {
+    let (c1, c2, _) = make_lax_pair("lax_set_all_if_partial").await;
+    let k1 = key("a");
+    let k2 = key("b");
+
+    c1.set_all(&[(&k1, 10), (&k2, 20)]).await.unwrap();
+
+    let results = c1
+        .set_all_if(&[
+            (&k1, CounterComparator::Nil, 11),
+            (&k2, CounterComparator::Lt(10), 99),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(results, vec![(&k1, 11, 11), (&k2, 20, 20)]);
+    assert_eq!(c2.get(&k1).await.unwrap().0, 11);
+    assert_eq!(c2.get(&k2).await.unwrap().0, 20);
+}
+
+#[tokio::test]
+async fn set_all_on_instance_if_refreshes_stale_state_before_comparing() {
+    let (c1, c2, _) = make_lax_pair("lax_set_all_on_instance_if_refresh").await;
+    let k = key("hits");
+
+    c2.inc(&k, 5).await.unwrap();
+    sleep(Duration::from_millis(FLUSH_MS * 5)).await;
+
+    let results = c1
+        .set_all_on_instance_if(&[(&k, CounterComparator::Eq(0), 3)])
+        .await
+        .unwrap();
+
+    assert_eq!(results, vec![(&k, 8, 3)]);
+    assert_eq!(c1.get(&k).await.unwrap(), (8, 3));
 }
