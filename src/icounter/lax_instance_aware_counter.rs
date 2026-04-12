@@ -366,6 +366,16 @@ impl LaxInstanceAwareCounter {
             return Ok(());
         }
 
+        let locks: Vec<_> = keys
+            .iter()
+            .map(|k| self.get_or_create_reset_lock(k))
+            .collect();
+        let mut guards = Vec::with_capacity(locks.len());
+
+        for l in &locks {
+            guards.push(l.lock().await);
+        }
+
         let keys: Vec<&RedisKey> = keys
             .iter()
             .filter(|key| {
@@ -794,4 +804,54 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
             })
             .collect()
     } // end function get_all
+
+    async fn get_all_on_instance<'k>(
+        &self,
+        keys: &[&'k RedisKey],
+    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
+        self.batch_refresh_stale(keys).await?;
+
+        Ok(keys
+            .iter()
+            .map(|key| {
+                let val = self
+                    .local_store
+                    .get(*key)
+                    .map(|s| {
+                        s.instance_count.load(Ordering::Acquire) + s.delta.load(Ordering::Acquire)
+                    })
+                    .unwrap_or(0);
+                (*key, val)
+            })
+            .collect())
+    } // end function get_all_on_instance
+
+    async fn set_all_on_instance<'k>(
+        &self,
+        updates: &[(&'k RedisKey, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        if updates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        self.activity.signal();
+
+        let keys: Vec<&RedisKey> = updates.iter().map(|(key, _)| *key).collect();
+
+        self.batch_refresh_stale(&keys).await?;
+
+        updates
+            .iter()
+            .map(|(key, count)| {
+                let store = self
+                    .local_store
+                    .get(*key)
+                    .expect("store populated after refresh");
+                let instance_count = store.instance_count.load(Ordering::Acquire);
+                store.delta.store(count - instance_count, Ordering::Release);
+                let cumulative = store.cumulative.load(Ordering::Acquire);
+                Ok((*key, cumulative - instance_count + count, *count))
+            })
+            .collect()
+    } // end function set_all_on_instance
 }
