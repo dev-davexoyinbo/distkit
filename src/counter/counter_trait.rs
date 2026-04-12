@@ -216,6 +216,68 @@ pub trait CounterTrait {
         keys: &[&'k RedisKey],
     ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError>;
 
+    /// Increments each `(key, delta)` pair and returns `(key, new_total)` in
+    /// the same order.
+    ///
+    /// Duplicate keys are processed sequentially in input order, so later
+    /// entries observe earlier same-call updates.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::strict_counter().await?;
+    /// let k1 = RedisKey::try_from("a".to_string())?;
+    /// let k2 = RedisKey::try_from("b".to_string())?;
+    ///
+    /// let results = counter.inc_all(&[(&k1, 3), (&k2, 5)]).await?;
+    ///
+    /// assert_eq!(results, vec![(&k1, 3), (&k2, 5)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn inc_all<'k>(
+        &self,
+        updates: &[(&'k RedisKey, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError>;
+
+    /// Conditionally increments each `(key, delta)` pair when the current
+    /// value satisfies the corresponding comparator.
+    ///
+    /// Each tuple is `(key, comparator, delta)`. Evaluation is per-item,
+    /// results preserve input order, and duplicate keys are processed
+    /// sequentially in input order. Use [`CounterComparator::Nil`] for
+    /// unconditional entries in a mixed batch.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{CounterComparator, RedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::strict_counter().await?;
+    /// let k1 = RedisKey::try_from("a".to_string())?;
+    /// let k2 = RedisKey::try_from("b".to_string())?;
+    /// counter.set(&k1, 10).await?;
+    ///
+    /// let results = counter
+    ///     .inc_all_if(&[
+    ///         (&k1, CounterComparator::Eq(10), 5),
+    ///         (&k2, CounterComparator::Nil, 2),
+    ///     ])
+    ///     .await?;
+    ///
+    /// assert_eq!(results, vec![(&k1, 15), (&k2, 2)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn inc_all_if<'k>(
+        &self,
+        updates: &[(&'k RedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError>;
+
     /// Sets each `(key, count)` pair and returns `(key, count)` in the same
     /// order. Semantics match `set` for each individual key.
     async fn set_all<'k>(
