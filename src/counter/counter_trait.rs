@@ -30,7 +30,7 @@ pub trait CounterTrait {
     async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError>;
 
     /// Conditionally increments the counter by `count` when the current value
-    /// satisfies `comparator` against `compare_against`.
+    /// satisfies `comparator`.
     ///
     /// Returns the updated total on success, or the current total unchanged
     /// when the condition fails.
@@ -46,12 +46,16 @@ pub trait CounterTrait {
     /// counter.set(&key, 10).await?;
     ///
     /// assert_eq!(
-    ///     counter.inc_if(&key, CounterComparator::Eq, 10, 5).await?,
+    ///     counter.inc_if(&key, CounterComparator::Eq(10), 5).await?,
     ///     15
     /// );
     /// assert_eq!(
-    ///     counter.inc_if(&key, CounterComparator::Lt, 10, 5).await?,
+    ///     counter.inc_if(&key, CounterComparator::Lt(10), 5).await?,
     ///     15
+    /// );
+    /// assert_eq!(
+    ///     counter.inc_if(&key, CounterComparator::Nil, 5).await?,
+    ///     20
     /// );
     /// # Ok(())
     /// # }
@@ -60,7 +64,6 @@ pub trait CounterTrait {
         &self,
         key: &RedisKey,
         comparator: CounterComparator,
-        compare_against: i64,
         count: i64,
     ) -> Result<i64, DistkitError>;
 
@@ -126,7 +129,7 @@ pub trait CounterTrait {
     async fn set(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError>;
 
     /// Conditionally sets the counter to `count` when the current value
-    /// satisfies `comparator` against `compare_against`.
+    /// satisfies `comparator`.
     ///
     /// Returns the value after evaluation: `count` when the write applied, or
     /// the current total unchanged when the condition failed.
@@ -142,12 +145,16 @@ pub trait CounterTrait {
     /// counter.set(&key, 10).await?;
     ///
     /// assert_eq!(
-    ///     counter.set_if(&key, CounterComparator::Gt, 5, 25).await?,
+    ///     counter.set_if(&key, CounterComparator::Gt(5), 25).await?,
     ///     25
     /// );
     /// assert_eq!(
-    ///     counter.set_if(&key, CounterComparator::Eq, 10, 50).await?,
+    ///     counter.set_if(&key, CounterComparator::Eq(10), 50).await?,
     ///     25
+    /// );
+    /// assert_eq!(
+    ///     counter.set_if(&key, CounterComparator::Nil, 40).await?,
+    ///     40
     /// );
     /// # Ok(())
     /// # }
@@ -156,7 +163,6 @@ pub trait CounterTrait {
         &self,
         key: &RedisKey,
         comparator: CounterComparator,
-        compare_against: i64,
         count: i64,
     ) -> Result<i64, DistkitError>;
 
@@ -218,10 +224,11 @@ pub trait CounterTrait {
     ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError>;
 
     /// Conditionally sets each `(key, count)` pair when the current value
-    /// satisfies the corresponding comparator against `compare_against`.
+    /// satisfies the corresponding comparator.
     ///
-    /// Each tuple is `(key, comparator, compare_against, count)`. Evaluation is
-    /// per-item and results preserve input order.
+    /// Each tuple is `(key, comparator, count)`. Evaluation is per-item and
+    /// results preserve input order. Use [`CounterComparator::Nil`] for
+    /// unconditional entries in a mixed batch.
     ///
     /// # Examples
     ///
@@ -236,8 +243,8 @@ pub trait CounterTrait {
     ///
     /// let results = counter
     ///     .set_all_if(&[
-    ///         (&k1, CounterComparator::Eq, 10, 15),
-    ///         (&k2, CounterComparator::Eq, 0, 20),
+    ///         (&k1, CounterComparator::Eq(10), 15),
+    ///         (&k2, CounterComparator::Nil, 20),
     ///     ])
     ///     .await?;
     ///
@@ -247,6 +254,6 @@ pub trait CounterTrait {
     /// ```
     async fn set_all_if<'k>(
         &self,
-        updates: &[(&'k RedisKey, CounterComparator, i64, i64)],
+        updates: &[(&'k RedisKey, CounterComparator, i64)],
     ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError>;
 }
