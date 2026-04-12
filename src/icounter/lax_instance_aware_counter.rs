@@ -125,6 +125,7 @@ pub struct LaxInstanceAwareCounter {
     flush_interval: Duration,
     allowed_lag: Duration,
     reset_locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>>,
+    pending_flushed: tokio::sync::Mutex<Vec<(RedisKey, i64)>>,
 }
 
 impl LaxInstanceAwareCounter {
@@ -175,6 +176,7 @@ impl LaxInstanceAwareCounter {
             flush_interval,
             allowed_lag,
             reset_locks: DashMap::default(),
+            pending_flushed: tokio::sync::Mutex::new(Vec::new()),
         });
 
         counter.run_flush_task();
@@ -194,8 +196,6 @@ impl LaxInstanceAwareCounter {
             let mut interval = tokio::time::interval(flush_interval);
             interval.tick().await; // skip first immediate tick
 
-            let mut pending: Vec<(RedisKey, i64)> = Vec::new();
-
             loop {
                 let is_active = {
                     let Some(counter) = weak.upgrade() else { break };
@@ -209,29 +209,32 @@ impl LaxInstanceAwareCounter {
                 interval.tick().await;
 
                 let Some(counter) = weak.upgrade() else { break };
-
-                // Collect newly stale deltas (delta already swapped to 0 in local_store).
-                pending.extend(counter.collect_stale_mark_flushed());
-
-                if pending.is_empty() {
-                    continue;
-                }
-
-                let results = match counter.strict.inc_batch(&mut pending, MAX_BATCH_SIZE).await {
-                    Ok(results) => results,
-                    Err(err) => {
-                        tracing::error!("lax_icounter:flush_task: inc_batch failed: {err}");
-                        continue;
-                    }
-                };
-
-                for (key_str, cumulative, instance_count) in results {
-                    if let Ok(key) = RedisKey::try_from(key_str) {
-                        counter.update_local(&key, cumulative, instance_count);
-                    }
+                if let Err(err) = counter.flush().await {
+                    tracing::error!("lax_icounter:flush_task: flush failed: {err}");
                 }
             }
         });
+    }
+
+    async fn flush(&self) -> Result<(), DistkitError> {
+        let mut pending = self.pending_flushed.lock().await;
+
+        // Collect newly stale deltas (delta already swapped to 0 in local_store).
+        pending.extend(self.collect_stale_mark_flushed());
+
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let results = self.strict.inc_batch(&mut pending, MAX_BATCH_SIZE).await?;
+
+        for (key_str, cumulative, instance_count) in results {
+            if let Ok(key) = RedisKey::try_from(key_str) {
+                self.update_local(&key, cumulative, instance_count);
+            }
+        }
+
+        Ok(())
     }
 
     /// Acquire (or create) the per-key reset lock and return an `Arc` to it.
@@ -390,6 +393,10 @@ impl LaxInstanceAwareCounter {
             })
             .copied()
             .collect();
+
+        if keys.is_empty() {
+            return Ok(());
+        }
 
         let results = self.strict.get_batch(&keys).await?;
 
@@ -825,6 +832,38 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
             })
             .collect())
     } // end function get_all_on_instance
+
+    async fn set_all<'k>(
+        &self,
+        updates: &[(&'k RedisKey, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        if updates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        self.activity.signal();
+
+        let keys: Vec<&RedisKey> = updates.iter().map(|(k, _)| *k).collect();
+
+        let locks: Vec<_> = keys
+            .iter()
+            .map(|k| self.get_or_create_reset_lock(k))
+            .collect();
+        let mut guards = Vec::with_capacity(locks.len());
+
+        for l in &locks {
+            guards.push(l.lock().await);
+        }
+
+        self.flush().await?;
+
+        let batch = self.strict.set_batch(updates).await?;
+        for (key, cumulative, instance_count) in &batch {
+            self.update_local(key, *cumulative, *instance_count);
+        }
+
+        Ok(batch)
+    } // end function set_all
 
     async fn set_all_on_instance<'k>(
         &self,
