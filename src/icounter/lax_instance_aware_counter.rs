@@ -358,6 +358,37 @@ impl LaxInstanceAwareCounter {
 
         Ok(())
     }
+
+    /// Fetches stale/missing keys from the strict counter in a single batched
+    /// round-trip, then updates `local_store` for each key.
+    async fn batch_refresh_stale(&self, keys: &[&RedisKey]) -> Result<(), DistkitError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let keys: Vec<&RedisKey> = keys
+            .iter()
+            .filter(|key| {
+                self.local_store
+                    .get(*key)
+                    .and_then(|s| {
+                        mutex_lock(&s.last_flush, "lax_icounter:last_flush")
+                            .ok()
+                            .map(|g| g.elapsed() >= self.allowed_lag)
+                    })
+                    .unwrap_or(true)
+            })
+            .copied()
+            .collect();
+
+        let results = self.strict.get_batch(&keys).await?;
+
+        for (key, cumulative, instance_count) in results {
+            self.update_local(key, cumulative, instance_count);
+        }
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
