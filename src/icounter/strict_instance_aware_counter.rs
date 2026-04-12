@@ -161,7 +161,7 @@ redis.call('HSET', cumulative_key, counter_key, count)
 redis.call('HSET', inst_count_key, counter_key, count)
 redis.call('SADD', keys_key,       counter_key)
 
-return {count, count, new_epoch, instance_created}
+return {counter_key, count, count, new_epoch, instance_created}
 "#;
 
 const SET_ON_INSTANCE_LUA: &str = r#"
@@ -193,7 +193,7 @@ redis.call('HSET', inst_count_key, counter_key, count)
 local new_cumulative = tonumber(redis.call('HINCRBY', cumulative_key, counter_key, delta))
 redis.call('SADD', keys_key, counter_key)
 
-return {new_cumulative, count, redis_epoch, instance_created}
+return {counter_key, new_cumulative, count, redis_epoch, instance_created}
 "#;
 
 const GET_LUA: &str = r#"
@@ -859,6 +859,122 @@ impl StrictInstanceAwareCounter {
             .collect())
     }
 
+    pub(crate) async fn set_batch<'k>(
+        &self,
+        updates: &[(&'k RedisKey, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        if updates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        self.activity.signal();
+
+        let mut conn = self.connection_manager.clone();
+        let mut map: HashMap<RedisKey, (i64, i64)> = HashMap::with_capacity(updates.len());
+        let mut processed = 0;
+
+        while processed < updates.len() {
+            let end = (processed + MAX_BATCH_SIZE).min(updates.len());
+            let chunk = &updates[processed..end];
+            let script = &self.set_script;
+
+            let chunk_results: Vec<(String, i64, i64, u64, i64)> =
+                execute_pipeline_with_script_retry(&mut conn, script, chunk, |(key, count)| {
+                    let mut inv = script.key(self.epoch_key());
+                    inv.key(self.instances_key());
+                    inv.key(self.cumulative_key());
+                    inv.key(self.keys_key());
+                    inv.key(self.inst_count_key());
+                    inv.arg(key.as_str());
+                    inv.arg(*count);
+                    inv.arg(self.get_local_epoch(key));
+                    inv.arg(self.dead_instance_threshold_ms);
+                    inv.arg(self.prefix_str());
+                    inv.arg(&self.instance_id);
+                    inv.arg(self.max_epoch);
+                    inv
+                })
+                .await?;
+
+            for (key, cumulative, inst_count, redis_epoch, _) in chunk_results {
+                let Ok(key) = RedisKey::try_from(key.clone()) else {
+                    continue;
+                };
+
+                self.update_local_store(&key, redis_epoch, cumulative, inst_count);
+
+                map.insert(key, (cumulative, inst_count));
+            }
+
+            processed = end;
+        }
+
+        Ok(updates
+            .iter()
+            .map(|(k, _)| {
+                let (cum, inst) = map.get(k).copied().unwrap_or((0, 0));
+
+                (*k, cum, inst)
+            })
+            .collect())
+    }
+
+    async fn set_on_instance_batch<'k>(
+        &self,
+        updates: &[(&'k RedisKey, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        if updates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        self.activity.signal();
+
+        let mut conn = self.connection_manager.clone();
+        let mut map: HashMap<RedisKey, (i64, i64)> = HashMap::with_capacity(updates.len());
+        let mut processed = 0;
+
+        while processed < updates.len() {
+            let end = (processed + MAX_BATCH_SIZE).min(updates.len());
+            let chunk = &updates[processed..end];
+            let script = &self.set_on_instance_script;
+
+            let chunk_results: Vec<(String, i64, i64, u64, i64)> =
+                execute_pipeline_with_script_retry(&mut conn, script, chunk, |(key, count)| {
+                    let mut inv = script.key(self.epoch_key());
+                    inv.key(self.instances_key());
+                    inv.key(self.cumulative_key());
+                    inv.key(self.keys_key());
+                    inv.key(self.inst_count_key());
+                    inv.arg(key.as_str());
+                    inv.arg(*count);
+                    inv.arg(self.get_local_epoch(key));
+                    inv.arg(self.dead_instance_threshold_ms);
+                    inv.arg(self.prefix_str());
+                    inv.arg(&self.instance_id);
+                    inv
+                })
+                .await?;
+
+            for (key, cumulative, inst_count, redis_epoch, _) in chunk_results {
+                let Ok(key) = RedisKey::try_from(key.clone()) else {
+                    continue;
+                };
+
+                self.update_local_store(&key, redis_epoch, cumulative, inst_count);
+                map.insert(key, (cumulative, inst_count));
+            }
+            processed = end;
+        }
+
+        Ok(updates
+            .iter()
+            .map(|(k, _)| {
+                let (cum, inst) = map.get(k).copied().unwrap_or((0, 0));
+                (*k, cum, inst)
+            })
+            .collect())
+    }
+
     #[cfg(test)]
     pub(crate) async fn trigger_mark_alive(&self) -> Result<(), DistkitError> {
         self.mark_alive().await
@@ -1016,7 +1132,7 @@ impl StrictInstanceAwareCounter {
         let mut conn = self.connection_manager.clone();
         let local_epoch = self.get_local_epoch(key);
 
-        let (cumulative, inst_count, new_epoch_raw, _): (i64, i64, u64, i64) = self
+        let (_, cumulative, inst_count, new_epoch_raw, _): (String, i64, i64, u64, i64) = self
             .set_script
             .key(self.epoch_key())
             .key(self.instances_key())
@@ -1071,7 +1187,7 @@ impl StrictInstanceAwareCounter {
         let mut conn = self.connection_manager.clone();
         let local_epoch = self.get_local_epoch(key);
 
-        let (cumulative, inst_count, redis_epoch_raw, _): (i64, i64, u64, i64) = self
+        let (_, cumulative, inst_count, redis_epoch_raw, _): (String, i64, i64, u64, i64) = self
             .set_on_instance_script
             .key(self.epoch_key())
             .key(self.instances_key())
@@ -1383,5 +1499,19 @@ impl InstanceAwareCounterTrait for StrictInstanceAwareCounter {
     ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
         let pairs = self.get_batch(keys).await?;
         Ok(pairs.into_iter().map(|(k, _, inst)| (k, inst)).collect())
+    }
+
+    async fn set_all<'k>(
+        &self,
+        updates: &[(&'k RedisKey, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        self.set_batch(updates).await
+    }
+
+    async fn set_all_on_instance<'k>(
+        &self,
+        updates: &[(&'k RedisKey, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        self.set_on_instance_batch(updates).await
     }
 }
