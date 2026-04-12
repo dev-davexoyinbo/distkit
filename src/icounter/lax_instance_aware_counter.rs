@@ -766,4 +766,32 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         self.local_store.clear();
         Ok(())
     }
+
+    async fn get_all<'k>(
+        &self,
+        keys: &[&'k RedisKey],
+    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        self.activity.signal();
+
+        self.batch_refresh_stale(keys).await?;
+
+        keys.iter()
+            .map(|key| {
+                let store = self
+                    .local_store
+                    .get(*key)
+                    .expect("store populated after refresh");
+                let delta = store.delta.load(Ordering::Acquire);
+                Ok((
+                    *key,
+                    store.cumulative.load(Ordering::Acquire) + delta,
+                    store.instance_count.load(Ordering::Acquire) + delta,
+                ))
+            })
+            .collect()
+    } // end function get_all
 }
