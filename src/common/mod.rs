@@ -4,12 +4,50 @@ use std::{
     time::Duration,
 };
 
+use redis::aio::ConnectionManager;
+
 mod activity_tracker;
 pub(crate) use activity_tracker::*;
 
 pub(crate) const EPOCH_CHANGE_INTERVAL: Duration = Duration::from_secs(15);
 
 use crate::DistkitError;
+
+pub(crate) async fn execute_pipeline_with_script_retry<'s, T, I, F>(
+    conn: &mut ConnectionManager,
+    script: &'s redis::Script,
+    items: &[I],
+    build_invocation: F,
+) -> Result<T, DistkitError>
+where
+    T: redis::FromRedisValue,
+    F: Fn(&I) -> redis::ScriptInvocation<'s>,
+{
+    let mut pipe = redis::Pipeline::new();
+
+    for item in items {
+        pipe.invoke_script(&build_invocation(item));
+    }
+
+    match pipe.query_async::<T>(conn).await {
+        Ok(r) => Ok(r),
+        Err(err) if err.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) => {
+            let mut retry_pipe = redis::Pipeline::new();
+
+            retry_pipe.load_script(script).ignore();
+
+            for item in items {
+                retry_pipe.invoke_script(&build_invocation(item));
+            }
+
+            retry_pipe
+                .query_async::<T>(conn)
+                .await
+                .map_err(DistkitError::RedisError)
+        }
+        Err(err) => Err(DistkitError::RedisError(err)),
+    }
+}
 
 /// A validated Redis key.
 ///
