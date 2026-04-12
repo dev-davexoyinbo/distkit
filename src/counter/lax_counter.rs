@@ -19,6 +19,8 @@ use crate::{
     execute_pipeline_with_script_retry, mutex_lock,
 };
 
+const MAX_BATCH_SIZE: usize = 100;
+
 const GET_LUA: &str = r#"
     local container_key = KEYS[1]
     local key = KEYS[2]
@@ -219,7 +221,7 @@ impl LaxCounter {
                         });
                     }
 
-                    if let Err(err) = counter.flush_to_redis(&mut batch, 100).await {
+                    if let Err(err) = counter.flush_to_redis(&mut batch, MAX_BATCH_SIZE).await {
                         tracing::error!("Failed to flush to redis: {err:?}");
                         continue;
                     }
@@ -353,7 +355,7 @@ impl LaxCounter {
         // To be honest, still contemplating whether to flush to redis here.
         // I'd just flush for now to be safe
         let mut batch = self.batch.lock().await;
-        self.flush_to_redis(&mut batch, 100).await?;
+        self.flush_to_redis(&mut batch, MAX_BATCH_SIZE).await?;
 
         let mut conn = self.connection_manager.clone();
         let script = &self.get_script;
