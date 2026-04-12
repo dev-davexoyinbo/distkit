@@ -1369,4 +1369,19 @@ impl InstanceAwareCounterTrait for StrictInstanceAwareCounter {
     async fn clear_on_instance(&self) -> Result<(), DistkitError> {
         self.clear_on_instance().await
     }
+
+    async fn get_all<'k>(
+        &self,
+        keys: &[&'k RedisKey],
+    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        self.get_batch(keys).await
+    }
+
+    async fn get_all_on_instance<'k>(
+        &self,
+        keys: &[&'k RedisKey],
+    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
+        let pairs = self.get_batch(keys).await?;
+        Ok(pairs.into_iter().map(|(k, _, inst)| (k, inst)).collect())
+    }
 }
