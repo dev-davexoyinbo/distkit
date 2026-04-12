@@ -319,12 +319,15 @@ async fn clear_on_instance_flushes_pending_delta() {
 }
 
 // ---------------------------------------------------------------------------
-// Stale-cumulative divergence (eventual-consistency property)
+// Stale-cumulative divergence — both instances must see the same cumulative
 // ---------------------------------------------------------------------------
 
-/// Two instances that flush at different times see different cumulative totals
-/// from their local `.get()`. Each instance's cached cumulative is only
-/// refreshed when *it* flushes — not when a peer flushes.
+/// After both instances have fully flushed, every subsequent get() must return
+/// the ground-truth cumulative (3). Only the instance counts differ (1 vs 2).
+///
+/// The early flusher (c1) is stuck with a stale cumulative until get() triggers
+/// a re-fetch from strict — this test will FAIL until that re-fetch is
+/// implemented in get().
 ///
 /// Timeline:
 ///   1. c1.inc(k, 1)  — c1 seeds from strict (0,0); delta=1
@@ -332,7 +335,7 @@ async fn clear_on_instance_flushes_pending_delta() {
 ///   3. c2.inc(k, 1)  — c2 seeds from strict (cum=1, inst_c2=0); delta=1
 ///   4. c2.inc(k, 1)  — delta=2
 ///   5. c2 flushes    — strict: c1=1, c2=2, cum=3; c2.local: cum=3, inst=2, δ=0
-///   6. c1.get()  → (1, 1) — stale; c1 was never told about c2's flush
+///   6. c1.get()  → (3, 1) — re-fetched: cache is 100 ms old, allowed_lag=10 ms
 ///   7. c2.get()  → (3, 2) — fresh from c2's own flush
 ///   8. fresh.get() → (3, 0) — ground truth from strict
 #[tokio::test]
@@ -353,23 +356,73 @@ async fn instances_see_different_cumulatives_after_sequential_flushes() {
 
     // Step 5: Wait for c2's background flush to commit to strict.
     // After this: strict has c1=1, c2=2, cum=3; c2.local: cum=3, inst=2, δ=0.
+    // c1 is now idle (δ=0); its cache is ~100 ms old — well past allowed_lag (10 ms).
     sleep(Duration::from_millis(FLUSH_MS * 5)).await;
 
-    // Step 6: c1 still has a stale cached cumulative (1) from its own earlier flush.
-    // It was never notified that c2 flushed.
+    // Step 6: c1's cache has expired (100 ms >> allowed_lag=10 ms).
+    // get() must re-fetch from strict and return the current ground-truth cumulative.
     let (c1_cum, c1_inst) = c1.get(&k).await.unwrap();
-    assert_eq!(c1_cum, 1, "c1 sees stale cumulative — only knew about itself when it flushed");
-    assert_eq!(c1_inst, 1);
+    assert_eq!(c1_cum, 3, "c1 must re-fetch from strict — cache is stale");
+    assert_eq!(c1_inst, 1, "c1's own instance slice is unchanged");
 
-    // Step 7: c2's cumulative is fresh from its own flush, which saw c1's prior contribution.
+    // Step 7: c2's cumulative is fresh from its own flush.
     let (c2_cum, c2_inst) = c2.get(&k).await.unwrap();
     assert_eq!(c2_cum, 3, "c2 sees fresh cumulative from its own flush");
     assert_eq!(c2_inst, 2);
 
-    // Step 8: A fresh reader has no local cache — it fetches directly from strict
-    // and sees the true ground-truth total.
+    // Step 8: A fresh reader has no local cache — always fetches directly from strict.
     let reader = make_lax_from_prefix(&prefix).await;
     let (reader_cum, reader_inst) = reader.get(&k).await.unwrap();
     assert_eq!(reader_cum, 3, "fresh reader sees ground-truth total");
     assert_eq!(reader_inst, 0, "fresh reader has no instance contribution");
+}
+
+/// Mirror of `instances_see_different_cumulatives_after_sequential_flushes`:
+/// c2 flushes first this time, so c2 ends up with the stale cache.
+///
+/// This test will FAIL until get() implements a staleness re-fetch.
+///
+/// Timeline:
+///   1. c2.inc(k, 1) × 2 — c2 seeds from strict (0,0); delta=2
+///   2. c2 flushes        — strict: c2=2, cum=2; c2.local: cum=2, inst=2, δ=0
+///   3. c1.inc(k, 1)      — c1 seeds from strict (cum=2, inst_c1=0); delta=1
+///   4. c1 flushes        — strict: c1=1, c2=2, cum=3; c1.local: cum=3, inst=1, δ=0
+///                           c2 is idle (δ=0), cache frozen at cum=2
+///   5. c2.get()  → (3, 2) — must re-fetch; cache is ~100 ms old
+///   6. c1.get()  → (3, 1) — fresh from c1's own flush
+///   7. fresh.get() → (3, 0)
+#[tokio::test]
+async fn early_flusher_sees_stale_cumulative_from_reversed_flush_order() {
+    let (c1, c2, prefix) = make_lax_pair("stale_cumulative_reversed").await;
+    let k = key("hits");
+
+    // Steps 1 & 2: c2 increments twice and flushes first.
+    c2.inc(&k, 1).await.unwrap();
+    c2.inc(&k, 1).await.unwrap();
+    sleep(Duration::from_millis(FLUSH_MS * 5)).await;
+    // strict: c2=2, cum=2; c2.local: cum=2, inst=2, δ=0
+
+    // Step 3: c1 increments after c2 has already flushed, seeding from strict (cum=2).
+    c1.inc(&k, 1).await.unwrap();
+
+    // Step 4: c1 flushes. strict: c1=1, c2=2, cum=3; c1.local: cum=3, inst=1.
+    // c2 is idle (δ=0) — the flush task skips it every tick.
+    sleep(Duration::from_millis(FLUSH_MS * 5)).await;
+
+    // Step 5: c2's cache is ~100 ms old (>>  allowed_lag=10 ms).
+    // get() must re-fetch from strict and return the current ground-truth cumulative.
+    let (c2_cum, c2_inst) = c2.get(&k).await.unwrap();
+    assert_eq!(c2_cum, 3, "c2 must re-fetch from strict — cache is stale");
+    assert_eq!(c2_inst, 2, "c2's own instance slice is unchanged");
+
+    // Step 6: c1's cumulative is fresh from its own flush.
+    let (c1_cum, c1_inst) = c1.get(&k).await.unwrap();
+    assert_eq!(c1_cum, 3, "c1 sees fresh cumulative from its own flush");
+    assert_eq!(c1_inst, 1);
+
+    // Step 7: Ground truth.
+    let reader = make_lax_from_prefix(&prefix).await;
+    let (reader_cum, reader_inst) = reader.get(&k).await.unwrap();
+    assert_eq!(reader_cum, 3, "fresh reader sees ground-truth total");
+    assert_eq!(reader_inst, 0);
 }
