@@ -13,8 +13,8 @@ use redis::{Script, aio::ConnectionManager};
 use tokio::time::Instant;
 
 use crate::{
-    ActivityTracker, DistkitError, EPOCH_CHANGE_INTERVAL, RedisKey, RedisKeyGenerator,
-    RedisKeyGeneratorTypeKey,
+    ActivityTracker, CounterComparator, DistkitError, EPOCH_CHANGE_INTERVAL, RedisKey,
+    RedisKeyGenerator, RedisKeyGeneratorTypeKey,
     counter::{CounterError, CounterOptions, CounterTrait},
     execute_pipeline_with_script_retry, mutex_lock,
 };
@@ -422,6 +422,15 @@ impl CounterTrait for LaxCounter {
     /// # }
     /// ```
     async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+        self.inc_if(key, CounterComparator::Nil, count).await
+    }
+
+    async fn inc_if(
+        &self,
+        key: &RedisKey,
+        comparator: CounterComparator,
+        count: i64,
+    ) -> Result<i64, DistkitError> {
         self.activity.signal();
 
         let store = match self.store.get(key) {
@@ -445,16 +454,22 @@ impl CounterTrait for LaxCounter {
             }
         };
 
+        let remote_total = store.remote_total.load(Ordering::Acquire);
+
+        let current = remote_total + store.delta.load(Ordering::Acquire);
+
+        if !comparator.matches(current) {
+            return Ok(current);
+        }
+
         let prev_delta = if count > 0 {
             store.delta.fetch_add(count, Ordering::AcqRel)
         } else {
             store.delta.fetch_sub(count.abs(), Ordering::AcqRel)
         };
 
-        let total = store.remote_total.load(Ordering::Acquire) + prev_delta + count;
-
-        Ok(total)
-    } // end function inc
+        Ok(remote_total + prev_delta + count)
+    }
 
     /// Buffers `-count` locally and returns the updated local estimate without
     /// a Redis round-trip. Equivalent to `inc(key, -count)`.
@@ -549,6 +564,15 @@ impl CounterTrait for LaxCounter {
     /// # }
     /// ```
     async fn set(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+        self.set_if(key, CounterComparator::Nil, count).await
+    }
+
+    async fn set_if(
+        &self,
+        key: &RedisKey,
+        comparator: CounterComparator,
+        count: i64,
+    ) -> Result<i64, DistkitError> {
         self.activity.signal();
         let store = match self.store.get(key) {
             Some(store)
@@ -571,12 +595,17 @@ impl CounterTrait for LaxCounter {
             }
         };
 
-        let total = store.remote_total.load(Ordering::Acquire);
+        let remote_total = store.remote_total.load(Ordering::Acquire);
+        let current = remote_total + store.delta.load(Ordering::Acquire);
 
-        store.delta.store(count - total, Ordering::Release);
+        if !comparator.matches(current) {
+            return Ok(current);
+        }
+
+        store.delta.store(count - remote_total, Ordering::Release);
 
         Ok(count)
-    } // end function set
+    }
 
     /// Cancels any pending local delta for `key`, then immediately deletes
     /// it from Redis. Returns the final value, including the cancelled delta.
@@ -698,24 +727,41 @@ impl CounterTrait for LaxCounter {
         &self,
         updates: &[(&'k RedisKey, i64)],
     ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&RedisKey, CounterComparator, i64)> = updates
+            .iter()
+            .map(|(key, count)| (*key, CounterComparator::Nil, *count))
+            .collect();
+
+        self.set_all_if(&conditional_updates).await
+    }
+
+    async fn set_all_if<'k>(
+        &self,
+        updates: &[(&'k RedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
         }
 
         self.activity.signal();
 
-        let keys: Vec<&RedisKey> = updates.iter().map(|(key, _)| *key).collect();
-
+        let keys: Vec<&RedisKey> = updates.iter().map(|(key, _, _)| *key).collect();
         self.batch_refresh_stale(&keys).await?;
 
         updates
             .iter()
-            .map(|(key, count)| {
+            .map(|(key, comparator, count)| {
                 let store = self.store.get(*key).expect("store populated after refresh");
                 let remote_total = store.remote_total.load(Ordering::Acquire);
-                store.delta.store(count - remote_total, Ordering::Release);
-                Ok((*key, *count))
+                let current = remote_total + store.delta.load(Ordering::Acquire);
+
+                if comparator.matches(current) {
+                    store.delta.store(count - remote_total, Ordering::Release);
+                    Ok((*key, *count))
+                } else {
+                    Ok((*key, current))
+                }
             })
             .collect()
-    } // end function set_all
+    }
 } // end impl CounterTrait for LaxCounter
