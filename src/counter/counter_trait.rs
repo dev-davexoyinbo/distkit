@@ -132,4 +132,12 @@ pub trait CounterTrait {
     /// # }
     /// ```
     async fn clear(&self) -> Result<(), DistkitError>;
+
+    /// Returns `(key, value)` for each key in `keys`, in the same order.
+    /// A missing key returns `(key, 0)`.
+    async fn get_all<'k>(&self, keys: &[&'k RedisKey]) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError>;
+
+    /// Sets each `(key, count)` pair and returns `(key, count)` in the same
+    /// order. Semantics match `set` for each individual key.
+    async fn set_all<'k>(&self, updates: &[(&'k RedisKey, i64)]) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError>;
 }

@@ -256,6 +256,28 @@ pub trait InstanceAwareCounterTrait {
     /// # }
     /// ```
     async fn clear_on_instance(&self) -> Result<(), DistkitError>;
+
+    /// Returns `(key, cumulative, instance_count)` for each key in `keys`, in
+    /// the same order. A missing key returns `(key, 0, 0)`.
+    async fn get_all<'k>(&self, keys: &[&'k RedisKey]) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError>;
+
+    /// Returns `(key, instance_count)` for each key in `keys`, in the same
+    /// order. Pure-local: no Redis round-trip, no staleness check. A key
+    /// with no local contribution returns `(key, 0)`.
+    async fn get_all_on_instance<'k>(&self, keys: &[&'k RedisKey]) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError>;
+
+    /// Sets each `(key, count)` pair globally, bumping the epoch. Semantics
+    /// match `set` for each individual key. Returns `(key, cumulative, instance_count)`
+    /// in the same order.
+    async fn set_all<'k>(&self, updates: &[(&'k RedisKey, i64)]) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError>;
+
+    /// Sets this instance's contribution for each `(key, count)` pair without
+    /// bumping the epoch. Other instances' slices are preserved. Returns
+    /// `(key, cumulative, instance_count)` in the same order.
+    async fn set_all_on_instance<'k>(
+        &self,
+        updates: &[(&'k RedisKey, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError>;
 }
 
 // ---------------------------------------------------------------------------
