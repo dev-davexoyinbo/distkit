@@ -1,10 +1,11 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
     DistkitError, RedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
     counter::{CounterOptions, CounterTrait},
+    execute_pipeline_with_script_retry,
 };
 
 const INC_LUA: &str = r#"
@@ -22,14 +23,14 @@ const SET_LUA: &str = r#"
 
     redis.call('HSET', container_key, key, count)
 
-    return count
+    return {key, count}
 "#;
 
 const GET_LUA: &str = r#"
     local container_key = KEYS[1]
     local key = KEYS[2]
 
-    return redis.call('HGET', container_key, key) or 0
+    return {key, tonumber(redis.call('HGET', container_key, key)) or 0}
 "#;
 
 const DEL_LUA: &str = r#"
@@ -117,7 +118,7 @@ impl CounterTrait for StrictCounter {
         let total: i64 = self
             .inc_script
             .key(self.key_generator.container_key())
-            .key(key.to_string())
+            .key(key.as_str())
             .arg(count)
             .invoke_async(&mut conn)
             .await?;
@@ -132,10 +133,10 @@ impl CounterTrait for StrictCounter {
     async fn get(&self, key: &RedisKey) -> Result<i64, DistkitError> {
         let mut conn = self.connection_manager.clone();
 
-        let total: i64 = self
+        let (_, total): (String, i64) = self
             .get_script
             .key(self.key_generator.container_key())
-            .key(key.to_string())
+            .key(key.as_str())
             .invoke_async(&mut conn)
             .await?;
 
@@ -145,10 +146,10 @@ impl CounterTrait for StrictCounter {
     async fn set(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
         let mut conn = self.connection_manager.clone();
 
-        let total: i64 = self
+        let (_, total): (String, i64) = self
             .set_script
             .key(self.key_generator.container_key())
-            .key(key.to_string())
+            .key(key.as_str())
             .arg(count)
             .invoke_async(&mut conn)
             .await?;
@@ -162,7 +163,7 @@ impl CounterTrait for StrictCounter {
         let total: i64 = self
             .del_script
             .key(self.key_generator.container_key())
-            .key(key.to_string())
+            .key(key.as_str())
             .invoke_async(&mut conn)
             .await?;
 
@@ -180,4 +181,59 @@ impl CounterTrait for StrictCounter {
 
         Ok(())
     } // end function clear
+
+    async fn get_all<'k>(
+        &self,
+        keys: &[&'k RedisKey],
+    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut conn = self.connection_manager.clone();
+        let script = &self.get_script;
+
+        let raw: Vec<(String, i64)> =
+            execute_pipeline_with_script_retry(&mut conn, script, keys, |key| {
+                let mut inv = script.key(self.key_generator.container_key());
+                inv.key(key.as_str());
+                inv
+            })
+            .await?;
+
+        let map: HashMap<String, i64> = raw.into_iter().collect();
+
+        Ok(keys
+            .iter()
+            .map(|k| (*k, map.get(k.as_str()).copied().unwrap_or(0)))
+            .collect())
+    } // end function get_all
+
+    async fn set_all<'k>(
+        &self,
+        updates: &[(&'k RedisKey, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
+        if updates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut conn = self.connection_manager.clone();
+        let script = &self.set_script;
+
+        let raw: Vec<(String, i64)> =
+            execute_pipeline_with_script_retry(&mut conn, script, updates, |(key, count)| {
+                let mut inv = script.key(self.key_generator.container_key());
+                inv.key(key.as_str());
+                inv.arg(*count);
+                inv
+            })
+            .await?;
+
+        let map: HashMap<String, i64> = raw.into_iter().collect();
+
+        Ok(updates
+            .iter()
+            .map(|(k, _)| (*k, map.get(k.as_str()).copied().unwrap_or(0)))
+            .collect())
+    } // end function set_all
 } // end impl CounterTrait for StrictCounter
