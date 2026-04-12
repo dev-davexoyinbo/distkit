@@ -260,7 +260,7 @@ impl LaxCounter {
         let script = &self.commit_state_script;
         execute_pipeline_with_script_retry::<(), _, _>(&mut conn, script, commits, |commit| {
             let mut inv = script.key(self.key_generator.container_key());
-            inv.key(commit.key.to_string());
+            inv.key(commit.key.as_str());
             inv.arg(commit.delta);
             inv
         })
@@ -287,7 +287,7 @@ impl LaxCounter {
         let (_, remote_total): (String, i64) = self
             .get_script
             .key(self.key_generator.container_key())
-            .key(key.to_string())
+            .key(key.as_str())
             .invoke_async(&mut conn)
             .await?;
 
@@ -361,7 +361,7 @@ impl LaxCounter {
         let raw: Vec<(String, i64)> =
             execute_pipeline_with_script_retry(&mut conn, script, &stale_keys, |key| {
                 let mut inv = script.key(self.key_generator.container_key());
-                inv.key(key.to_string());
+                inv.key(key.as_str());
                 inv
             })
             .await?;
@@ -618,7 +618,7 @@ impl CounterTrait for LaxCounter {
         let total: i64 = self
             .del_script
             .key(self.key_generator.container_key())
-            .key(key.to_string())
+            .key(key.as_str())
             .invoke_async(&mut conn)
             .await?;
 
