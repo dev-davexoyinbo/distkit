@@ -324,10 +324,10 @@ async fn inc_if_uses_all_comparators() {
         counter.set(&k, 10).await.unwrap();
 
         let result = counter.inc_if(&k, comparator, 2).await.unwrap();
-        let expected = if should_apply { 12 } else { 10 };
+        let expected = if should_apply { (12, 10) } else { (10, 10) };
 
         assert_eq!(result, expected);
-        assert_eq!(counter.get(&k).await.unwrap(), expected);
+        assert_eq!(counter.get(&k).await.unwrap(), expected.0);
     }
 }
 
@@ -368,7 +368,10 @@ async fn inc_all_if_supports_partial_success_missing_keys_and_duplicates() {
         .await
         .unwrap();
 
-    assert_eq!(results, vec![(&k1, 1), (&k1, 3), (&k2, 10), (&k2, 13)]);
+    assert_eq!(
+        results,
+        vec![(&k1, 1, 0), (&k1, 3, 1), (&k2, 10, 10), (&k2, 13, 10)]
+    );
     assert_eq!(counter.get(&k1).await.unwrap(), 3);
     assert_eq!(counter.get(&k2).await.unwrap(), 13);
 }
@@ -389,10 +392,10 @@ async fn set_if_uses_all_comparators() {
         counter.set(&k, 10).await.unwrap();
 
         let result = counter.set_if(&k, comparator, 99).await.unwrap();
-        let expected = if should_apply { 99 } else { 10 };
+        let expected = if should_apply { (99, 10) } else { (10, 10) };
 
         assert_eq!(result, expected);
-        assert_eq!(counter.get(&k).await.unwrap(), expected);
+        assert_eq!(counter.get(&k).await.unwrap(), expected.0);
     }
 }
 
@@ -415,7 +418,7 @@ async fn set_all_if_supports_partial_success_and_missing_keys() {
         .await
         .unwrap();
 
-    assert_eq!(results, vec![(&k3, 30), (&k1, 11), (&k2, 20)]);
+    assert_eq!(results, vec![(&k3, 30, 0), (&k1, 11, 10), (&k2, 20, 20)]);
     assert_eq!(counter.get(&k1).await.unwrap(), 11);
     assert_eq!(counter.get(&k2).await.unwrap(), 20);
     assert_eq!(counter.get(&k3).await.unwrap(), 30);

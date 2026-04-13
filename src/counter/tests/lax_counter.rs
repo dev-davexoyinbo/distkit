@@ -667,10 +667,10 @@ async fn inc_if_uses_all_comparators_against_local_view() {
         counter.set(&k, 10).await.unwrap();
 
         let result = counter.inc_if(&k, comparator, 2).await.unwrap();
-        let expected = if should_apply { 12 } else { 10 };
+        let expected = if should_apply { (12, 10) } else { (10, 10) };
 
         assert_eq!(result, expected);
-        assert_eq!(counter.get(&k).await.unwrap(), expected);
+        assert_eq!(counter.get(&k).await.unwrap(), expected.0);
     }
 }
 
@@ -689,8 +689,50 @@ async fn inc_if_refreshes_stale_value_before_comparing() {
         .await
         .unwrap();
 
-    assert_eq!(result, 10);
+    assert_eq!(result, (10, 7));
     assert_eq!(reader.get(&k).await.unwrap(), 10);
+}
+
+#[tokio::test]
+async fn set_if_uses_all_comparators_against_local_view() {
+    let cases = [
+        ("eq", CounterComparator::Eq(10), true),
+        ("lt", CounterComparator::Lt(11), true),
+        ("gt", CounterComparator::Gt(10), false),
+        ("ne", CounterComparator::Ne(9), true),
+        ("nil", CounterComparator::Nil, true),
+    ];
+
+    for (suffix, comparator, should_apply) in cases {
+        let counter = make_lax_counter(&format!("lax_set_if_{suffix}")).await;
+        let k = key("conditional");
+        counter.set(&k, 10).await.unwrap();
+
+        let result = counter.set_if(&k, comparator, 99).await.unwrap();
+        let expected = if should_apply { (99, 10) } else { (10, 10) };
+
+        assert_eq!(result, expected);
+        assert_eq!(counter.get(&k).await.unwrap(), expected.0);
+    }
+}
+
+#[tokio::test]
+async fn set_if_refreshes_stale_value_before_comparing() {
+    let prefix = "lax_set_if_refresh";
+    let k = key("hits");
+
+    let writer = make_lax_counter(prefix).await;
+    writer.set(&k, 7).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let reader = make_lax_counter(prefix).await;
+    let result = reader
+        .set_if(&k, CounterComparator::Eq(7), 20)
+        .await
+        .unwrap();
+
+    assert_eq!(result, (20, 7));
+    assert_eq!(reader.get(&k).await.unwrap(), 20);
 }
 
 #[tokio::test]
@@ -730,7 +772,7 @@ async fn inc_all_if_refreshes_stale_values_and_processes_entries_sequentially() 
         .await
         .unwrap();
 
-    assert_eq!(results, vec![(&k, 1), (&k, 3), (&k, 3)]);
+    assert_eq!(results, vec![(&k, 1, 0), (&k, 3, 1), (&k, 3, 3)]);
     assert_eq!(reader.get(&k).await.unwrap(), 3);
 }
 
@@ -748,7 +790,7 @@ async fn inc_all_if_is_eventually_flushed_for_successful_updates() {
         ])
         .await
         .unwrap();
-    assert_eq!(results, vec![(&k1, 4), (&k2, 0)]);
+    assert_eq!(results, vec![(&k1, 4, 0), (&k2, 0, 0)]);
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -770,7 +812,7 @@ async fn set_all_if_returns_current_values_for_failed_conditions() {
         .await
         .unwrap();
 
-    assert_eq!(results, vec![(&k, 5)]);
+    assert_eq!(results, vec![(&k, 5, 5)]);
     assert_eq!(counter.get(&k).await.unwrap(), 5);
 }
 
@@ -788,7 +830,7 @@ async fn set_all_if_is_eventually_flushed_for_successful_updates() {
         ])
         .await
         .unwrap();
-    assert_eq!(results, vec![(&k1, 55), (&k2, 0)]);
+    assert_eq!(results, vec![(&k1, 55, 0), (&k2, 0, 0)]);
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 

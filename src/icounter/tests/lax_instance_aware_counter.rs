@@ -655,11 +655,15 @@ async fn inc_if_uses_all_comparators_against_local_view() {
         let k = key("hits");
         c.set(&k, 10).await.unwrap();
 
-        let (cum, inst) = c.inc_if(&k, comparator, 2).await.unwrap();
-        let expected = if should_apply { (12, 12) } else { (10, 10) };
+        let result = c.inc_if(&k, comparator, 2).await.unwrap();
+        let expected = if should_apply {
+            ((12, 12), (10, 10))
+        } else {
+            ((10, 10), (10, 10))
+        };
 
-        assert_eq!((cum, inst), expected);
-        assert_eq!(c.get(&k).await.unwrap(), expected);
+        assert_eq!(result, expected);
+        assert_eq!(c.get(&k).await.unwrap(), expected.0);
     }
 }
 
@@ -671,8 +675,43 @@ async fn set_if_success_is_visible_to_other_instances_immediately() {
     c1.inc(&k, 5).await.unwrap();
     let result = c1.set_if(&k, CounterComparator::Eq(5), 20).await.unwrap();
 
-    assert_eq!(result, (20, 20));
+    assert_eq!(result, ((20, 20), (5, 5)));
     assert_eq!(c2.get(&k).await.unwrap().0, 20);
+}
+
+#[tokio::test]
+async fn set_if_failed_condition_returns_old_state_and_does_not_apply() {
+    let (c1, c2, _) = make_lax_pair("lax_set_if_failed").await;
+    let k = key("hits");
+
+    c1.set(&k, 5).await.unwrap();
+    let result = c1.set_if(&k, CounterComparator::Gt(10), 20).await.unwrap();
+
+    assert_eq!(result, ((5, 5), (5, 5)));
+    assert_eq!(c1.get(&k).await.unwrap(), (5, 5));
+    assert_eq!(c2.get(&k).await.unwrap().0, 5);
+}
+
+#[tokio::test]
+async fn set_on_instance_if_compares_against_instance_slice_and_returns_old_state() {
+    let (c1, c2, _) = make_lax_pair("lax_set_on_instance_if_slice").await;
+    let k = key("hits");
+
+    c1.inc(&k, 7).await.unwrap();
+    c2.inc(&k, 5).await.unwrap();
+    sleep(Duration::from_millis(FLUSH_MS * 5)).await;
+
+    let result = c1
+        .set_on_instance_if(&k, CounterComparator::Gt(6), 9)
+        .await
+        .unwrap();
+    assert_eq!(result, ((14, 9), (12, 7)));
+
+    let failed = c1
+        .set_on_instance_if(&k, CounterComparator::Eq(8), 50)
+        .await
+        .unwrap();
+    assert_eq!(failed, ((14, 9), (14, 9)));
 }
 
 #[tokio::test]
@@ -710,7 +749,14 @@ async fn inc_all_if_uses_stale_aware_local_cumulative_and_is_sequential() {
         .await
         .unwrap();
 
-    assert_eq!(results, vec![(&k, 6, 1), (&k, 8, 3), (&k, 8, 3)]);
+    assert_eq!(
+        results,
+        vec![
+            (&k, (6, 1), (5, 0)),
+            (&k, (8, 3), (6, 1)),
+            (&k, (8, 3), (8, 3))
+        ]
+    );
     assert_eq!(c1.get(&k).await.unwrap(), (8, 3));
 }
 
@@ -728,7 +774,7 @@ async fn inc_all_if_successes_are_eventually_visible_after_flush() {
         .await
         .unwrap();
 
-    assert_eq!(results, vec![(&k1, 4, 4), (&k2, 0, 0)]);
+    assert_eq!(results, vec![(&k1, (4, 4), (0, 0)), (&k2, (0, 0), (0, 0))]);
 
     sleep(Duration::from_millis(FLUSH_MS * 5)).await;
 
@@ -752,7 +798,10 @@ async fn set_all_if_supports_partial_success() {
         .await
         .unwrap();
 
-    assert_eq!(results, vec![(&k1, 11, 11), (&k2, 20, 20)]);
+    assert_eq!(
+        results,
+        vec![(&k1, (11, 11), (10, 10)), (&k2, (20, 20), (20, 20))]
+    );
     assert_eq!(c2.get(&k1).await.unwrap().0, 11);
     assert_eq!(c2.get(&k2).await.unwrap().0, 20);
 }
@@ -770,6 +819,6 @@ async fn set_all_on_instance_if_refreshes_stale_state_before_comparing() {
         .await
         .unwrap();
 
-    assert_eq!(results, vec![(&k, 8, 3)]);
+    assert_eq!(results, vec![(&k, (8, 3), (5, 0))]);
     assert_eq!(c1.get(&k).await.unwrap(), (8, 3));
 }
