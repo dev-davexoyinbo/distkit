@@ -73,9 +73,11 @@ pub trait InstanceAwareCounterTrait {
     /// Conditionally increments this instance's contribution for `key` by
     /// `count` when the cumulative total satisfies `comparator`.
     ///
-    /// Returns `(cumulative, instance_count)` after evaluation. If the
-    /// condition fails, the returned values reflect the current state and no
-    /// increment is applied.
+    /// Returns `((new_cumulative, new_instance_count), (old_cumulative,
+    /// old_instance_count))`.
+    ///
+    /// If the condition fails, no mutation occurs and the new state equals the
+    /// old state.
     ///
     /// # Examples
     ///
@@ -89,15 +91,15 @@ pub trait InstanceAwareCounterTrait {
     ///
     /// assert_eq!(
     ///     counter.inc_if(&key, CounterComparator::Eq(10), 5).await?,
-    ///     (15, 15)
+    ///     ((15, 15), (10, 10))
     /// );
     /// assert_eq!(
     ///     counter.inc_if(&key, CounterComparator::Lt(10), 5).await?,
-    ///     (15, 15)
+    ///     ((15, 15), (15, 15))
     /// );
     /// assert_eq!(
     ///     counter.inc_if(&key, CounterComparator::Nil, 5).await?,
-    ///     (20, 20)
+    ///     ((20, 20), (15, 15))
     /// );
     /// # Ok(())
     /// # }
@@ -107,7 +109,7 @@ pub trait InstanceAwareCounterTrait {
         key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
-    ) -> Result<(i64, i64), DistkitError>;
+    ) -> Result<((i64, i64), (i64, i64)), DistkitError>;
 
     /// Decrements the counter for `key` by `count` (stale-aware).
     ///
@@ -158,8 +160,11 @@ pub trait InstanceAwareCounterTrait {
     /// Conditionally sets the cumulative total for `key` to `count` when the
     /// cumulative total satisfies `comparator`.
     ///
-    /// Returns `(cumulative, instance_count)` after evaluation. If the
-    /// condition fails, the returned values reflect the current state.
+    /// Returns `((new_cumulative, new_instance_count), (old_cumulative,
+    /// old_instance_count))`.
+    ///
+    /// If the condition fails, no mutation occurs and the new state equals the
+    /// old state.
     ///
     /// # Examples
     ///
@@ -173,15 +178,15 @@ pub trait InstanceAwareCounterTrait {
     ///
     /// assert_eq!(
     ///     counter.set_if(&key, CounterComparator::Gt(5), 40).await?,
-    ///     (40, 40)
+    ///     ((40, 40), (10, 10))
     /// );
     /// assert_eq!(
     ///     counter.set_if(&key, CounterComparator::Eq(10), 99).await?,
-    ///     (40, 40)
+    ///     ((40, 40), (40, 40))
     /// );
     /// assert_eq!(
     ///     counter.set_if(&key, CounterComparator::Nil, 12).await?,
-    ///     (12, 12)
+    ///     ((12, 12), (40, 40))
     /// );
     /// # Ok(())
     /// # }
@@ -191,7 +196,7 @@ pub trait InstanceAwareCounterTrait {
         key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
-    ) -> Result<(i64, i64), DistkitError>;
+    ) -> Result<((i64, i64), (i64, i64)), DistkitError>;
 
     /// Sets only this instance's contribution for `key` to `count`, without
     /// bumping the epoch.
@@ -224,8 +229,11 @@ pub trait InstanceAwareCounterTrait {
     /// Conditionally sets this instance's contribution for `key` to `count`
     /// when the current instance slice satisfies `comparator`.
     ///
-    /// Returns `(cumulative, instance_count)` after evaluation. If the
-    /// condition fails, the returned values reflect the current state.
+    /// Returns `((new_cumulative, new_instance_count), (old_cumulative,
+    /// old_instance_count))`.
+    ///
+    /// If the condition fails, no mutation occurs and the new state equals the
+    /// old state.
     ///
     /// # Examples
     ///
@@ -242,19 +250,19 @@ pub trait InstanceAwareCounterTrait {
     ///     server_a
     ///         .set_on_instance_if(&key, CounterComparator::Eq(7), 9)
     ///         .await?,
-    ///     (14, 9)
+    ///     ((14, 9), (12, 7))
     /// );
     /// assert_eq!(
     ///     server_a
     ///         .set_on_instance_if(&key, CounterComparator::Gt(10), 50)
     ///         .await?,
-    ///     (14, 9)
+    ///     ((14, 9), (14, 9))
     /// );
     /// assert_eq!(
     ///     server_a
     ///         .set_on_instance_if(&key, CounterComparator::Nil, 11)
     ///         .await?,
-    ///     (16, 11)
+    ///     ((16, 11), (14, 9))
     /// );
     /// # Ok(())
     /// # }
@@ -264,7 +272,7 @@ pub trait InstanceAwareCounterTrait {
         key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
-    ) -> Result<(i64, i64), DistkitError>;
+    ) -> Result<((i64, i64), (i64, i64)), DistkitError>;
 
     /// Returns `(cumulative, instance_count)` for `key`.
     ///
@@ -424,10 +432,11 @@ pub trait InstanceAwareCounterTrait {
     /// Conditionally increments each `(key, delta)` pair when the cumulative
     /// total satisfies the corresponding comparator.
     ///
-    /// Each tuple is `(key, comparator, delta)`. Evaluation is per-item,
-    /// results preserve input order, and duplicate keys are processed
-    /// sequentially in input order. Use [`CounterComparator::Nil`] for
-    /// unconditional entries in a mixed batch.
+    /// Each tuple is `(key, comparator, delta)`. Results are `(key,
+    /// (new_cumulative, new_instance_count), (old_cumulative,
+    /// old_instance_count))`. Evaluation is per-item, results preserve input
+    /// order, and duplicate keys are processed sequentially in input order. Use
+    /// [`CounterComparator::Nil`] for unconditional entries in a mixed batch.
     ///
     /// # Examples
     ///
@@ -447,14 +456,17 @@ pub trait InstanceAwareCounterTrait {
     ///     ])
     ///     .await?;
     ///
-    /// assert_eq!(results, vec![(&k1, 15, 15), (&k2, 2, 2)]);
+    /// assert_eq!(
+    ///     results,
+    ///     vec![(&k1, (15, 15), (10, 10)), (&k2, (2, 2), (0, 0))]
+    /// );
     /// # Ok(())
     /// # }
     /// ```
     async fn inc_all_if<'k>(
         &self,
         updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError>;
+    ) -> Result<Vec<(&'k DistkitRedisKey, (i64, i64), (i64, i64))>, DistkitError>;
 
     /// Sets each `(key, count)` pair globally, bumping the epoch. Semantics
     /// match `set` for each individual key. Returns `(key, cumulative, instance_count)`
@@ -467,9 +479,11 @@ pub trait InstanceAwareCounterTrait {
     /// Conditionally sets each `(key, count)` pair globally when the
     /// cumulative total satisfies the corresponding comparator.
     ///
-    /// Each tuple is `(key, comparator, count)`. Evaluation is per-item and
-    /// results preserve input order. Use [`CounterComparator::Nil`] for
-    /// unconditional entries in a mixed batch.
+    /// Each tuple is `(key, comparator, count)`. Results are `(key,
+    /// (new_cumulative, new_instance_count), (old_cumulative,
+    /// old_instance_count))`. Evaluation is per-item and results preserve
+    /// input order. Use
+    /// [`CounterComparator::Nil`] for unconditional entries in a mixed batch.
     ///
     /// # Examples
     ///
@@ -489,14 +503,17 @@ pub trait InstanceAwareCounterTrait {
     ///     ])
     ///     .await?;
     ///
-    /// assert_eq!(results, vec![(&k1, 15, 15), (&k2, 20, 20)]);
+    /// assert_eq!(
+    ///     results,
+    ///     vec![(&k1, (15, 15), (10, 10)), (&k2, (20, 20), (0, 0))]
+    /// );
     /// # Ok(())
     /// # }
     /// ```
     async fn set_all_if<'k>(
         &self,
         updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError>;
+    ) -> Result<Vec<(&'k DistkitRedisKey, (i64, i64), (i64, i64))>, DistkitError>;
 
     /// Sets this instance's contribution for each `(key, count)` pair without
     /// bumping the epoch. Other instances' slices are preserved. Returns
@@ -510,9 +527,11 @@ pub trait InstanceAwareCounterTrait {
     /// pair when the current instance slice satisfies the corresponding
     /// comparator.
     ///
-    /// Each tuple is `(key, comparator, count)`. Evaluation is per-item and
-    /// results preserve input order. Use [`CounterComparator::Nil`] for
-    /// unconditional entries in a mixed batch.
+    /// Each tuple is `(key, comparator, count)`. Results are `(key,
+    /// (new_cumulative, new_instance_count), (old_cumulative,
+    /// old_instance_count))`. Evaluation is per-item and results preserve
+    /// input order. Use
+    /// [`CounterComparator::Nil`] for unconditional entries in a mixed batch.
     ///
     /// # Examples
     ///
@@ -531,14 +550,17 @@ pub trait InstanceAwareCounterTrait {
     ///     ])
     ///     .await?;
     ///
-    /// assert_eq!(results, vec![(&k1, 5, 5), (&k2, 7, 7)]);
+    /// assert_eq!(
+    ///     results,
+    ///     vec![(&k1, (5, 5), (0, 0)), (&k2, (7, 7), (0, 0))]
+    /// );
     /// # Ok(())
     /// # }
     /// ```
     async fn set_all_on_instance_if<'k>(
         &self,
         updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError>;
+    ) -> Result<Vec<(&'k DistkitRedisKey, (i64, i64), (i64, i64))>, DistkitError>;
 }
 
 // ---------------------------------------------------------------------------

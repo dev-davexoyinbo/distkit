@@ -32,8 +32,10 @@ pub trait CounterTrait {
     /// Conditionally increments the counter by `count` when the current value
     /// satisfies `comparator`.
     ///
-    /// Returns the updated total on success, or the current total unchanged
-    /// when the condition fails.
+    /// Returns `(new_value, old_value)`.
+    ///
+    /// When the condition fails, no mutation occurs and the result is
+    /// `(old_value, old_value)`.
     ///
     /// # Examples
     ///
@@ -45,18 +47,9 @@ pub trait CounterTrait {
     /// let key = DistkitRedisKey::try_from("inventory".to_string())?;
     /// counter.set(&key, 10).await?;
     ///
-    /// assert_eq!(
-    ///     counter.inc_if(&key, CounterComparator::Eq(10), 5).await?,
-    ///     15
-    /// );
-    /// assert_eq!(
-    ///     counter.inc_if(&key, CounterComparator::Lt(10), 5).await?,
-    ///     15
-    /// );
-    /// assert_eq!(
-    ///     counter.inc_if(&key, CounterComparator::Nil, 5).await?,
-    ///     20
-    /// );
+    /// assert_eq!(counter.inc_if(&key, CounterComparator::Eq(10), 5).await?, (15, 10));
+    /// assert_eq!(counter.inc_if(&key, CounterComparator::Lt(10), 5).await?, (15, 15));
+    /// assert_eq!(counter.inc_if(&key, CounterComparator::Nil, 5).await?, (20, 15));
     /// # Ok(())
     /// # }
     /// ```
@@ -65,7 +58,7 @@ pub trait CounterTrait {
         key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
-    ) -> Result<i64, DistkitError>;
+    ) -> Result<(i64, i64), DistkitError>;
 
     /// Decrements the counter by `count` and returns the new total.
     ///
@@ -131,8 +124,10 @@ pub trait CounterTrait {
     /// Conditionally sets the counter to `count` when the current value
     /// satisfies `comparator`.
     ///
-    /// Returns the value after evaluation: `count` when the write applied, or
-    /// the current total unchanged when the condition failed.
+    /// Returns `(new_value, old_value)`.
+    ///
+    /// When the condition fails, no mutation occurs and the result is
+    /// `(old_value, old_value)`.
     ///
     /// # Examples
     ///
@@ -144,18 +139,9 @@ pub trait CounterTrait {
     /// let key = DistkitRedisKey::try_from("inventory".to_string())?;
     /// counter.set(&key, 10).await?;
     ///
-    /// assert_eq!(
-    ///     counter.set_if(&key, CounterComparator::Gt(5), 25).await?,
-    ///     25
-    /// );
-    /// assert_eq!(
-    ///     counter.set_if(&key, CounterComparator::Eq(10), 50).await?,
-    ///     25
-    /// );
-    /// assert_eq!(
-    ///     counter.set_if(&key, CounterComparator::Nil, 40).await?,
-    ///     40
-    /// );
+    /// assert_eq!(counter.set_if(&key, CounterComparator::Gt(5), 25).await?, (25, 10));
+    /// assert_eq!(counter.set_if(&key, CounterComparator::Eq(10), 50).await?, (25, 25));
+    /// assert_eq!(counter.set_if(&key, CounterComparator::Nil, 40).await?, (40, 25));
     /// # Ok(())
     /// # }
     /// ```
@@ -164,7 +150,7 @@ pub trait CounterTrait {
         key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
-    ) -> Result<i64, DistkitError>;
+    ) -> Result<(i64, i64), DistkitError>;
 
     /// Deletes the counter and returns the value it held before deletion.
     /// Returns `0` if the key did not exist.
@@ -246,10 +232,10 @@ pub trait CounterTrait {
     /// Conditionally increments each `(key, delta)` pair when the current
     /// value satisfies the corresponding comparator.
     ///
-    /// Each tuple is `(key, comparator, delta)`. Evaluation is per-item,
-    /// results preserve input order, and duplicate keys are processed
-    /// sequentially in input order. Use [`CounterComparator::Nil`] for
-    /// unconditional entries in a mixed batch.
+    /// Each tuple is `(key, comparator, delta)`. Results are `(key, new, old)`.
+    /// Evaluation is per-item, results preserve input order, and duplicate
+    /// keys are processed sequentially in input order. Use
+    /// [`CounterComparator::Nil`] for unconditional entries in a mixed batch.
     ///
     /// # Examples
     ///
@@ -269,14 +255,14 @@ pub trait CounterTrait {
     ///     ])
     ///     .await?;
     ///
-    /// assert_eq!(results, vec![(&k1, 15), (&k2, 2)]);
+    /// assert_eq!(results, vec![(&k1, 15, 10), (&k2, 2, 0)]);
     /// # Ok(())
     /// # }
     /// ```
     async fn inc_all_if<'k>(
         &self,
         updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError>;
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError>;
 
     /// Sets each `(key, count)` pair and returns `(key, count)` in the same
     /// order. Semantics match `set` for each individual key.
@@ -288,9 +274,9 @@ pub trait CounterTrait {
     /// Conditionally sets each `(key, count)` pair when the current value
     /// satisfies the corresponding comparator.
     ///
-    /// Each tuple is `(key, comparator, count)`. Evaluation is per-item and
-    /// results preserve input order. Use [`CounterComparator::Nil`] for
-    /// unconditional entries in a mixed batch.
+    /// Each tuple is `(key, comparator, count)`. Results are `(key, new, old)`.
+    /// Evaluation is per-item and results preserve input order. Use
+    /// [`CounterComparator::Nil`] for unconditional entries in a mixed batch.
     ///
     /// # Examples
     ///
@@ -310,12 +296,12 @@ pub trait CounterTrait {
     ///     ])
     ///     .await?;
     ///
-    /// assert_eq!(results, vec![(&k1, 15), (&k2, 20)]);
+    /// assert_eq!(results, vec![(&k1, 15, 10), (&k2, 20, 0)]);
     /// # Ok(())
     /// # }
     /// ```
     async fn set_all_if<'k>(
         &self,
         updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError>;
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError>;
 }
