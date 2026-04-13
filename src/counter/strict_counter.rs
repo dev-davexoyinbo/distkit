@@ -264,6 +264,49 @@ impl CounterTrait for StrictCounter {
             .collect())
     } // end function get_all
 
+    async fn inc_all<'k>(
+        &self,
+        updates: &[(&'k RedisKey, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&RedisKey, CounterComparator, i64)> = updates
+            .iter()
+            .map(|(key, count)| (*key, CounterComparator::Nil, *count))
+            .collect();
+
+        self.inc_all_if(&conditional_updates).await
+    }
+
+    async fn inc_all_if<'k>(
+        &self,
+        updates: &[(&'k RedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
+        if updates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut conn = self.connection_manager.clone();
+        let script = &self.inc_script;
+
+        let raw: Vec<i64> =
+            execute_pipeline_with_script_retry(&mut conn, script, updates, |update| {
+                let (key, comparator, count) = update;
+                let (lua_comparator, compare_against) = comparator.as_lua_parts();
+                let mut inv = script.key(self.key_generator.container_key());
+                inv.key(key.as_str());
+                inv.arg(lua_comparator);
+                inv.arg(compare_against);
+                inv.arg(*count);
+                inv
+            })
+            .await?;
+
+        Ok(updates
+            .iter()
+            .zip(raw.into_iter())
+            .map(|((key, _, _), total)| (*key, total))
+            .collect())
+    }
+
     async fn set_all<'k>(
         &self,
         updates: &[(&'k RedisKey, i64)],

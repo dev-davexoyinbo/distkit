@@ -870,6 +870,56 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
             .collect())
     } // end function get_all_on_instance
 
+    async fn inc_all<'k>(
+        &self,
+        updates: &[(&'k RedisKey, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&RedisKey, CounterComparator, i64)> = updates
+            .iter()
+            .map(|(key, count)| (*key, CounterComparator::Nil, *count))
+            .collect();
+
+        self.inc_all_if(&conditional_updates).await
+    }
+
+    async fn inc_all_if<'k>(
+        &self,
+        updates: &[(&'k RedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        if updates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        self.activity.signal();
+
+        let keys: Vec<&RedisKey> = updates.iter().map(|(key, _, _)| *key).collect();
+        self.batch_refresh_stale(&keys).await?;
+
+        updates
+            .iter()
+            .map(|(key, comparator, count)| {
+                let store = self
+                    .local_store
+                    .get(*key)
+                    .expect("store populated after refresh");
+                let delta_before = store.delta.load(Ordering::Acquire);
+                let current = (
+                    store.cumulative.load(Ordering::Acquire) + delta_before,
+                    store.instance_count.load(Ordering::Acquire) + delta_before,
+                );
+
+                if comparator.matches(current.0) {
+                    let delta_after = store.delta.fetch_add(*count, Ordering::AcqRel) + *count;
+                    let cumulative = store.cumulative.load(Ordering::Acquire);
+                    let instance_count = store.instance_count.load(Ordering::Acquire);
+                    Ok((*key, cumulative + delta_after, instance_count + delta_after))
+                } else {
+                    Ok((*key, current.0, current.1))
+                }
+            })
+            .collect()
+    }
+
     async fn set_all<'k>(
         &self,
         updates: &[(&'k RedisKey, i64)],

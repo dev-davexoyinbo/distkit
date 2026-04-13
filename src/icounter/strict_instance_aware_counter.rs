@@ -6,7 +6,7 @@
 //! sending heartbeats, its contribution is automatically removed.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicI64, AtomicU64, Ordering},
@@ -773,32 +773,7 @@ impl StrictInstanceAwareCounter {
         Ok(())
     }
 
-    /// Sends multiple increments in a pipelined batch, chunked to `max_batch_size` per
-    /// pipeline. Takes `&mut Vec` so successfully committed entries are drained
-    /// in-place; on failure the remaining entries stay in the vector for the
-    /// caller to retry.
-    ///
-    /// Returns `(counter_key, cumulative, instance_count)` for every entry that
-    /// was committed. Also updates `local_store` from each result.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use distkit::RedisKey;
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
-    /// let k1 = RedisKey::try_from("a".to_string())?;
-    /// let k2 = RedisKey::try_from("b".to_string())?;
-    /// let mut increments = vec![(k1, 3_i64), (k2, 7_i64)];
-    /// let results = counter.inc_batch(&mut increments, 50).await?;
-    /// // Successful entries are drained from the input vec.
-    /// assert!(increments.is_empty());
-    /// assert_eq!(results.len(), 2);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn inc_batch(
+    pub(crate) async fn inc_batch(
         &self,
         increments: &mut Vec<(RedisKey, i64)>,
         max_batch_size: usize,

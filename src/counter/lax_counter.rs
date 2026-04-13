@@ -723,6 +723,53 @@ impl CounterTrait for LaxCounter {
             .collect()
     } // end function get_all
 
+    async fn inc_all<'k>(
+        &self,
+        updates: &[(&'k RedisKey, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&RedisKey, CounterComparator, i64)> = updates
+            .iter()
+            .map(|(key, count)| (*key, CounterComparator::Nil, *count))
+            .collect();
+
+        self.inc_all_if(&conditional_updates).await
+    }
+
+    async fn inc_all_if<'k>(
+        &self,
+        updates: &[(&'k RedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
+        if updates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        self.activity.signal();
+
+        let keys: Vec<&RedisKey> = updates.iter().map(|(key, _, _)| *key).collect();
+        self.batch_refresh_stale(&keys).await?;
+
+        updates
+            .iter()
+            .map(|(key, comparator, count)| {
+                let store = self.store.get(*key).expect("store populated after refresh");
+                let remote_total = store.remote_total.load(Ordering::Acquire);
+                let current = remote_total + store.delta.load(Ordering::Acquire);
+
+                if comparator.matches(current) {
+                    let prev_delta = if *count > 0 {
+                        store.delta.fetch_add(*count, Ordering::AcqRel)
+                    } else {
+                        store.delta.fetch_sub(count.abs(), Ordering::AcqRel)
+                    };
+
+                    Ok((*key, remote_total + prev_delta + *count))
+                } else {
+                    Ok((*key, current))
+                }
+            })
+            .collect()
+    }
+
     async fn set_all<'k>(
         &self,
         updates: &[(&'k RedisKey, i64)],
