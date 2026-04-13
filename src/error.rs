@@ -7,8 +7,8 @@ use crate::counter::CounterError;
 /// Top-level error type for all distkit operations.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum DistkitError {
-    /// A [`RedisKey`](crate::RedisKey) failed validation (empty, too long, or
-    /// contains a colon).
+    /// A [`DistkitRedisKey`](crate::DistkitRedisKey) failed validation
+    /// (empty, too long, or contains a colon).
     #[error("Invalid Redis key: {0}")]
     InvalidRedisKey(String),
     /// A counter-specific error. See [`CounterError`].

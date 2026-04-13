@@ -61,17 +61,17 @@ distkit requires a running Redis instance (5.0+ for Lua script support).
 ## Quick start
 
 ```rust
-use distkit::{RedisKey, counter::{StrictCounter, LaxCounter, CounterOptions, CounterTrait}};
+use distkit::{DistkitRedisKey, counter::{StrictCounter, LaxCounter, CounterOptions, CounterTrait}};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = redis::Client::open("redis://127.0.0.1/")?;
     let conn = client.get_connection_manager().await?;
 
-    let prefix = RedisKey::try_from("my_app".to_string())?;
+    let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
     let options = CounterOptions::new(prefix, conn);
 
-    let key = RedisKey::try_from("page_views".to_string())?;
+    let key = DistkitRedisKey::try_from("page_views".to_string())?;
 
     // Strict: immediate consistency
     let strict = StrictCounter::new(options.clone());
@@ -97,11 +97,34 @@ Every call is a single Redis round-trip executing an atomic Lua script. The
 counter value is always authoritative.
 
 ```rust
-let key = RedisKey::try_from("orders".to_string())?;
+let key = DistkitRedisKey::try_from("orders".to_string())?;
 strict.inc(&key, 1).await?;   // HINCRBY via Lua
 strict.set(&key, 100).await?; // HSET via Lua
 strict.del(&key).await?;      // HDEL, returns old value
 strict.clear().await?;        // DEL on the hash
+```
+
+Conditional writes use `CounterComparator` and return the current value
+unchanged when the comparison fails.
+
+```rust
+use distkit::CounterComparator;
+
+strict.set(&key, 10).await?;
+assert_eq!(strict.inc_if(&key, CounterComparator::Eq(10), 5).await?, 15);
+assert_eq!(strict.set_if(&key, CounterComparator::Gt(20), 99).await?, 15);
+```
+
+Batch increments follow the same rules and preserve input order.
+
+```rust
+let results = strict
+    .inc_all_if(&[
+        (&key, CounterComparator::Eq(15), 2),
+        (&key, CounterComparator::Nil, 3),
+    ])
+    .await?;
+assert_eq!(results, vec![(&key, 17), (&key, 20)]);
 ```
 
 ### LaxCounter
@@ -112,7 +135,7 @@ pipelines every `allowed_lag` (default 20 ms). Reads return the local view
 process.
 
 ```rust
-let key = RedisKey::try_from("impressions".to_string())?;
+let key = DistkitRedisKey::try_from("impressions".to_string())?;
 lax.inc(&key, 1).await?;         // local atomic add, sub-microsecond
 let val = lax.get(&key).await?;  // reads local state, no Redis hit
 ```
@@ -156,6 +179,12 @@ This makes them well-suited for:
   restarts or crashes.
 - **Per-node metrics** -- see both the global total and each instance's slice.
 
+Conditional instance-aware writes follow the same rule set:
+
+- `inc_if` and `set_if` compare against the cumulative total.
+- `set_on_instance_if` compares against the calling instance's slice.
+- Failed comparisons return the current `(cumulative, instance_count)` unchanged.
+
 ### StrictInstanceAwareCounter
 
 Every call is immediately consistent with Redis. `set` and `del` bump a
@@ -167,16 +196,16 @@ use distkit::icounter::{
     InstanceAwareCounterTrait,
     StrictInstanceAwareCounter, StrictInstanceAwareCounterOptions,
 };
-use distkit::RedisKey;
+use distkit::DistkitRedisKey;
 
 let client = redis::Client::open("redis://127.0.0.1/")?;
 let conn = client.get_connection_manager().await?;
-let prefix = RedisKey::try_from("my_app".to_string())?;
+let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
 let counter = StrictInstanceAwareCounter::new(
     StrictInstanceAwareCounterOptions::new(prefix, conn),
 );
 
-let key = RedisKey::try_from("connections".to_string())?;
+let key = DistkitRedisKey::try_from("connections".to_string())?;
 
 // Increment this instance's contribution; returns (cumulative, instance_count).
 let (total, mine) = counter.inc(&key, 5).await?;
@@ -211,13 +240,13 @@ use distkit::icounter::{
     InstanceAwareCounterTrait,
     StrictInstanceAwareCounter, StrictInstanceAwareCounterOptions,
 };
-use distkit::RedisKey;
+use distkit::DistkitRedisKey;
 
 let client = redis::Client::open("redis://127.0.0.1/")?;
 let conn1 = client.get_connection_manager().await?;
 let conn2 = client.get_connection_manager().await?;
-let prefix = RedisKey::try_from("my_app".to_string())?;
-let key = RedisKey::try_from("connections".to_string())?;
+let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
+let key = DistkitRedisKey::try_from("connections".to_string())?;
 
 let opts = |conn| StrictInstanceAwareCounterOptions {
     prefix: prefix.clone(),
@@ -250,12 +279,12 @@ use distkit::icounter::{
     InstanceAwareCounterTrait,
     LaxInstanceAwareCounter, LaxInstanceAwareCounterOptions,
 };
-use distkit::RedisKey;
+use distkit::DistkitRedisKey;
 use std::time::Duration;
 
 let client = redis::Client::open("redis://127.0.0.1/")?;
 let conn = client.get_connection_manager().await?;
-let prefix = RedisKey::try_from("my_app".to_string())?;
+let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
 let counter = LaxInstanceAwareCounter::new(LaxInstanceAwareCounterOptions {
     prefix,
     connection_manager: conn,
@@ -264,7 +293,7 @@ let counter = LaxInstanceAwareCounter::new(LaxInstanceAwareCounterOptions {
     allowed_lag:    Duration::from_millis(20),
 });
 
-let key = RedisKey::try_from("connections".to_string())?;
+let key = DistkitRedisKey::try_from("connections".to_string())?;
 
 // Returns the local estimate immediately — no Redis round-trip on warm path.
 let (local_total, mine) = counter.inc(&key, 1).await?;

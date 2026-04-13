@@ -19,7 +19,7 @@ pub use counter_trait::*;
 mod error;
 pub use error::*;
 
-use crate::RedisKey;
+use crate::DistkitRedisKey;
 
 #[cfg(test)]
 mod tests;
@@ -32,7 +32,7 @@ mod tests;
 #[derive(Debug, Clone)]
 pub struct CounterOptions {
     /// Redis key prefix used to namespace all counter keys.
-    pub prefix: RedisKey,
+    pub prefix: DistkitRedisKey,
     /// Redis connection manager for executing commands.
     pub connection_manager: ConnectionManager,
     /// Maximum acceptable staleness for [`LaxCounter`] reads (default 20 ms).
@@ -46,7 +46,7 @@ impl CounterOptions {
     /// # Examples
     ///
     /// ```rust
-    /// use distkit::{RedisKey, counter::CounterOptions};
+    /// use distkit::{DistkitRedisKey, counter::CounterOptions};
     ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -54,13 +54,13 @@ impl CounterOptions {
     ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     /// let client = redis::Client::open(redis_url)?;
     /// let conn = client.get_connection_manager().await?;
-    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
     /// let options = CounterOptions::new(prefix, conn);
     /// // options.allowed_lag == Duration::from_millis(20)
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
+    pub fn new(prefix: DistkitRedisKey, connection_manager: ConnectionManager) -> Self {
         Self {
             prefix,
             connection_manager,

@@ -15,7 +15,7 @@ use dashmap::DashMap;
 use redis::aio::ConnectionManager;
 
 use crate::{
-    ActivityTracker, CounterComparator, EPOCH_CHANGE_INTERVAL, RedisKey,
+    ActivityTracker, CounterComparator, DistkitRedisKey, EPOCH_CHANGE_INTERVAL,
     common::mutex_lock,
     error::DistkitError,
     icounter::{
@@ -60,7 +60,7 @@ impl SingleStore {
 #[derive(Debug, Clone)]
 pub struct LaxInstanceAwareCounterOptions {
     /// Redis key prefix used to namespace all counter keys.
-    pub prefix: RedisKey,
+    pub prefix: DistkitRedisKey,
     /// Redis connection manager.
     pub connection_manager: ConnectionManager,
     /// Milliseconds without a heartbeat before an instance is considered dead.
@@ -82,7 +82,7 @@ impl LaxInstanceAwareCounterOptions {
     /// # Examples
     ///
     /// ```rust
-    /// use distkit::{RedisKey, icounter::LaxInstanceAwareCounterOptions};
+    /// use distkit::{DistkitRedisKey, icounter::LaxInstanceAwareCounterOptions};
     ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -90,13 +90,13 @@ impl LaxInstanceAwareCounterOptions {
     ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     /// let client = redis::Client::open(redis_url)?;
     /// let conn = client.get_connection_manager().await?;
-    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
     /// let opts = LaxInstanceAwareCounterOptions::new(prefix, conn);
     /// assert_eq!(opts.dead_instance_threshold_ms, 30_000);
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
+    pub fn new(prefix: DistkitRedisKey, connection_manager: ConnectionManager) -> Self {
         Self {
             prefix,
             connection_manager,
@@ -120,12 +120,12 @@ impl LaxInstanceAwareCounterOptions {
 #[derive(Debug)]
 pub struct LaxInstanceAwareCounter {
     strict: Arc<StrictInstanceAwareCounter>,
-    local_store: DashMap<RedisKey, SingleStore>,
+    local_store: DashMap<DistkitRedisKey, SingleStore>,
     activity: Arc<ActivityTracker>,
     flush_interval: Duration,
     allowed_lag: Duration,
-    reset_locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>>,
-    pending_flushed: tokio::sync::Mutex<Vec<(RedisKey, i64)>>,
+    reset_locks: DashMap<DistkitRedisKey, Arc<tokio::sync::Mutex<()>>>,
+    pending_flushed: tokio::sync::Mutex<Vec<(DistkitRedisKey, i64)>>,
 }
 
 impl LaxInstanceAwareCounter {
@@ -139,7 +139,7 @@ impl LaxInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// use distkit::{RedisKey, icounter::{LaxInstanceAwareCounter, LaxInstanceAwareCounterOptions, InstanceAwareCounterTrait}};
+    /// use distkit::{DistkitRedisKey, icounter::{LaxInstanceAwareCounter, LaxInstanceAwareCounterOptions, InstanceAwareCounterTrait}};
     ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -147,7 +147,7 @@ impl LaxInstanceAwareCounter {
     ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     /// let client = redis::Client::open(redis_url)?;
     /// let conn = client.get_connection_manager().await?;
-    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
     /// let counter = LaxInstanceAwareCounter::new(LaxInstanceAwareCounterOptions::new(prefix, conn));
     /// assert!(!counter.instance_id().is_empty());
     /// # Ok(())
@@ -229,7 +229,7 @@ impl LaxInstanceAwareCounter {
         let results = self.strict.inc_batch(&mut pending, MAX_BATCH_SIZE).await?;
 
         for (key_str, cumulative, instance_count) in results {
-            if let Ok(key) = RedisKey::try_from(key_str) {
+            if let Ok(key) = DistkitRedisKey::try_from(key_str) {
                 self.update_local(&key, cumulative, instance_count);
             }
         }
@@ -238,7 +238,7 @@ impl LaxInstanceAwareCounter {
     }
 
     /// Acquire (or create) the per-key reset lock and return an `Arc` to it.
-    fn get_or_create_reset_lock(&self, key: &RedisKey) -> Arc<tokio::sync::Mutex<()>> {
+    fn get_or_create_reset_lock(&self, key: &DistkitRedisKey) -> Arc<tokio::sync::Mutex<()>> {
         if let Some(lock) = self.reset_locks.get(key) {
             return Arc::clone(&lock);
         }
@@ -249,7 +249,7 @@ impl LaxInstanceAwareCounter {
             .clone()
     } // end function get_or_create_reset_lock
 
-    fn collect_stale_mark_flushed(&self) -> Vec<(RedisKey, i64)> {
+    fn collect_stale_mark_flushed(&self) -> Vec<(DistkitRedisKey, i64)> {
         let now = Instant::now();
         self.local_store
             .iter()
@@ -276,7 +276,7 @@ impl LaxInstanceAwareCounter {
 
     /// Drains the pending delta for a single key by calling `strict.inc`
     /// directly. Used before epoch-bumping operations (`set`, `del`, etc.).
-    async fn flush_key(&self, key: &RedisKey) -> Result<(), DistkitError> {
+    async fn flush_key(&self, key: &DistkitRedisKey) -> Result<(), DistkitError> {
         let Some(store) = self.local_store.get(key) else {
             return Ok(());
         };
@@ -297,7 +297,7 @@ impl LaxInstanceAwareCounter {
     /// Drains pending deltas for all keys regardless of staleness.
     /// Used by `clear` / `clear_on_instance` before delegating to strict.
     async fn flush_all_keys(&self) -> Result<(), DistkitError> {
-        let mut all: Vec<(RedisKey, i64)> = self
+        let mut all: Vec<(DistkitRedisKey, i64)> = self
             .local_store
             .iter()
             .filter_map(|store| {
@@ -319,7 +319,7 @@ impl LaxInstanceAwareCounter {
         let results = self.strict.inc_batch(&mut all, MAX_BATCH_SIZE).await?;
 
         for (key_str, cumulative, instance_count) in results {
-            if let Ok(key) = RedisKey::try_from(key_str) {
+            if let Ok(key) = DistkitRedisKey::try_from(key_str) {
                 self.update_local(&key, cumulative, instance_count);
             }
         }
@@ -328,7 +328,7 @@ impl LaxInstanceAwareCounter {
     }
 
     /// Updates `local_store` with fresh values from the strict counter.
-    fn update_local(&self, key: &RedisKey, cumulative: i64, instance_count: i64) {
+    fn update_local(&self, key: &DistkitRedisKey, cumulative: i64, instance_count: i64) {
         match self.local_store.get(key) {
             Some(store) => {
                 store.cumulative.store(cumulative, Ordering::Release);
@@ -344,7 +344,7 @@ impl LaxInstanceAwareCounter {
         }
     } // end function update_local
 
-    async fn refresh_local_if_needed(&self, key: &RedisKey) -> Result<(), DistkitError> {
+    async fn refresh_local_if_needed(&self, key: &DistkitRedisKey) -> Result<(), DistkitError> {
         let lock = self.get_or_create_reset_lock(key);
         let _guard = lock.lock().await;
 
@@ -364,12 +364,12 @@ impl LaxInstanceAwareCounter {
 
     /// Fetches stale/missing keys from the strict counter in a single batched
     /// round-trip, then updates `local_store` for each key.
-    async fn batch_refresh_stale(&self, keys: &[&RedisKey]) -> Result<(), DistkitError> {
+    async fn batch_refresh_stale(&self, keys: &[&DistkitRedisKey]) -> Result<(), DistkitError> {
         if keys.is_empty() {
             return Ok(());
         }
 
-        let keys: Vec<&RedisKey> = keys
+        let keys: Vec<&DistkitRedisKey> = keys
             .iter()
             .filter(|key| {
                 self.local_store
@@ -409,7 +409,7 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::lax_icounter().await?;
@@ -432,11 +432,11 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::lax_icounter().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// // All three calls are sub-microsecond; no Redis round-trip until flush.
     /// let (c1, s1) = counter.inc(&key, 1).await?;
     /// let (c2, s2) = counter.inc(&key, 1).await?;
@@ -446,13 +446,13 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # Ok(())
     /// # }
     /// ```
-    async fn inc(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
+    async fn inc(&self, key: &DistkitRedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.inc_if(key, CounterComparator::Nil, count).await
     }
 
     async fn inc_if(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
     ) -> Result<(i64, i64), DistkitError> {
@@ -506,11 +506,11 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::lax_icounter().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// counter.inc(&key, 10).await?;
     /// let (cumulative, slice) = counter.dec(&key, 4).await?;
     /// assert_eq!(cumulative, 6);
@@ -518,7 +518,7 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # Ok(())
     /// # }
     /// ```
-    async fn dec(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
+    async fn dec(&self, key: &DistkitRedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.inc(key, -count).await
     }
 
@@ -531,11 +531,11 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::lax_icounter().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// counter.inc(&key, 5).await?; // buffered locally
     /// // Pending delta flushed first; then strict.set takes over.
     /// let (cumulative, slice) = counter.set(&key, 100).await?;
@@ -544,13 +544,13 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # Ok(())
     /// # }
     /// ```
-    async fn set(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
+    async fn set(&self, key: &DistkitRedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.set_if(key, CounterComparator::Nil, count).await
     }
 
     async fn set_if(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
     ) -> Result<(i64, i64), DistkitError> {
@@ -578,11 +578,11 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_lax_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// server_a.inc(&key, 10).await?;
     /// server_b.inc(&key, 5).await?;
     /// // Adjusts server_a's local delta to reach 7; no epoch bump.
@@ -596,7 +596,7 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// ```
     async fn set_on_instance(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         count: i64,
     ) -> Result<(i64, i64), DistkitError> {
         self.set_on_instance_if(key, CounterComparator::Nil, count)
@@ -605,7 +605,7 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
 
     async fn set_on_instance_if(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
     ) -> Result<(i64, i64), DistkitError> {
@@ -658,11 +658,11 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::lax_icounter().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// assert_eq!(counter.get(&key).await?, (0, 0));
     /// counter.inc(&key, 5).await?;
     /// // Returns local estimate (buffered delta included).
@@ -670,7 +670,7 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # Ok(())
     /// # }
     /// ```
-    async fn get(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
+    async fn get(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
         let store = match self.local_store.get(key) {
@@ -713,11 +713,11 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::lax_icounter().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// counter.inc(&key, 5).await?; // buffered
     /// let (old_cumulative, _) = counter.del(&key).await?;
     /// assert_eq!(old_cumulative, 5);
@@ -725,7 +725,7 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # Ok(())
     /// # }
     /// ```
-    async fn del(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
+    async fn del(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
         self.flush_key(key).await?;
         let result = self.strict.del(key).await?;
@@ -741,11 +741,11 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_lax_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// server_a.inc(&key, 3).await?;
     /// server_b.inc(&key, 7).await?;
     /// // Flush server_a's pending delta, then remove only its slice.
@@ -758,7 +758,7 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # Ok(())
     /// # }
     /// ```
-    async fn del_on_instance(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
+    async fn del_on_instance(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
         self.flush_key(key).await?;
         let result = self.strict.del_on_instance(key).await?;
@@ -772,12 +772,12 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::lax_icounter().await?;
-    /// let k1 = RedisKey::try_from("a".to_string())?;
-    /// let k2 = RedisKey::try_from("b".to_string())?;
+    /// let k1 = DistkitRedisKey::try_from("a".to_string())?;
+    /// let k2 = DistkitRedisKey::try_from("b".to_string())?;
     /// counter.inc(&k1, 10).await?;
     /// counter.inc(&k2, 20).await?;
     /// counter.clear().await?;
@@ -800,11 +800,11 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_lax_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// server_a.inc(&key, 3).await?;
     /// server_b.inc(&key, 7).await?;
     /// // Flush + remove only server_a's contributions; server_b's slice survives.
@@ -823,8 +823,8 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
 
     async fn get_all<'k>(
         &self,
-        keys: &[&'k RedisKey],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        keys: &[&'k DistkitRedisKey],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
         if keys.is_empty() {
             return Ok(vec![]);
         }
@@ -851,8 +851,8 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
 
     async fn get_all_on_instance<'k>(
         &self,
-        keys: &[&'k RedisKey],
-    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
+        keys: &[&'k DistkitRedisKey],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
         self.batch_refresh_stale(keys).await?;
 
         Ok(keys
@@ -872,9 +872,9 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
 
     async fn inc_all<'k>(
         &self,
-        updates: &[(&'k RedisKey, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
-        let conditional_updates: Vec<(&RedisKey, CounterComparator, i64)> = updates
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&DistkitRedisKey, CounterComparator, i64)> = updates
             .iter()
             .map(|(key, count)| (*key, CounterComparator::Nil, *count))
             .collect();
@@ -884,15 +884,15 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
 
     async fn inc_all_if<'k>(
         &self,
-        updates: &[(&'k RedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
         }
 
         self.activity.signal();
 
-        let keys: Vec<&RedisKey> = updates.iter().map(|(key, _, _)| *key).collect();
+        let keys: Vec<&DistkitRedisKey> = updates.iter().map(|(key, _, _)| *key).collect();
         self.batch_refresh_stale(&keys).await?;
 
         updates
@@ -922,9 +922,9 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
 
     async fn set_all<'k>(
         &self,
-        updates: &[(&'k RedisKey, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
-        let conditional_updates: Vec<(&RedisKey, CounterComparator, i64)> = updates
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&DistkitRedisKey, CounterComparator, i64)> = updates
             .iter()
             .map(|(key, count)| (*key, CounterComparator::Nil, *count))
             .collect();
@@ -934,19 +934,20 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
 
     async fn set_all_if<'k>(
         &self,
-        updates: &[(&'k RedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
         }
 
         self.activity.signal();
 
-        let keys: Vec<&RedisKey> = updates.iter().map(|(key, _, _)| *key).collect();
+        let keys: Vec<&DistkitRedisKey> = updates.iter().map(|(key, _, _)| *key).collect();
         self.batch_refresh_stale(&keys).await?;
 
-        let mut current_map: HashMap<RedisKey, (i64, i64)> = HashMap::with_capacity(updates.len());
-        let mut matched_updates: Vec<(&RedisKey, i64)> = Vec::new();
+        let mut current_map: HashMap<DistkitRedisKey, (i64, i64)> =
+            HashMap::with_capacity(updates.len());
+        let mut matched_updates: Vec<(&DistkitRedisKey, i64)> = Vec::new();
 
         for (key, comparator, count) in updates {
             let store = self
@@ -965,7 +966,7 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
             }
         }
 
-        let mut applied_map: HashMap<RedisKey, (i64, i64)> =
+        let mut applied_map: HashMap<DistkitRedisKey, (i64, i64)> =
             HashMap::with_capacity(matched_updates.len());
         if !matched_updates.is_empty() {
             self.flush().await?;
@@ -991,9 +992,9 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
 
     async fn set_all_on_instance<'k>(
         &self,
-        updates: &[(&'k RedisKey, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
-        let conditional_updates: Vec<(&RedisKey, CounterComparator, i64)> = updates
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&DistkitRedisKey, CounterComparator, i64)> = updates
             .iter()
             .map(|(key, count)| (*key, CounterComparator::Nil, *count))
             .collect();
@@ -1003,15 +1004,15 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
 
     async fn set_all_on_instance_if<'k>(
         &self,
-        updates: &[(&'k RedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
         }
 
         self.activity.signal();
 
-        let keys: Vec<&RedisKey> = updates.iter().map(|(key, _, _)| *key).collect();
+        let keys: Vec<&DistkitRedisKey> = updates.iter().map(|(key, _, _)| *key).collect();
         self.batch_refresh_stale(&keys).await?;
 
         updates

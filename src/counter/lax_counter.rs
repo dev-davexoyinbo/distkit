@@ -13,7 +13,7 @@ use redis::{Script, aio::ConnectionManager};
 use tokio::time::Instant;
 
 use crate::{
-    ActivityTracker, CounterComparator, DistkitError, EPOCH_CHANGE_INTERVAL, RedisKey,
+    ActivityTracker, CounterComparator, DistkitError, DistkitRedisKey, EPOCH_CHANGE_INTERVAL,
     RedisKeyGenerator, RedisKeyGeneratorTypeKey,
     counter::{CounterError, CounterOptions, CounterTrait},
     execute_pipeline_with_script_retry, mutex_lock,
@@ -54,7 +54,7 @@ const CLEAR_LUA: &str = r#"
 
 #[derive(Debug)]
 struct Commit {
-    key: RedisKey,
+    key: DistkitRedisKey,
     delta: i64,
 }
 
@@ -82,8 +82,8 @@ struct SingleStore {
 pub struct LaxCounter {
     connection_manager: ConnectionManager,
     key_generator: RedisKeyGenerator,
-    store: DashMap<RedisKey, SingleStore>,
-    locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>>,
+    store: DashMap<DistkitRedisKey, SingleStore>,
+    locks: DashMap<DistkitRedisKey, Arc<tokio::sync::Mutex<()>>>,
     get_script: Script,
     allowed_lag: Duration,
     commit_state_script: Script,
@@ -105,7 +105,7 @@ impl LaxCounter {
     /// # Examples
     ///
     /// ```rust
-    /// use distkit::{RedisKey, counter::{LaxCounter, CounterOptions}};
+    /// use distkit::{DistkitRedisKey, counter::{LaxCounter, CounterOptions}};
     ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -113,7 +113,7 @@ impl LaxCounter {
     ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     /// let client = redis::Client::open(redis_url)?;
     /// let conn = client.get_connection_manager().await?;
-    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
     /// let counter = LaxCounter::new(CounterOptions::new(prefix, conn));
     /// // The background flush task is now running.
     /// # Ok(())
@@ -269,7 +269,7 @@ impl LaxCounter {
         .await
     } // end method batch_commit_state
 
-    async fn ensure_valid_state(&self, key: &RedisKey) -> Result<(), DistkitError> {
+    async fn ensure_valid_state(&self, key: &DistkitRedisKey) -> Result<(), DistkitError> {
         let lock = self.get_or_create_lock(key).await;
         let _guard = lock.lock().await;
 
@@ -316,7 +316,7 @@ impl LaxCounter {
         Ok(())
     } // end function get_remote_total
 
-    async fn get_or_create_lock(&self, key: &RedisKey) -> Arc<tokio::sync::Mutex<()>> {
+    async fn get_or_create_lock(&self, key: &DistkitRedisKey) -> Arc<tokio::sync::Mutex<()>> {
         if let Some(lock) = self.locks.get(key) {
             return lock.clone();
         }
@@ -329,7 +329,7 @@ impl LaxCounter {
 
     /// Fetches stale/missing keys from Redis in a single pipeline, then updates
     /// `self.store` with the fresh remote totals.
-    async fn batch_refresh_stale(&self, keys: &[&RedisKey]) -> Result<(), DistkitError> {
+    async fn batch_refresh_stale(&self, keys: &[&DistkitRedisKey]) -> Result<(), DistkitError> {
         if keys.is_empty() {
             return Ok(());
         }
@@ -408,11 +408,11 @@ impl CounterTrait for LaxCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # use distkit::{DistkitRedisKey, counter::CounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::lax_counter().await?;
-    /// let key = RedisKey::try_from("hits".to_string())?;
+    /// let key = DistkitRedisKey::try_from("hits".to_string())?;
     /// // All three calls are sub-microsecond; no Redis round-trip until flush.
     /// assert_eq!(counter.inc(&key, 1).await?, 1);
     /// assert_eq!(counter.inc(&key, 1).await?, 2);
@@ -421,13 +421,13 @@ impl CounterTrait for LaxCounter {
     /// # Ok(())
     /// # }
     /// ```
-    async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+    async fn inc(&self, key: &DistkitRedisKey, count: i64) -> Result<i64, DistkitError> {
         self.inc_if(key, CounterComparator::Nil, count).await
     }
 
     async fn inc_if(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
     ) -> Result<i64, DistkitError> {
@@ -477,17 +477,17 @@ impl CounterTrait for LaxCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # use distkit::{DistkitRedisKey, counter::CounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::lax_counter().await?;
-    /// let key = RedisKey::try_from("tokens".to_string())?;
+    /// let key = DistkitRedisKey::try_from("tokens".to_string())?;
     /// counter.set(&key, 10).await?;
     /// assert_eq!(counter.dec(&key, 3).await?, 7);
     /// # Ok(())
     /// # }
     /// ```
-    async fn dec(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+    async fn dec(&self, key: &DistkitRedisKey, count: i64) -> Result<i64, DistkitError> {
         self.inc(key, -count).await
     } // end function dec
 
@@ -502,18 +502,18 @@ impl CounterTrait for LaxCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # use distkit::{DistkitRedisKey, counter::CounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::lax_counter().await?;
-    /// let key = RedisKey::try_from("hits".to_string())?;
+    /// let key = DistkitRedisKey::try_from("hits".to_string())?;
     /// counter.inc(&key, 7).await?;
     /// // Returns remote_total (0) + pending_delta (7) = 7, no Redis round-trip.
     /// assert_eq!(counter.get(&key).await?, 7);
     /// # Ok(())
     /// # }
     /// ```
-    async fn get(&self, key: &RedisKey) -> Result<i64, DistkitError> {
+    async fn get(&self, key: &DistkitRedisKey) -> Result<i64, DistkitError> {
         self.activity.signal();
         let store = match self.store.get(key) {
             Some(store)
@@ -551,11 +551,11 @@ impl CounterTrait for LaxCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # use distkit::{DistkitRedisKey, counter::CounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::lax_counter().await?;
-    /// let key = RedisKey::try_from("inventory".to_string())?;
+    /// let key = DistkitRedisKey::try_from("inventory".to_string())?;
     /// counter.inc(&key, 1000).await?;
     /// // The write is buffered; this process sees the new value immediately.
     /// assert_eq!(counter.set(&key, 850).await?, 850);
@@ -563,13 +563,13 @@ impl CounterTrait for LaxCounter {
     /// # Ok(())
     /// # }
     /// ```
-    async fn set(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+    async fn set(&self, key: &DistkitRedisKey, count: i64) -> Result<i64, DistkitError> {
         self.set_if(key, CounterComparator::Nil, count).await
     }
 
     async fn set_if(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
     ) -> Result<i64, DistkitError> {
@@ -617,11 +617,11 @@ impl CounterTrait for LaxCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # use distkit::{DistkitRedisKey, counter::CounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::lax_counter().await?;
-    /// let key = RedisKey::try_from("session".to_string())?;
+    /// let key = DistkitRedisKey::try_from("session".to_string())?;
     /// counter.inc(&key, 10).await?; // buffered, not yet in Redis
     /// // Pending delta (10) is cancelled; Redis is updated immediately.
     /// assert_eq!(counter.del(&key).await?, 10);
@@ -629,7 +629,7 @@ impl CounterTrait for LaxCounter {
     /// # Ok(())
     /// # }
     /// ```
-    async fn del(&self, key: &RedisKey) -> Result<i64, DistkitError> {
+    async fn del(&self, key: &DistkitRedisKey) -> Result<i64, DistkitError> {
         self.activity.signal();
 
         let lock = self.get_or_create_lock(key).await;
@@ -664,12 +664,12 @@ impl CounterTrait for LaxCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # use distkit::{DistkitRedisKey, counter::CounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::lax_counter().await?;
-    /// let k1 = RedisKey::try_from("a".to_string())?;
-    /// let k2 = RedisKey::try_from("b".to_string())?;
+    /// let k1 = DistkitRedisKey::try_from("a".to_string())?;
+    /// let k2 = DistkitRedisKey::try_from("b".to_string())?;
     /// counter.inc(&k1, 5).await?;
     /// counter.inc(&k2, 10).await?;
     /// counter.clear().await?;
@@ -701,8 +701,8 @@ impl CounterTrait for LaxCounter {
 
     async fn get_all<'k>(
         &self,
-        keys: &[&'k RedisKey],
-    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
+        keys: &[&'k DistkitRedisKey],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
         if keys.is_empty() {
             return Ok(vec![]);
         }
@@ -725,9 +725,9 @@ impl CounterTrait for LaxCounter {
 
     async fn inc_all<'k>(
         &self,
-        updates: &[(&'k RedisKey, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
-        let conditional_updates: Vec<(&RedisKey, CounterComparator, i64)> = updates
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&DistkitRedisKey, CounterComparator, i64)> = updates
             .iter()
             .map(|(key, count)| (*key, CounterComparator::Nil, *count))
             .collect();
@@ -737,15 +737,15 @@ impl CounterTrait for LaxCounter {
 
     async fn inc_all_if<'k>(
         &self,
-        updates: &[(&'k RedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
         }
 
         self.activity.signal();
 
-        let keys: Vec<&RedisKey> = updates.iter().map(|(key, _, _)| *key).collect();
+        let keys: Vec<&DistkitRedisKey> = updates.iter().map(|(key, _, _)| *key).collect();
         self.batch_refresh_stale(&keys).await?;
 
         updates
@@ -772,9 +772,9 @@ impl CounterTrait for LaxCounter {
 
     async fn set_all<'k>(
         &self,
-        updates: &[(&'k RedisKey, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
-        let conditional_updates: Vec<(&RedisKey, CounterComparator, i64)> = updates
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&DistkitRedisKey, CounterComparator, i64)> = updates
             .iter()
             .map(|(key, count)| (*key, CounterComparator::Nil, *count))
             .collect();
@@ -784,15 +784,15 @@ impl CounterTrait for LaxCounter {
 
     async fn set_all_if<'k>(
         &self,
-        updates: &[(&'k RedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
         }
 
         self.activity.signal();
 
-        let keys: Vec<&RedisKey> = updates.iter().map(|(key, _, _)| *key).collect();
+        let keys: Vec<&DistkitRedisKey> = updates.iter().map(|(key, _, _)| *key).collect();
         self.batch_refresh_stale(&keys).await?;
 
         updates

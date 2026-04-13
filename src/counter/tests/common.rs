@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use redis::aio::ConnectionManager;
 
 use crate::{
-    RedisKey,
+    DistkitRedisKey,
     counter::{CounterOptions, LaxCounter, StrictCounter},
 };
 
@@ -32,15 +32,21 @@ async fn make_connection() -> ConnectionManager {
 pub async fn make_strict_counter(prefix: &str) -> Arc<StrictCounter> {
     let conn = make_connection().await;
     let unique_prefix = format!("{}_{}", run_id(), prefix);
-    StrictCounter::new(CounterOptions::new(RedisKey::from(unique_prefix), conn))
+    StrictCounter::new(CounterOptions::new(
+        DistkitRedisKey::from(unique_prefix),
+        conn,
+    ))
 }
 
 pub async fn make_lax_counter(prefix: &str) -> Arc<LaxCounter> {
     let conn = make_connection().await;
     let unique_prefix = format!("{}_{}", run_id(), prefix);
-    LaxCounter::new(CounterOptions::new(RedisKey::from(unique_prefix), conn))
+    LaxCounter::new(CounterOptions::new(
+        DistkitRedisKey::from(unique_prefix),
+        conn,
+    ))
 }
 
-pub fn key(name: &str) -> RedisKey {
-    RedisKey::from(name.to_string())
+pub fn key(name: &str) -> DistkitRedisKey {
+    DistkitRedisKey::from(name.to_string())
 }

@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
-    ActivityTracker, CounterComparator, EPOCH_CHANGE_INTERVAL, RedisKey, RedisKeyGenerator,
+    ActivityTracker, CounterComparator, DistkitRedisKey, EPOCH_CHANGE_INTERVAL, RedisKeyGenerator,
     RedisKeyGeneratorTypeKey,
     error::DistkitError,
     execute_pipeline_with_script_retry,
@@ -454,7 +454,7 @@ return {counter_key, new_cumulative, new_inst_count, redis_epoch}
 #[derive(Debug, Clone)]
 pub struct StrictInstanceAwareCounterOptions {
     /// Redis key prefix used to namespace all counter keys.
-    pub prefix: RedisKey,
+    pub prefix: DistkitRedisKey,
     /// Redis connection manager.
     pub connection_manager: ConnectionManager,
     /// Milliseconds without a heartbeat before an instance is considered dead.
@@ -468,7 +468,7 @@ impl StrictInstanceAwareCounterOptions {
     /// # Examples
     ///
     /// ```rust
-    /// use distkit::{RedisKey, icounter::StrictInstanceAwareCounterOptions};
+    /// use distkit::{DistkitRedisKey, icounter::StrictInstanceAwareCounterOptions};
     ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -476,13 +476,13 @@ impl StrictInstanceAwareCounterOptions {
     ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     /// let client = redis::Client::open(redis_url)?;
     /// let conn = client.get_connection_manager().await?;
-    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
     /// let opts = StrictInstanceAwareCounterOptions::new(prefix, conn);
     /// assert_eq!(opts.dead_instance_threshold_ms, 30_000);
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
+    pub fn new(prefix: DistkitRedisKey, connection_manager: ConnectionManager) -> Self {
         Self {
             prefix,
             connection_manager,
@@ -510,7 +510,7 @@ pub struct StrictInstanceAwareCounter {
     instance_id: String,
     dead_instance_threshold_ms: u64,
     /// Per-key in-memory state: epoch, last-seen cumulative, and this instance's count.
-    local_store: DashMap<RedisKey, SingleStore>,
+    local_store: DashMap<DistkitRedisKey, SingleStore>,
     /// Maximum epoch value before wrapping. Set to `u64::MAX / 2`.
     max_epoch: u64,
     inc_script: Script,
@@ -572,7 +572,7 @@ impl StrictInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// use distkit::{RedisKey, icounter::{StrictInstanceAwareCounter, StrictInstanceAwareCounterOptions}};
+    /// use distkit::{DistkitRedisKey, icounter::{StrictInstanceAwareCounter, StrictInstanceAwareCounterOptions}};
     ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -580,7 +580,7 @@ impl StrictInstanceAwareCounter {
     ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     /// let client = redis::Client::open(redis_url)?;
     /// let conn = client.get_connection_manager().await?;
-    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
     /// let counter = StrictInstanceAwareCounter::new(StrictInstanceAwareCounterOptions::new(prefix, conn));
     /// assert!(!counter.instance_id().is_empty());
     /// # Ok(())
@@ -655,21 +655,27 @@ impl StrictInstanceAwareCounter {
     // local_store helpers
     // -----------------------------------------------------------------------
 
-    fn get_local_epoch(&self, key: &RedisKey) -> u64 {
+    fn get_local_epoch(&self, key: &DistkitRedisKey) -> u64 {
         self.local_store
             .get(key)
             .map(|s| s.epoch.load(Ordering::Acquire))
             .unwrap_or(0)
     }
 
-    fn get_local_count(&self, key: &RedisKey) -> i64 {
+    fn get_local_count(&self, key: &DistkitRedisKey) -> i64 {
         self.local_store
             .get(key)
             .map(|s| s.local_count.load(Ordering::Acquire))
             .unwrap_or(0)
     }
 
-    fn update_local_store(&self, key: &RedisKey, epoch: u64, cumulative: i64, local_count: i64) {
+    fn update_local_store(
+        &self,
+        key: &DistkitRedisKey,
+        epoch: u64,
+        cumulative: i64,
+        local_count: i64,
+    ) {
         match self.local_store.get(key) {
             Some(s) => {
                 s.epoch.store(epoch, Ordering::Release);
@@ -727,7 +733,7 @@ impl StrictInstanceAwareCounter {
     /// tuples are used to update `local_store` before the next chunk begins.
     async fn recover_contributions_batched(
         &self,
-        recoveries: Vec<(RedisKey, i64, u64)>,
+        recoveries: Vec<(DistkitRedisKey, i64, u64)>,
         chunk_size: usize,
     ) -> Result<(), DistkitError> {
         if recoveries.is_empty() {
@@ -762,7 +768,7 @@ impl StrictInstanceAwareCounter {
 
             // Each result carries its own key — no zip required.
             for (key_str, cumulative, inst_count, redis_epoch) in results {
-                if let Ok(key) = RedisKey::try_from(key_str) {
+                if let Ok(key) = DistkitRedisKey::try_from(key_str) {
                     self.update_local_store(&key, redis_epoch as u64, cumulative, inst_count);
                 }
             }
@@ -775,7 +781,7 @@ impl StrictInstanceAwareCounter {
 
     pub(crate) async fn inc_batch(
         &self,
-        increments: &mut Vec<(RedisKey, i64)>,
+        increments: &mut Vec<(DistkitRedisKey, i64)>,
         max_batch_size: usize,
     ) -> Result<Vec<(String, i64, i64)>, DistkitError> {
         if increments.is_empty() {
@@ -788,7 +794,7 @@ impl StrictInstanceAwareCounter {
         while processed < increments.len() {
             let end = (processed + max_batch_size).min(increments.len());
             let chunk = &increments[processed..end];
-            let conditional_chunk: Vec<(&RedisKey, CounterComparator, i64)> = chunk
+            let conditional_chunk: Vec<(&DistkitRedisKey, CounterComparator, i64)> = chunk
                 .iter()
                 .map(|(key, delta)| (key, CounterComparator::Nil, *delta))
                 .collect();
@@ -811,8 +817,8 @@ impl StrictInstanceAwareCounter {
 
     pub(crate) async fn inc_if_batch<'k>(
         &self,
-        updates: &[(&'k RedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
         }
@@ -882,8 +888,8 @@ impl StrictInstanceAwareCounter {
 
     pub(crate) async fn get_batch<'k>(
         &self,
-        keys: &[&'k RedisKey],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        keys: &[&'k DistkitRedisKey],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
         if keys.is_empty() {
             return Ok(vec![]);
         }
@@ -892,7 +898,7 @@ impl StrictInstanceAwareCounter {
 
         let mut conn = self.connection_manager.clone();
         let mut map: HashMap<String, (i64, i64)> = HashMap::with_capacity(keys.len());
-        let mut recovery_keys: Vec<(RedisKey, i64)> = Vec::new();
+        let mut recovery_keys: Vec<(DistkitRedisKey, i64)> = Vec::new();
 
         let mut processed = 0;
         while processed < keys.len() {
@@ -920,7 +926,7 @@ impl StrictInstanceAwareCounter {
             for (key_str, cumulative, inst_count, redis_epoch, instance_created_raw) in
                 chunk_results
             {
-                if let Ok(key) = RedisKey::try_from(key_str.clone()) {
+                if let Ok(key) = DistkitRedisKey::try_from(key_str.clone()) {
                     let instance_created = instance_created_raw != 0;
                     let local_epoch = self.get_local_epoch(&key);
                     let old_local_count = self.get_local_count(&key);
@@ -952,9 +958,9 @@ impl StrictInstanceAwareCounter {
 
     pub(crate) async fn set_batch<'k>(
         &self,
-        updates: &[(&'k RedisKey, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
-        let conditional_updates: Vec<(&RedisKey, CounterComparator, i64)> = updates
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&DistkitRedisKey, CounterComparator, i64)> = updates
             .iter()
             .map(|(key, count)| (*key, CounterComparator::Nil, *count))
             .collect();
@@ -964,8 +970,8 @@ impl StrictInstanceAwareCounter {
 
     pub(crate) async fn set_if_batch<'k>(
         &self,
-        updates: &[(&'k RedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
         }
@@ -973,14 +979,14 @@ impl StrictInstanceAwareCounter {
         self.activity.signal();
 
         let mut conn = self.connection_manager.clone();
-        let mut map: HashMap<RedisKey, (i64, i64)> = HashMap::with_capacity(updates.len());
+        let mut map: HashMap<DistkitRedisKey, (i64, i64)> = HashMap::with_capacity(updates.len());
         let mut processed = 0;
 
         while processed < updates.len() {
             let end = (processed + MAX_BATCH_SIZE).min(updates.len());
             let chunk = &updates[processed..end];
             let script = &self.set_script;
-            let local_epochs: HashMap<RedisKey, u64> = chunk
+            let local_epochs: HashMap<DistkitRedisKey, u64> = chunk
                 .iter()
                 .map(|(key, _, _)| ((*key).clone(), self.get_local_epoch(key)))
                 .collect();
@@ -1009,7 +1015,7 @@ impl StrictInstanceAwareCounter {
                 .await?;
 
             for (key, cumulative, inst_count, redis_epoch, _, matched_raw) in chunk_results {
-                let Ok(key) = RedisKey::try_from(key.clone()) else {
+                let Ok(key) = DistkitRedisKey::try_from(key.clone()) else {
                     continue;
                 };
 
@@ -1035,9 +1041,9 @@ impl StrictInstanceAwareCounter {
 
     async fn set_on_instance_batch<'k>(
         &self,
-        updates: &[(&'k RedisKey, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
-        let conditional_updates: Vec<(&RedisKey, CounterComparator, i64)> = updates
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&DistkitRedisKey, CounterComparator, i64)> = updates
             .iter()
             .map(|(key, count)| (*key, CounterComparator::Nil, *count))
             .collect();
@@ -1047,8 +1053,8 @@ impl StrictInstanceAwareCounter {
 
     async fn set_on_instance_if_batch<'k>(
         &self,
-        updates: &[(&'k RedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
         }
@@ -1056,14 +1062,14 @@ impl StrictInstanceAwareCounter {
         self.activity.signal();
 
         let mut conn = self.connection_manager.clone();
-        let mut map: HashMap<RedisKey, (i64, i64)> = HashMap::with_capacity(updates.len());
+        let mut map: HashMap<DistkitRedisKey, (i64, i64)> = HashMap::with_capacity(updates.len());
         let mut processed = 0;
 
         while processed < updates.len() {
             let end = (processed + MAX_BATCH_SIZE).min(updates.len());
             let chunk = &updates[processed..end];
             let script = &self.set_on_instance_script;
-            let local_epochs: HashMap<RedisKey, u64> = chunk
+            let local_epochs: HashMap<DistkitRedisKey, u64> = chunk
                 .iter()
                 .map(|(key, _, _)| ((*key).clone(), self.get_local_epoch(key)))
                 .collect();
@@ -1091,7 +1097,7 @@ impl StrictInstanceAwareCounter {
                 .await?;
 
             for (key, cumulative, inst_count, redis_epoch, _, matched_raw) in chunk_results {
-                let Ok(key) = RedisKey::try_from(key.clone()) else {
+                let Ok(key) = DistkitRedisKey::try_from(key.clone()) else {
                     continue;
                 };
 
@@ -1138,7 +1144,7 @@ impl StrictInstanceAwareCounter {
             // The instance was cleaned up while offline. Recover contributions
             // for all keys that still have a positive local count, but only
             // when the per-key epoch in Redis still matches — epoch-safe recovery.
-            let recoveries: Vec<(RedisKey, i64, u64)> = self
+            let recoveries: Vec<(DistkitRedisKey, i64, u64)> = self
                 .local_store
                 .iter()
                 .filter_map(|e| {
@@ -1167,7 +1173,7 @@ impl StrictInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::RedisKey;
+    /// # use distkit::DistkitRedisKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
@@ -1187,11 +1193,11 @@ impl StrictInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::RedisKey;
+    /// # use distkit::DistkitRedisKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// let (cumulative_a, slice_a) = server_a.inc(&key, 3).await?;
     /// assert_eq!(cumulative_a, 3);
     /// assert_eq!(slice_a, 3);
@@ -1201,7 +1207,7 @@ impl StrictInstanceAwareCounter {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn inc(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
+    pub async fn inc(&self, key: &DistkitRedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.inc_if(key, CounterComparator::Nil, count).await
     }
 
@@ -1212,7 +1218,7 @@ impl StrictInstanceAwareCounter {
     /// condition fails, the returned values reflect the current state.
     pub async fn inc_if(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
     ) -> Result<(i64, i64), DistkitError> {
@@ -1264,11 +1270,11 @@ impl StrictInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::RedisKey;
+    /// # use distkit::DistkitRedisKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// server_a.inc(&key, 10).await?;
     /// server_b.inc(&key, 5).await?;
     /// // Epoch bumps; all previous per-instance contributions are cleared.
@@ -1278,7 +1284,7 @@ impl StrictInstanceAwareCounter {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn set(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
+    pub async fn set(&self, key: &DistkitRedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.set_if(key, CounterComparator::Nil, count).await
     }
 
@@ -1289,7 +1295,7 @@ impl StrictInstanceAwareCounter {
     /// condition fails, the returned values reflect the current state.
     pub async fn set_if(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
     ) -> Result<(i64, i64), DistkitError> {
@@ -1341,11 +1347,11 @@ impl StrictInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::RedisKey;
+    /// # use distkit::DistkitRedisKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// server_a.inc(&key, 10).await?;
     /// server_b.inc(&key, 5).await?;
     /// // No epoch bump: server_b's slice is not evicted.
@@ -1357,7 +1363,7 @@ impl StrictInstanceAwareCounter {
     /// ```
     pub async fn set_on_instance(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         count: i64,
     ) -> Result<(i64, i64), DistkitError> {
         self.set_on_instance_if(key, CounterComparator::Nil, count)
@@ -1371,7 +1377,7 @@ impl StrictInstanceAwareCounter {
     /// condition fails, the returned values reflect the current state.
     pub async fn set_on_instance_if(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
     ) -> Result<(i64, i64), DistkitError> {
@@ -1421,11 +1427,11 @@ impl StrictInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::RedisKey;
+    /// # use distkit::DistkitRedisKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// // A missing key returns (0, 0).
     /// assert_eq!(counter.get(&key).await?, (0, 0));
     /// counter.inc(&key, 5).await?;
@@ -1433,7 +1439,7 @@ impl StrictInstanceAwareCounter {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn get(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
+    pub async fn get(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
         let mut conn = self.connection_manager.clone();
@@ -1481,11 +1487,11 @@ impl StrictInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::RedisKey;
+    /// # use distkit::DistkitRedisKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// server_a.inc(&key, 3).await?;
     /// server_b.inc(&key, 7).await?;
     /// let (old_cumulative, _) = server_a.del(&key).await?;
@@ -1495,7 +1501,7 @@ impl StrictInstanceAwareCounter {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn del(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
+    pub async fn del(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
         let mut conn = self.connection_manager.clone();
@@ -1533,11 +1539,11 @@ impl StrictInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::RedisKey;
+    /// # use distkit::DistkitRedisKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// server_a.inc(&key, 3).await?;
     /// server_b.inc(&key, 7).await?;
     /// // Only server_a's slice is removed; server_b is unaffected.
@@ -1547,7 +1553,7 @@ impl StrictInstanceAwareCounter {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn del_on_instance(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
+    pub async fn del_on_instance(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
         let mut conn = self.connection_manager.clone();
@@ -1579,12 +1585,12 @@ impl StrictInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::RedisKey;
+    /// # use distkit::DistkitRedisKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
-    /// let k1 = RedisKey::try_from("a".to_string())?;
-    /// let k2 = RedisKey::try_from("b".to_string())?;
+    /// let k1 = DistkitRedisKey::try_from("a".to_string())?;
+    /// let k2 = DistkitRedisKey::try_from("b".to_string())?;
     /// counter.inc(&k1, 10).await?;
     /// counter.inc(&k2, 20).await?;
     /// counter.clear().await?;
@@ -1651,30 +1657,30 @@ impl InstanceAwareCounterTrait for StrictInstanceAwareCounter {
         self.instance_id()
     }
 
-    async fn inc(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
+    async fn inc(&self, key: &DistkitRedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.inc(key, count).await
     }
 
     async fn inc_if(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
     ) -> Result<(i64, i64), DistkitError> {
         self.inc_if(key, comparator, count).await
     }
 
-    async fn dec(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
+    async fn dec(&self, key: &DistkitRedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.inc(key, -count).await
     }
 
-    async fn set(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
+    async fn set(&self, key: &DistkitRedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.set(key, count).await
     }
 
     async fn set_if(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
     ) -> Result<(i64, i64), DistkitError> {
@@ -1683,7 +1689,7 @@ impl InstanceAwareCounterTrait for StrictInstanceAwareCounter {
 
     async fn set_on_instance(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         count: i64,
     ) -> Result<(i64, i64), DistkitError> {
         self.set_on_instance(key, count).await
@@ -1691,22 +1697,22 @@ impl InstanceAwareCounterTrait for StrictInstanceAwareCounter {
 
     async fn set_on_instance_if(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
     ) -> Result<(i64, i64), DistkitError> {
         self.set_on_instance_if(key, comparator, count).await
     }
 
-    async fn get(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
+    async fn get(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError> {
         self.get(key).await
     }
 
-    async fn del(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
+    async fn del(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError> {
         self.del(key).await
     }
 
-    async fn del_on_instance(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
+    async fn del_on_instance(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError> {
         self.del_on_instance(key).await
     }
 
@@ -1720,24 +1726,24 @@ impl InstanceAwareCounterTrait for StrictInstanceAwareCounter {
 
     async fn get_all<'k>(
         &self,
-        keys: &[&'k RedisKey],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        keys: &[&'k DistkitRedisKey],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
         self.get_batch(keys).await
     }
 
     async fn get_all_on_instance<'k>(
         &self,
-        keys: &[&'k RedisKey],
-    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
+        keys: &[&'k DistkitRedisKey],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
         let pairs = self.get_batch(keys).await?;
         Ok(pairs.into_iter().map(|(k, _, inst)| (k, inst)).collect())
     }
 
     async fn inc_all<'k>(
         &self,
-        updates: &[(&'k RedisKey, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
-        let conditional_updates: Vec<(&RedisKey, CounterComparator, i64)> = updates
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&DistkitRedisKey, CounterComparator, i64)> = updates
             .iter()
             .map(|(key, count)| (*key, CounterComparator::Nil, *count))
             .collect();
@@ -1747,36 +1753,36 @@ impl InstanceAwareCounterTrait for StrictInstanceAwareCounter {
 
     async fn inc_all_if<'k>(
         &self,
-        updates: &[(&'k RedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
         self.inc_if_batch(updates).await
     }
 
     async fn set_all<'k>(
         &self,
-        updates: &[(&'k RedisKey, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
         self.set_batch(updates).await
     }
 
     async fn set_all_if<'k>(
         &self,
-        updates: &[(&'k RedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
         self.set_if_batch(updates).await
     }
 
     async fn set_all_on_instance<'k>(
         &self,
-        updates: &[(&'k RedisKey, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
         self.set_on_instance_batch(updates).await
     }
 
     async fn set_all_on_instance_if<'k>(
         &self,
-        updates: &[(&'k RedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
         self.set_on_instance_if_batch(updates).await
     }
 }

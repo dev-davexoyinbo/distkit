@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    RedisKey,
+    DistkitRedisKey,
     counter::{CounterOptions, LaxCounter, StrictCounter},
     icounter::{
         LaxInstanceAwareCounter, LaxInstanceAwareCounterOptions, StrictInstanceAwareCounter,
@@ -22,8 +22,8 @@ fn redis_url() -> String {
     std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
 }
 
-fn unique_prefix() -> Result<RedisKey, crate::DistkitError> {
-    RedisKey::try_from(format!(
+fn unique_prefix() -> Result<DistkitRedisKey, crate::DistkitError> {
+    DistkitRedisKey::try_from(format!(
         "test_{}_{}_{}",
         uuid::Uuid::new_v4(),
         SystemTime::now()

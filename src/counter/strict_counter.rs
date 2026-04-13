@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
-    CounterComparator, DistkitError, RedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
+    CounterComparator, DistkitError, DistkitRedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
     counter::{CounterOptions, CounterTrait},
     execute_pipeline_with_script_retry,
 };
@@ -102,7 +102,7 @@ impl StrictCounter {
     /// # Examples
     ///
     /// ```rust
-    /// use distkit::{RedisKey, counter::{StrictCounter, CounterOptions}};
+    /// use distkit::{DistkitRedisKey, counter::{StrictCounter, CounterOptions}};
     ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -110,7 +110,7 @@ impl StrictCounter {
     ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     /// let client = redis::Client::open(redis_url)?;
     /// let conn = client.get_connection_manager().await?;
-    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
     /// let counter = StrictCounter::new(CounterOptions::new(prefix, conn));
     /// # Ok(())
     /// # }
@@ -143,13 +143,13 @@ impl StrictCounter {
 
 #[async_trait::async_trait]
 impl CounterTrait for StrictCounter {
-    async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+    async fn inc(&self, key: &DistkitRedisKey, count: i64) -> Result<i64, DistkitError> {
         self.inc_if(key, CounterComparator::Nil, count).await
     }
 
     async fn inc_if(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
     ) -> Result<i64, DistkitError> {
@@ -169,11 +169,11 @@ impl CounterTrait for StrictCounter {
         Ok(total)
     }
 
-    async fn dec(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+    async fn dec(&self, key: &DistkitRedisKey, count: i64) -> Result<i64, DistkitError> {
         self.inc(key, -count).await
     }
 
-    async fn get(&self, key: &RedisKey) -> Result<i64, DistkitError> {
+    async fn get(&self, key: &DistkitRedisKey) -> Result<i64, DistkitError> {
         let mut conn = self.connection_manager.clone();
 
         let (_, total): (String, i64) = self
@@ -186,13 +186,13 @@ impl CounterTrait for StrictCounter {
         Ok(total)
     } // end function get
 
-    async fn set(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+    async fn set(&self, key: &DistkitRedisKey, count: i64) -> Result<i64, DistkitError> {
         self.set_if(key, CounterComparator::Nil, count).await
     }
 
     async fn set_if(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
     ) -> Result<i64, DistkitError> {
@@ -212,7 +212,7 @@ impl CounterTrait for StrictCounter {
         Ok(total)
     }
 
-    async fn del(&self, key: &RedisKey) -> Result<i64, DistkitError> {
+    async fn del(&self, key: &DistkitRedisKey) -> Result<i64, DistkitError> {
         let mut conn = self.connection_manager.clone();
 
         let total: i64 = self
@@ -239,8 +239,8 @@ impl CounterTrait for StrictCounter {
 
     async fn get_all<'k>(
         &self,
-        keys: &[&'k RedisKey],
-    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
+        keys: &[&'k DistkitRedisKey],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
         if keys.is_empty() {
             return Ok(vec![]);
         }
@@ -266,9 +266,9 @@ impl CounterTrait for StrictCounter {
 
     async fn inc_all<'k>(
         &self,
-        updates: &[(&'k RedisKey, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
-        let conditional_updates: Vec<(&RedisKey, CounterComparator, i64)> = updates
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&DistkitRedisKey, CounterComparator, i64)> = updates
             .iter()
             .map(|(key, count)| (*key, CounterComparator::Nil, *count))
             .collect();
@@ -278,8 +278,8 @@ impl CounterTrait for StrictCounter {
 
     async fn inc_all_if<'k>(
         &self,
-        updates: &[(&'k RedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
         }
@@ -309,9 +309,9 @@ impl CounterTrait for StrictCounter {
 
     async fn set_all<'k>(
         &self,
-        updates: &[(&'k RedisKey, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
-        let conditional_updates: Vec<(&RedisKey, CounterComparator, i64)> = updates
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&DistkitRedisKey, CounterComparator, i64)> = updates
             .iter()
             .map(|(key, count)| (*key, CounterComparator::Nil, *count))
             .collect();
@@ -321,8 +321,8 @@ impl CounterTrait for StrictCounter {
 
     async fn set_all_if<'k>(
         &self,
-        updates: &[(&'k RedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
         }

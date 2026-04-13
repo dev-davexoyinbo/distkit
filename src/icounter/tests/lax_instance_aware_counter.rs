@@ -9,7 +9,7 @@ use crate::icounter::{
 };
 
 use super::common::{make_connection, run_id};
-use crate::RedisKey;
+use crate::DistkitRedisKey;
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -26,7 +26,7 @@ fn unique_prefix(name: &str) -> String {
 async fn make_lax_from_prefix(prefix: &str) -> Arc<LaxInstanceAwareCounter> {
     let conn = make_connection().await;
     LaxInstanceAwareCounter::new(LaxInstanceAwareCounterOptions {
-        prefix: RedisKey::from(prefix.to_string()),
+        prefix: DistkitRedisKey::from(prefix.to_string()),
         connection_manager: conn,
         dead_instance_threshold_ms: THRESHOLD_MS,
         flush_interval: Duration::from_millis(FLUSH_MS),
@@ -52,8 +52,8 @@ async fn make_lax_pair(
     (c1, c2, prefix)
 }
 
-fn key(name: &str) -> RedisKey {
-    RedisKey::from(name.to_string())
+fn key(name: &str) -> DistkitRedisKey {
+    DistkitRedisKey::from(name.to_string())
 }
 
 // ---------------------------------------------------------------------------

@@ -14,7 +14,7 @@ mod lax_instance_aware_counter;
 pub use lax_instance_aware_counter::*;
 use uuid::Uuid;
 
-use crate::{CounterComparator, DistkitError, RedisKey};
+use crate::{CounterComparator, DistkitError, DistkitRedisKey};
 
 // ---------------------------------------------------------------------------
 // Trait
@@ -35,7 +35,7 @@ pub trait InstanceAwareCounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
@@ -54,11 +54,11 @@ pub trait InstanceAwareCounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// let (cumulative_a, slice_a) = server_a.inc(&key, 3).await?;
     /// assert_eq!(cumulative_a, 3);
     /// assert_eq!(slice_a, 3);
@@ -68,7 +68,7 @@ pub trait InstanceAwareCounterTrait {
     /// # Ok(())
     /// # }
     /// ```
-    async fn inc(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError>;
+    async fn inc(&self, key: &DistkitRedisKey, count: i64) -> Result<(i64, i64), DistkitError>;
 
     /// Conditionally increments this instance's contribution for `key` by
     /// `count` when the cumulative total satisfies `comparator`.
@@ -80,11 +80,11 @@ pub trait InstanceAwareCounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{CounterComparator, RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{CounterComparator, DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// counter.set(&key, 10).await?;
     ///
     /// assert_eq!(
@@ -104,7 +104,7 @@ pub trait InstanceAwareCounterTrait {
     /// ```
     async fn inc_if(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
     ) -> Result<(i64, i64), DistkitError>;
@@ -116,11 +116,11 @@ pub trait InstanceAwareCounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// counter.inc(&key, 10).await?;
     /// let (cumulative, slice) = counter.dec(&key, 4).await?;
     /// assert_eq!(cumulative, 6);
@@ -128,7 +128,7 @@ pub trait InstanceAwareCounterTrait {
     /// # Ok(())
     /// # }
     /// ```
-    async fn dec(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError>;
+    async fn dec(&self, key: &DistkitRedisKey, count: i64) -> Result<(i64, i64), DistkitError>;
 
     /// Sets the cumulative total for `key` to `count`, bumping the epoch.
     ///
@@ -139,11 +139,11 @@ pub trait InstanceAwareCounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// server_a.inc(&key, 10).await?;
     /// server_b.inc(&key, 5).await?;
     /// // Epoch bumps; all previous per-instance contributions are cleared.
@@ -153,7 +153,7 @@ pub trait InstanceAwareCounterTrait {
     /// # Ok(())
     /// # }
     /// ```
-    async fn set(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError>;
+    async fn set(&self, key: &DistkitRedisKey, count: i64) -> Result<(i64, i64), DistkitError>;
 
     /// Conditionally sets the cumulative total for `key` to `count` when the
     /// cumulative total satisfies `comparator`.
@@ -164,11 +164,11 @@ pub trait InstanceAwareCounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{CounterComparator, RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{CounterComparator, DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// counter.set(&key, 10).await?;
     ///
     /// assert_eq!(
@@ -188,7 +188,7 @@ pub trait InstanceAwareCounterTrait {
     /// ```
     async fn set_if(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
     ) -> Result<(i64, i64), DistkitError>;
@@ -201,11 +201,11 @@ pub trait InstanceAwareCounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// server_a.inc(&key, 10).await?;
     /// server_b.inc(&key, 5).await?;
     /// // No epoch bump: server_b's slice is not evicted.
@@ -215,8 +215,11 @@ pub trait InstanceAwareCounterTrait {
     /// # Ok(())
     /// # }
     /// ```
-    async fn set_on_instance(&self, key: &RedisKey, count: i64)
-    -> Result<(i64, i64), DistkitError>;
+    async fn set_on_instance(
+        &self,
+        key: &DistkitRedisKey,
+        count: i64,
+    ) -> Result<(i64, i64), DistkitError>;
 
     /// Conditionally sets this instance's contribution for `key` to `count`
     /// when the current instance slice satisfies `comparator`.
@@ -227,11 +230,11 @@ pub trait InstanceAwareCounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{CounterComparator, RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{CounterComparator, DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// server_a.set_on_instance(&key, 7).await?;
     /// server_b.set_on_instance(&key, 5).await?;
     ///
@@ -258,7 +261,7 @@ pub trait InstanceAwareCounterTrait {
     /// ```
     async fn set_on_instance_if(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
     ) -> Result<(i64, i64), DistkitError>;
@@ -271,11 +274,11 @@ pub trait InstanceAwareCounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// // A missing key returns (0, 0).
     /// assert_eq!(counter.get(&key).await?, (0, 0));
     /// counter.inc(&key, 5).await?;
@@ -283,7 +286,7 @@ pub trait InstanceAwareCounterTrait {
     /// # Ok(())
     /// # }
     /// ```
-    async fn get(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError>;
+    async fn get(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError>;
 
     /// Deletes `key` globally, bumping the epoch to invalidate all instances.
     ///
@@ -293,11 +296,11 @@ pub trait InstanceAwareCounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// server_a.inc(&key, 3).await?;
     /// server_b.inc(&key, 7).await?;
     /// let (old_cumulative, _) = server_a.del(&key).await?;
@@ -307,7 +310,7 @@ pub trait InstanceAwareCounterTrait {
     /// # Ok(())
     /// # }
     /// ```
-    async fn del(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError>;
+    async fn del(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError>;
 
     /// Removes only this instance's contribution for `key`, without bumping
     /// the epoch.
@@ -318,11 +321,11 @@ pub trait InstanceAwareCounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// server_a.inc(&key, 3).await?;
     /// server_b.inc(&key, 7).await?;
     /// // Only server_a's slice is removed; server_b is unaffected.
@@ -332,19 +335,19 @@ pub trait InstanceAwareCounterTrait {
     /// # Ok(())
     /// # }
     /// ```
-    async fn del_on_instance(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError>;
+    async fn del_on_instance(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError>;
 
     /// Clears all keys and all instance state from Redis.
     ///
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
-    /// let k1 = RedisKey::try_from("a".to_string())?;
-    /// let k2 = RedisKey::try_from("b".to_string())?;
+    /// let k1 = DistkitRedisKey::try_from("a".to_string())?;
+    /// let k2 = DistkitRedisKey::try_from("b".to_string())?;
     /// counter.inc(&k1, 10).await?;
     /// counter.inc(&k2, 20).await?;
     /// counter.clear().await?;
@@ -361,11 +364,11 @@ pub trait InstanceAwareCounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// server_a.inc(&key, 3).await?;
     /// server_b.inc(&key, 7).await?;
     /// // Only server_a's contributions are removed; server_b's slice survives.
@@ -380,16 +383,16 @@ pub trait InstanceAwareCounterTrait {
     /// the same order. A missing key returns `(key, 0, 0)`.
     async fn get_all<'k>(
         &self,
-        keys: &[&'k RedisKey],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError>;
+        keys: &[&'k DistkitRedisKey],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError>;
 
     /// Returns `(key, instance_count)` for each key in `keys`, in the same
     /// order. Pure-local: no Redis round-trip, no staleness check. A key
     /// with no local contribution returns `(key, 0)`.
     async fn get_all_on_instance<'k>(
         &self,
-        keys: &[&'k RedisKey],
-    ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError>;
+        keys: &[&'k DistkitRedisKey],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError>;
 
     /// Increments each `(key, delta)` pair for this instance and returns
     /// `(key, cumulative, instance_count)` in the same order.
@@ -400,12 +403,12 @@ pub trait InstanceAwareCounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
-    /// let k1 = RedisKey::try_from("a".to_string())?;
-    /// let k2 = RedisKey::try_from("b".to_string())?;
+    /// let k1 = DistkitRedisKey::try_from("a".to_string())?;
+    /// let k2 = DistkitRedisKey::try_from("b".to_string())?;
     ///
     /// let results = counter.inc_all(&[(&k1, 3), (&k2, 5)]).await?;
     ///
@@ -415,8 +418,8 @@ pub trait InstanceAwareCounterTrait {
     /// ```
     async fn inc_all<'k>(
         &self,
-        updates: &[(&'k RedisKey, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError>;
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError>;
 
     /// Conditionally increments each `(key, delta)` pair when the cumulative
     /// total satisfies the corresponding comparator.
@@ -429,12 +432,12 @@ pub trait InstanceAwareCounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{CounterComparator, RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{CounterComparator, DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
-    /// let k1 = RedisKey::try_from("a".to_string())?;
-    /// let k2 = RedisKey::try_from("b".to_string())?;
+    /// let k1 = DistkitRedisKey::try_from("a".to_string())?;
+    /// let k2 = DistkitRedisKey::try_from("b".to_string())?;
     /// counter.set(&k1, 10).await?;
     ///
     /// let results = counter
@@ -450,16 +453,16 @@ pub trait InstanceAwareCounterTrait {
     /// ```
     async fn inc_all_if<'k>(
         &self,
-        updates: &[(&'k RedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError>;
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError>;
 
     /// Sets each `(key, count)` pair globally, bumping the epoch. Semantics
     /// match `set` for each individual key. Returns `(key, cumulative, instance_count)`
     /// in the same order.
     async fn set_all<'k>(
         &self,
-        updates: &[(&'k RedisKey, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError>;
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError>;
 
     /// Conditionally sets each `(key, count)` pair globally when the
     /// cumulative total satisfies the corresponding comparator.
@@ -471,12 +474,12 @@ pub trait InstanceAwareCounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{CounterComparator, RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{CounterComparator, DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
-    /// let k1 = RedisKey::try_from("a".to_string())?;
-    /// let k2 = RedisKey::try_from("b".to_string())?;
+    /// let k1 = DistkitRedisKey::try_from("a".to_string())?;
+    /// let k2 = DistkitRedisKey::try_from("b".to_string())?;
     /// counter.set(&k1, 10).await?;
     ///
     /// let results = counter
@@ -492,16 +495,16 @@ pub trait InstanceAwareCounterTrait {
     /// ```
     async fn set_all_if<'k>(
         &self,
-        updates: &[(&'k RedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError>;
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError>;
 
     /// Sets this instance's contribution for each `(key, count)` pair without
     /// bumping the epoch. Other instances' slices are preserved. Returns
     /// `(key, cumulative, instance_count)` in the same order.
     async fn set_all_on_instance<'k>(
         &self,
-        updates: &[(&'k RedisKey, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError>;
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError>;
 
     /// Conditionally sets this instance's contribution for each `(key, count)`
     /// pair when the current instance slice satisfies the corresponding
@@ -514,12 +517,12 @@ pub trait InstanceAwareCounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{CounterComparator, RedisKey, icounter::InstanceAwareCounterTrait};
+    /// # use distkit::{CounterComparator, DistkitRedisKey, icounter::InstanceAwareCounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
-    /// let k1 = RedisKey::try_from("a".to_string())?;
-    /// let k2 = RedisKey::try_from("b".to_string())?;
+    /// let k1 = DistkitRedisKey::try_from("a".to_string())?;
+    /// let k2 = DistkitRedisKey::try_from("b".to_string())?;
     ///
     /// let results = counter
     ///     .set_all_on_instance_if(&[
@@ -534,8 +537,8 @@ pub trait InstanceAwareCounterTrait {
     /// ```
     async fn set_all_on_instance_if<'k>(
         &self,
-        updates: &[(&'k RedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError>;
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError>;
 }
 
 // ---------------------------------------------------------------------------

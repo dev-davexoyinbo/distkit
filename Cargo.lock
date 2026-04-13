@@ -338,6 +338,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "redis",
+ "regex",
  "strum",
  "strum_macros",
  "thiserror",
