@@ -46,14 +46,14 @@ Or add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-distkit = "0.2"
+distkit = "0.3"
 ```
 
 To enable instance-aware counters or rate limiting:
 
 ```toml
 [dependencies]
-distkit = { version = "0.2", features = ["instance-aware-counter", "trypema"] }
+distkit = { version = "0.3", features = ["instance-aware-counter", "trypema"] }
 ```
 
 distkit requires a running Redis instance (5.0+ for Lua script support).
@@ -162,7 +162,7 @@ Enable the `instance-aware-counter` feature:
 
 ```toml
 [dependencies]
-distkit = { version = "0.2", features = ["instance-aware-counter"] }
+distkit = { version = "0.3", features = ["instance-aware-counter"] }
 ```
 
 Instance-aware counters track each running instance's contribution separately.
@@ -313,7 +313,7 @@ Trypema documentation website: <https://trypema.davidoyinbo.com>
 
 ```toml
 [dependencies]
-distkit = { version = "0.2", features = ["trypema"] }
+distkit = { version = "0.3", features = ["trypema"] }
 ```
 
 All public types from the [`trypema`](https://docs.rs/trypema) crate are
