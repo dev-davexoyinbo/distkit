@@ -104,15 +104,21 @@ strict.del(&key).await?;      // HDEL, returns old value
 strict.clear().await?;        // DEL on the hash
 ```
 
-Conditional writes use `CounterComparator` and return the current value
-unchanged when the comparison fails.
+Conditional writes use `CounterComparator` and return `(new, old)`. When the
+comparison fails, `new == old`.
 
 ```rust
 use distkit::CounterComparator;
 
 strict.set(&key, 10).await?;
-assert_eq!(strict.inc_if(&key, CounterComparator::Eq(10), 5).await?, 15);
-assert_eq!(strict.set_if(&key, CounterComparator::Gt(20), 99).await?, 15);
+assert_eq!(
+    strict.inc_if(&key, CounterComparator::Eq(10), 5).await?,
+    (15, 10)
+);
+assert_eq!(
+    strict.set_if(&key, CounterComparator::Gt(20), 99).await?,
+    (15, 15)
+);
 ```
 
 Batch increments follow the same rules and preserve input order.
@@ -124,7 +130,7 @@ let results = strict
         (&key, CounterComparator::Nil, 3),
     ])
     .await?;
-assert_eq!(results, vec![(&key, 17), (&key, 20)]);
+assert_eq!(results, vec![(&key, 17, 15), (&key, 20, 17)]);
 ```
 
 ### LaxCounter

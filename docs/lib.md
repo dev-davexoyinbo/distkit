@@ -118,11 +118,11 @@ counter.set(&key, 10).await?;
 
 assert_eq!(
     counter.inc_if(&key, CounterComparator::Eq(10), 5).await?,
-    15
+    (15, 10)
 );
 assert_eq!(
     counter.set_if(&key, CounterComparator::Gt(20), 99).await?,
-    15
+    (15, 15)
 );
 assert_eq!(
     counter
@@ -131,7 +131,7 @@ assert_eq!(
             (&key, CounterComparator::Nil, 3),
         ])
         .await?,
-    vec![(&key, 17), (&key, 20)]
+    vec![(&key, 17, 15), (&key, 20, 17)]
 );
 # Ok(())
 # }

@@ -987,11 +987,15 @@ async fn inc_if_uses_all_comparators_against_cumulative() {
         let k = key("hits");
         c.set(&k, 10).await.unwrap();
 
-        let (cum, inst) = c.inc_if(&k, comparator, 2).await.unwrap();
-        let expected = if should_apply { (12, 12) } else { (10, 10) };
+        let result = c.inc_if(&k, comparator, 2).await.unwrap();
+        let expected = if should_apply {
+            ((12, 12), (10, 10))
+        } else {
+            ((10, 10), (10, 10))
+        };
 
-        assert_eq!((cum, inst), expected);
-        assert_eq!(c.get(&k).await.unwrap(), expected);
+        assert_eq!(result, expected);
+        assert_eq!(c.get(&k).await.unwrap(), expected.0);
         c.clear().await.unwrap();
     }
 }
@@ -1037,7 +1041,12 @@ async fn inc_all_if_compares_against_cumulative_and_processes_duplicates_sequent
 
     assert_eq!(
         results,
-        vec![(&k1, 1, 1), (&k1, 3, 3), (&k2, 5, 0), (&k2, 8, 3)]
+        vec![
+            (&k1, (1, 1), (0, 0)),
+            (&k1, (3, 3), (1, 1)),
+            (&k2, (5, 0), (5, 0)),
+            (&k2, (8, 3), (5, 0)),
+        ]
     );
     assert_eq!(c1.get(&k1).await.unwrap(), (3, 3));
     assert_eq!(c1.get(&k2).await.unwrap(), (8, 3));
@@ -1058,19 +1067,19 @@ async fn set_on_instance_if_compares_against_instance_slice() {
         .set_on_instance_if(&k, CounterComparator::Gt(6), 9)
         .await
         .unwrap();
-    assert_eq!(result, (14, 9));
+    assert_eq!(result, ((14, 9), (12, 7)));
 
     let failed = c1
         .set_on_instance_if(&k, CounterComparator::Eq(8), 50)
         .await
         .unwrap();
-    assert_eq!(failed, (14, 9));
+    assert_eq!(failed, ((14, 9), (14, 9)));
 
     let unconditional = c1
         .set_on_instance_if(&k, CounterComparator::Nil, 11)
         .await
         .unwrap();
-    assert_eq!(unconditional, (16, 11));
+    assert_eq!(unconditional, ((16, 11), (14, 9)));
 
     c1.clear().await.unwrap();
 }
@@ -1094,7 +1103,14 @@ async fn set_all_if_supports_partial_success_and_missing_keys() {
         .await
         .unwrap();
 
-    assert_eq!(results, vec![(&k3, 30, 30), (&k1, 11, 11), (&k2, 20, 20)]);
+    assert_eq!(
+        results,
+        vec![
+            (&k3, (30, 30), (0, 0)),
+            (&k1, (11, 11), (10, 10)),
+            (&k2, (20, 20), (20, 20))
+        ]
+    );
     assert_eq!(c.get(&k1).await.unwrap(), (11, 11));
     assert_eq!(c.get(&k2).await.unwrap(), (20, 20));
     assert_eq!(c.get(&k3).await.unwrap(), (30, 30));
@@ -1120,7 +1136,7 @@ async fn set_all_on_instance_if_supports_partial_success() {
         .await
         .unwrap();
 
-    assert_eq!(results, vec![(&k2, 3, 0), (&k1, 12, 7)]);
+    assert_eq!(results, vec![(&k2, (3, 0), (3, 0)), (&k1, (12, 7), (9, 4))]);
     assert_eq!(c2.get(&k1).await.unwrap().0, 12);
     assert_eq!(c2.get(&k2).await.unwrap(), (3, 3));
 
