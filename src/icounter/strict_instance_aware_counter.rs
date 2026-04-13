@@ -782,34 +782,76 @@ impl StrictInstanceAwareCounter {
             return Ok(vec![]);
         }
 
-        self.activity.signal();
-
-        let mut conn = self.connection_manager.clone();
         let mut processed = 0;
         let mut output: Vec<(String, i64, i64)> = Vec::with_capacity(increments.len());
 
         while processed < increments.len() {
             let end = (processed + max_batch_size).min(increments.len());
             let chunk = &increments[processed..end];
+            let conditional_chunk: Vec<(&RedisKey, CounterComparator, i64)> = chunk
+                .iter()
+                .map(|(key, delta)| (key, CounterComparator::Nil, *delta))
+                .collect();
+            let chunk_results = self.inc_if_batch(&conditional_chunk).await?;
 
-            // Results: (counter_key, cumulative, inst_count, redis_epoch, instance_created, matched)
+            output.extend(
+                chunk_results
+                    .into_iter()
+                    .map(|(key, cumulative, inst_count)| (key.to_string(), cumulative, inst_count)),
+            );
+
+            processed = end;
+        }
+
+        // All chunks succeeded — drain entire input.
+        increments.drain(..processed);
+
+        Ok(output)
+    }
+
+    pub(crate) async fn inc_if_batch<'k>(
+        &self,
+        updates: &[(&'k RedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        if updates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        self.activity.signal();
+
+        let mut conn = self.connection_manager.clone();
+        let mut processed = 0;
+        let mut output = Vec::with_capacity(updates.len());
+
+        while processed < updates.len() {
+            let mut seen = HashSet::new();
+            let mut end = processed;
+            while end < updates.len() && seen.insert(updates[end].0.as_str()) {
+                end += 1;
+            }
+
+            let chunk = &updates[processed..end];
             let script = &self.inc_script;
+            let local_epochs: Vec<u64> = chunk
+                .iter()
+                .map(|(key, _, _)| self.get_local_epoch(key))
+                .collect();
+
             let chunk_results: Vec<(String, i64, i64, u64, i64, i64)> =
-                execute_pipeline_with_script_retry(&mut conn, script, chunk, |item| {
-                    let (key, delta) = item;
-                    let local_epoch = self.get_local_epoch(key);
-                    let local_count = self.get_local_count(key);
+                execute_pipeline_with_script_retry(&mut conn, script, chunk, |update| {
+                    let (key, comparator, delta) = update;
+                    let (lua_comparator, compare_against) = comparator.as_lua_parts();
                     let mut inv = script.key(self.epoch_key());
                     inv.key(self.instances_key());
                     inv.key(self.cumulative_key());
                     inv.key(self.keys_key());
                     inv.key(self.inst_count_key());
                     inv.arg(key.as_str());
-                    inv.arg("nil");
-                    inv.arg(0);
+                    inv.arg(lua_comparator);
+                    inv.arg(compare_against);
                     inv.arg(*delta);
-                    inv.arg(local_epoch);
-                    inv.arg(local_count);
+                    inv.arg(self.get_local_epoch(key));
+                    inv.arg(self.get_local_count(key));
                     inv.arg(self.dead_instance_threshold_ms);
                     inv.arg(self.prefix_str());
                     inv.arg(&self.instance_id);
@@ -817,18 +859,23 @@ impl StrictInstanceAwareCounter {
                 })
                 .await?;
 
-            for (key_str, cumulative, inst_count, redis_epoch, _, _) in chunk_results {
-                if let Ok(key) = RedisKey::try_from(key_str.clone()) {
-                    self.update_local_store(&key, redis_epoch, cumulative, inst_count);
+            for (
+                ((key, _, _), local_epoch),
+                (_, cumulative, inst_count, redis_epoch, _, matched_raw),
+            ) in chunk
+                .iter()
+                .zip(local_epochs.iter())
+                .zip(chunk_results.into_iter())
+            {
+                if matched_raw != 0 || *local_epoch == redis_epoch {
+                    self.update_local_store(key, redis_epoch, cumulative, inst_count);
                 }
-                output.push((key_str, cumulative, inst_count));
+
+                output.push((*key, cumulative, inst_count));
             }
 
             processed = end;
         }
-
-        // All chunks succeeded — drain entire input.
-        increments.drain(..processed);
 
         Ok(output)
     }
@@ -1684,6 +1731,25 @@ impl InstanceAwareCounterTrait for StrictInstanceAwareCounter {
     ) -> Result<Vec<(&'k RedisKey, i64)>, DistkitError> {
         let pairs = self.get_batch(keys).await?;
         Ok(pairs.into_iter().map(|(k, _, inst)| (k, inst)).collect())
+    }
+
+    async fn inc_all<'k>(
+        &self,
+        updates: &[(&'k RedisKey, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&RedisKey, CounterComparator, i64)> = updates
+            .iter()
+            .map(|(key, count)| (*key, CounterComparator::Nil, *count))
+            .collect();
+
+        self.inc_all_if(&conditional_updates).await
+    }
+
+    async fn inc_all_if<'k>(
+        &self,
+        updates: &[(&'k RedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k RedisKey, i64, i64)>, DistkitError> {
+        self.inc_if_batch(updates).await
     }
 
     async fn set_all<'k>(
