@@ -4,17 +4,16 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use distkit::DistkitRedisKey;
 use distkit::counter::{CounterOptions, LaxCounter, StrictCounter};
 use distkit::icounter::{
     LaxInstanceAwareCounter, LaxInstanceAwareCounterOptions, StrictInstanceAwareCounter,
     StrictInstanceAwareCounterOptions,
 };
-use distkit::RedisKey;
 use redis::aio::ConnectionManager;
 
 pub async fn make_connection() -> ConnectionManager {
-    let url = std::env::var("REDIS_URL")
-        .expect("REDIS_URL must be set — run via `make bench`");
+    let url = std::env::var("REDIS_URL").expect("REDIS_URL must be set — run via `make bench`");
     let client = redis::Client::open(url).expect("REDIS_URL is not a valid Redis URL");
     client
         .get_connection_manager()
@@ -48,9 +47,9 @@ pub async fn make_lax_counter(bench_name: &str) -> Arc<LaxCounter> {
     LaxCounter::new(CounterOptions::new(bench_prefix(bench_name), conn))
 }
 
-/// Builds a `RedisKey` from a plain name string.
-pub fn key(name: &str) -> RedisKey {
-    RedisKey::try_from(name.to_string())
+/// Builds a `DistkitRedisKey` from a plain name string.
+pub fn key(name: &str) -> DistkitRedisKey {
+    DistkitRedisKey::try_from(name.to_string())
         .expect("bench key must be non-empty, ≤255 chars, and colon-free")
 }
 
@@ -58,11 +57,11 @@ pub fn key(name: &str) -> RedisKey {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn bench_prefix(bench_name: &str) -> RedisKey {
+fn bench_prefix(bench_name: &str) -> DistkitRedisKey {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    RedisKey::try_from(format!("bench_{}_{}", ts, bench_name))
+    DistkitRedisKey::try_from(format!("bench_{}_{}", ts, bench_name))
         .expect("constructed bench prefix is always valid")
 }

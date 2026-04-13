@@ -332,12 +332,13 @@ dependencies = [
 
 [[package]]
 name = "distkit"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "criterion",
  "dashmap",
  "redis",
+ "regex",
  "strum",
  "strum_macros",
  "thiserror",

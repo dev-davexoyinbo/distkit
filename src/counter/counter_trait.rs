@@ -1,4 +1,4 @@
-use crate::{DistkitError, RedisKey};
+use crate::{CounterComparator, DistkitError, DistkitRedisKey};
 
 /// Async interface for distributed counter operations.
 ///
@@ -15,11 +15,11 @@ pub trait CounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # use distkit::{DistkitRedisKey, counter::CounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_counter().await?;
-    /// let key = RedisKey::try_from("visits".to_string())?;
+    /// let key = DistkitRedisKey::try_from("visits".to_string())?;
     /// assert_eq!(counter.inc(&key, 1).await?, 1);
     /// assert_eq!(counter.inc(&key, 9).await?, 10);
     /// // Negative count is the same as calling dec.
@@ -27,7 +27,45 @@ pub trait CounterTrait {
     /// # Ok(())
     /// # }
     /// ```
-    async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError>;
+    async fn inc(&self, key: &DistkitRedisKey, count: i64) -> Result<i64, DistkitError>;
+
+    /// Conditionally increments the counter by `count` when the current value
+    /// satisfies `comparator`.
+    ///
+    /// Returns the updated total on success, or the current total unchanged
+    /// when the condition fails.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{CounterComparator, DistkitRedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::strict_counter().await?;
+    /// let key = DistkitRedisKey::try_from("inventory".to_string())?;
+    /// counter.set(&key, 10).await?;
+    ///
+    /// assert_eq!(
+    ///     counter.inc_if(&key, CounterComparator::Eq(10), 5).await?,
+    ///     15
+    /// );
+    /// assert_eq!(
+    ///     counter.inc_if(&key, CounterComparator::Lt(10), 5).await?,
+    ///     15
+    /// );
+    /// assert_eq!(
+    ///     counter.inc_if(&key, CounterComparator::Nil, 5).await?,
+    ///     20
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn inc_if(
+        &self,
+        key: &DistkitRedisKey,
+        comparator: CounterComparator,
+        count: i64,
+    ) -> Result<i64, DistkitError>;
 
     /// Decrements the counter by `count` and returns the new total.
     ///
@@ -36,11 +74,11 @@ pub trait CounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # use distkit::{DistkitRedisKey, counter::CounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_counter().await?;
-    /// let key = RedisKey::try_from("tokens".to_string())?;
+    /// let key = DistkitRedisKey::try_from("tokens".to_string())?;
     /// counter.set(&key, 10).await?;
     /// assert_eq!(counter.dec(&key, 3).await?, 7);
     /// // Counters can go negative.
@@ -48,7 +86,7 @@ pub trait CounterTrait {
     /// # Ok(())
     /// # }
     /// ```
-    async fn dec(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError>;
+    async fn dec(&self, key: &DistkitRedisKey, count: i64) -> Result<i64, DistkitError>;
 
     /// Returns the current value of the counter, or `0` if the key does not
     /// exist.
@@ -56,11 +94,11 @@ pub trait CounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # use distkit::{DistkitRedisKey, counter::CounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_counter().await?;
-    /// let key = RedisKey::try_from("visits".to_string())?;
+    /// let key = DistkitRedisKey::try_from("visits".to_string())?;
     /// // A key that does not exist returns 0.
     /// assert_eq!(counter.get(&key).await?, 0);
     /// counter.inc(&key, 5).await?;
@@ -68,7 +106,7 @@ pub trait CounterTrait {
     /// # Ok(())
     /// # }
     /// ```
-    async fn get(&self, key: &RedisKey) -> Result<i64, DistkitError>;
+    async fn get(&self, key: &DistkitRedisKey) -> Result<i64, DistkitError>;
 
     /// Sets the counter to an exact value, overwriting any previous state.
     /// Returns the value that was set.
@@ -76,11 +114,11 @@ pub trait CounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # use distkit::{DistkitRedisKey, counter::CounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_counter().await?;
-    /// let key = RedisKey::try_from("inventory".to_string())?;
+    /// let key = DistkitRedisKey::try_from("inventory".to_string())?;
     /// counter.inc(&key, 1000).await?;
     /// // Overwrite with an authoritative count.
     /// assert_eq!(counter.set(&key, 850).await?, 850);
@@ -88,7 +126,45 @@ pub trait CounterTrait {
     /// # Ok(())
     /// # }
     /// ```
-    async fn set(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError>;
+    async fn set(&self, key: &DistkitRedisKey, count: i64) -> Result<i64, DistkitError>;
+
+    /// Conditionally sets the counter to `count` when the current value
+    /// satisfies `comparator`.
+    ///
+    /// Returns the value after evaluation: `count` when the write applied, or
+    /// the current total unchanged when the condition failed.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{CounterComparator, DistkitRedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::strict_counter().await?;
+    /// let key = DistkitRedisKey::try_from("inventory".to_string())?;
+    /// counter.set(&key, 10).await?;
+    ///
+    /// assert_eq!(
+    ///     counter.set_if(&key, CounterComparator::Gt(5), 25).await?,
+    ///     25
+    /// );
+    /// assert_eq!(
+    ///     counter.set_if(&key, CounterComparator::Eq(10), 50).await?,
+    ///     25
+    /// );
+    /// assert_eq!(
+    ///     counter.set_if(&key, CounterComparator::Nil, 40).await?,
+    ///     40
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn set_if(
+        &self,
+        key: &DistkitRedisKey,
+        comparator: CounterComparator,
+        count: i64,
+    ) -> Result<i64, DistkitError>;
 
     /// Deletes the counter and returns the value it held before deletion.
     /// Returns `0` if the key did not exist.
@@ -96,11 +172,11 @@ pub trait CounterTrait {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # use distkit::{DistkitRedisKey, counter::CounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_counter().await?;
-    /// let key = RedisKey::try_from("session".to_string())?;
+    /// let key = DistkitRedisKey::try_from("session".to_string())?;
     /// counter.set(&key, 42).await?;
     /// assert_eq!(counter.del(&key).await?, 42);
     /// // After deletion the key reads back as 0.
@@ -110,19 +186,19 @@ pub trait CounterTrait {
     /// # Ok(())
     /// # }
     /// ```
-    async fn del(&self, key: &RedisKey) -> Result<i64, DistkitError>;
+    async fn del(&self, key: &DistkitRedisKey) -> Result<i64, DistkitError>;
 
     /// Removes all counters under the current prefix.
     ///
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::{RedisKey, counter::CounterTrait};
+    /// # use distkit::{DistkitRedisKey, counter::CounterTrait};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_counter().await?;
-    /// let k1 = RedisKey::try_from("a".to_string())?;
-    /// let k2 = RedisKey::try_from("b".to_string())?;
+    /// let k1 = DistkitRedisKey::try_from("a".to_string())?;
+    /// let k2 = DistkitRedisKey::try_from("b".to_string())?;
     /// counter.set(&k1, 10).await?;
     /// counter.set(&k2, 20).await?;
     /// counter.clear().await?;
@@ -132,4 +208,114 @@ pub trait CounterTrait {
     /// # }
     /// ```
     async fn clear(&self) -> Result<(), DistkitError>;
+
+    /// Returns `(key, value)` for each key in `keys`, in the same order.
+    /// A missing key returns `(key, 0)`.
+    async fn get_all<'k>(
+        &self,
+        keys: &[&'k DistkitRedisKey],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError>;
+
+    /// Increments each `(key, delta)` pair and returns `(key, new_total)` in
+    /// the same order.
+    ///
+    /// Duplicate keys are processed sequentially in input order, so later
+    /// entries observe earlier same-call updates.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{DistkitRedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::strict_counter().await?;
+    /// let k1 = DistkitRedisKey::try_from("a".to_string())?;
+    /// let k2 = DistkitRedisKey::try_from("b".to_string())?;
+    ///
+    /// let results = counter.inc_all(&[(&k1, 3), (&k2, 5)]).await?;
+    ///
+    /// assert_eq!(results, vec![(&k1, 3), (&k2, 5)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn inc_all<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError>;
+
+    /// Conditionally increments each `(key, delta)` pair when the current
+    /// value satisfies the corresponding comparator.
+    ///
+    /// Each tuple is `(key, comparator, delta)`. Evaluation is per-item,
+    /// results preserve input order, and duplicate keys are processed
+    /// sequentially in input order. Use [`CounterComparator::Nil`] for
+    /// unconditional entries in a mixed batch.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{CounterComparator, DistkitRedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::strict_counter().await?;
+    /// let k1 = DistkitRedisKey::try_from("a".to_string())?;
+    /// let k2 = DistkitRedisKey::try_from("b".to_string())?;
+    /// counter.set(&k1, 10).await?;
+    ///
+    /// let results = counter
+    ///     .inc_all_if(&[
+    ///         (&k1, CounterComparator::Eq(10), 5),
+    ///         (&k2, CounterComparator::Nil, 2),
+    ///     ])
+    ///     .await?;
+    ///
+    /// assert_eq!(results, vec![(&k1, 15), (&k2, 2)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn inc_all_if<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError>;
+
+    /// Sets each `(key, count)` pair and returns `(key, count)` in the same
+    /// order. Semantics match `set` for each individual key.
+    async fn set_all<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError>;
+
+    /// Conditionally sets each `(key, count)` pair when the current value
+    /// satisfies the corresponding comparator.
+    ///
+    /// Each tuple is `(key, comparator, count)`. Evaluation is per-item and
+    /// results preserve input order. Use [`CounterComparator::Nil`] for
+    /// unconditional entries in a mixed batch.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use distkit::{CounterComparator, DistkitRedisKey, counter::CounterTrait};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let counter = distkit::__doctest_helpers::strict_counter().await?;
+    /// let k1 = DistkitRedisKey::try_from("a".to_string())?;
+    /// let k2 = DistkitRedisKey::try_from("b".to_string())?;
+    /// counter.set(&k1, 10).await?;
+    ///
+    /// let results = counter
+    ///     .set_all_if(&[
+    ///         (&k1, CounterComparator::Eq(10), 15),
+    ///         (&k2, CounterComparator::Nil, 20),
+    ///     ])
+    ///     .await?;
+    ///
+    /// assert_eq!(results, vec![(&k1, 15), (&k2, 20)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn set_all_if<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError>;
 }

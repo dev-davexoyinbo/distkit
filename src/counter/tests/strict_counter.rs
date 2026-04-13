@@ -1,4 +1,4 @@
-use crate::counter::CounterTrait;
+use crate::{CounterComparator, counter::CounterTrait};
 
 use super::common::{key, make_strict_counter};
 
@@ -68,9 +68,9 @@ async fn chained_inc_and_dec() {
     let k = key("score");
 
     counter.inc(&k, 10).await.unwrap(); // 10
-    counter.dec(&k, 3).await.unwrap();  // 7
-    counter.inc(&k, 5).await.unwrap();  // 12
-    counter.dec(&k, 2).await.unwrap();  // 10
+    counter.dec(&k, 3).await.unwrap(); // 7
+    counter.inc(&k, 5).await.unwrap(); // 12
+    counter.dec(&k, 2).await.unwrap(); // 10
 
     let total = counter.get(&k).await.unwrap();
     assert_eq!(total, 10);
@@ -306,4 +306,117 @@ async fn clear_does_not_affect_other_prefixes() {
     counter_a.clear().await.unwrap();
 
     assert_eq!(counter_b.get(&k).await.unwrap(), 99);
+}
+
+#[tokio::test]
+async fn inc_if_uses_all_comparators() {
+    let cases = [
+        ("eq", CounterComparator::Eq(10), true),
+        ("lt", CounterComparator::Lt(11), true),
+        ("gt", CounterComparator::Gt(10), false),
+        ("ne", CounterComparator::Ne(9), true),
+        ("nil", CounterComparator::Nil, true),
+    ];
+
+    for (suffix, comparator, should_apply) in cases {
+        let counter = make_strict_counter(&format!("test_inc_if_{suffix}")).await;
+        let k = key("conditional");
+        counter.set(&k, 10).await.unwrap();
+
+        let result = counter.inc_if(&k, comparator, 2).await.unwrap();
+        let expected = if should_apply { 12 } else { 10 };
+
+        assert_eq!(result, expected);
+        assert_eq!(counter.get(&k).await.unwrap(), expected);
+    }
+}
+
+#[tokio::test]
+async fn inc_all_empty_and_inc_all_if_empty_return_empty() {
+    let counter = make_strict_counter("test_inc_all_empty").await;
+    assert_eq!(counter.inc_all(&[]).await.unwrap(), vec![]);
+    assert_eq!(counter.inc_all_if(&[]).await.unwrap(), vec![]);
+}
+
+#[tokio::test]
+async fn inc_all_supports_duplicate_keys_sequentially() {
+    let counter = make_strict_counter("test_inc_all_duplicates").await;
+    let k = key("hits");
+
+    let results = counter.inc_all(&[(&k, 1), (&k, 2)]).await.unwrap();
+
+    assert_eq!(results, vec![(&k, 1), (&k, 3)]);
+    assert_eq!(counter.get(&k).await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn inc_all_if_supports_partial_success_missing_keys_and_duplicates() {
+    let counter = make_strict_counter("test_inc_all_if_ordered").await;
+    let k1 = key("a");
+    let k2 = key("b");
+
+    counter.set(&k1, 0).await.unwrap();
+    counter.set(&k2, 10).await.unwrap();
+
+    let results = counter
+        .inc_all_if(&[
+            (&k1, CounterComparator::Eq(0), 1),
+            (&k1, CounterComparator::Eq(1), 2),
+            (&k2, CounterComparator::Gt(20), 5),
+            (&k2, CounterComparator::Nil, 3),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(results, vec![(&k1, 1), (&k1, 3), (&k2, 10), (&k2, 13)]);
+    assert_eq!(counter.get(&k1).await.unwrap(), 3);
+    assert_eq!(counter.get(&k2).await.unwrap(), 13);
+}
+
+#[tokio::test]
+async fn set_if_uses_all_comparators() {
+    let cases = [
+        ("eq", CounterComparator::Eq(10), true),
+        ("lt", CounterComparator::Lt(11), true),
+        ("gt", CounterComparator::Gt(10), false),
+        ("ne", CounterComparator::Ne(9), true),
+        ("nil", CounterComparator::Nil, true),
+    ];
+
+    for (suffix, comparator, should_apply) in cases {
+        let counter = make_strict_counter(&format!("test_set_if_{suffix}")).await;
+        let k = key("conditional");
+        counter.set(&k, 10).await.unwrap();
+
+        let result = counter.set_if(&k, comparator, 99).await.unwrap();
+        let expected = if should_apply { 99 } else { 10 };
+
+        assert_eq!(result, expected);
+        assert_eq!(counter.get(&k).await.unwrap(), expected);
+    }
+}
+
+#[tokio::test]
+async fn set_all_if_supports_partial_success_and_missing_keys() {
+    let counter = make_strict_counter("test_set_all_if_partial").await;
+    let k1 = key("a");
+    let k2 = key("b");
+    let k3 = key("c");
+
+    counter.set(&k1, 10).await.unwrap();
+    counter.set(&k2, 20).await.unwrap();
+
+    let results = counter
+        .set_all_if(&[
+            (&k3, CounterComparator::Nil, 30),
+            (&k1, CounterComparator::Gt(5), 11),
+            (&k2, CounterComparator::Lt(10), 99),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(results, vec![(&k3, 30), (&k1, 11), (&k2, 20)]);
+    assert_eq!(counter.get(&k1).await.unwrap(), 11);
+    assert_eq!(counter.get(&k2).await.unwrap(), 20);
+    assert_eq!(counter.get(&k3).await.unwrap(), 30);
 }

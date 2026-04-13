@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use redis::aio::ConnectionManager;
 
-use crate::RedisKey;
+use crate::DistkitRedisKey;
 use crate::icounter::{StrictInstanceAwareCounter, StrictInstanceAwareCounterOptions};
 
 static RUN_ID: OnceLock<u128> = OnceLock::new();
@@ -30,7 +30,7 @@ pub async fn make_counter(prefix: &str) -> Arc<StrictInstanceAwareCounter> {
     let conn = make_connection().await;
     let unique_prefix = format!("{}_{}", run_id(), prefix);
     StrictInstanceAwareCounter::new(StrictInstanceAwareCounterOptions::new(
-        RedisKey::from(unique_prefix),
+        DistkitRedisKey::from(unique_prefix),
         conn,
     ))
 }
@@ -43,7 +43,7 @@ pub async fn make_counter_with_opts(
     let conn = make_connection().await;
     let unique_prefix = format!("{}_{}", run_id(), prefix);
     StrictInstanceAwareCounter::new(StrictInstanceAwareCounterOptions {
-        prefix: RedisKey::from(unique_prefix),
+        prefix: DistkitRedisKey::from(unique_prefix),
         connection_manager: conn,
         dead_instance_threshold_ms: threshold_ms,
     })
@@ -61,11 +61,11 @@ pub async fn make_pair(
     let unique_prefix = format!("{}_{}", run_id(), prefix);
 
     let c1 = StrictInstanceAwareCounter::new(StrictInstanceAwareCounterOptions::new(
-        RedisKey::from(unique_prefix.clone()),
+        DistkitRedisKey::from(unique_prefix.clone()),
         conn1,
     ));
     let c2 = StrictInstanceAwareCounter::new(StrictInstanceAwareCounterOptions::new(
-        RedisKey::from(unique_prefix),
+        DistkitRedisKey::from(unique_prefix),
         conn2,
     ));
     (c1, c2)
@@ -83,7 +83,7 @@ pub async fn make_pair_with_opts(
     let unique_prefix = format!("{}_{}", run_id(), prefix);
 
     let opts = |conn| StrictInstanceAwareCounterOptions {
-        prefix: RedisKey::from(unique_prefix.clone()),
+        prefix: DistkitRedisKey::from(unique_prefix.clone()),
         connection_manager: conn,
         dead_instance_threshold_ms: threshold_ms,
     };
@@ -100,7 +100,10 @@ pub async fn make_n_counters(prefix: &str, n: usize) -> Vec<Arc<StrictInstanceAw
     for _ in 0..n {
         let conn = make_connection().await;
         counters.push(StrictInstanceAwareCounter::new(
-            StrictInstanceAwareCounterOptions::new(RedisKey::from(unique_prefix.clone()), conn),
+            StrictInstanceAwareCounterOptions::new(
+                DistkitRedisKey::from(unique_prefix.clone()),
+                conn,
+            ),
         ));
     }
     counters
@@ -117,7 +120,7 @@ pub async fn make_n_counters_with_opts(
         let conn = make_connection().await;
         counters.push(StrictInstanceAwareCounter::new(
             StrictInstanceAwareCounterOptions {
-                prefix: RedisKey::from(unique_prefix.clone()),
+                prefix: DistkitRedisKey::from(unique_prefix.clone()),
                 connection_manager: conn,
                 dead_instance_threshold_ms: threshold_ms,
             },
@@ -126,6 +129,6 @@ pub async fn make_n_counters_with_opts(
     counters
 }
 
-pub fn key(name: &str) -> RedisKey {
-    RedisKey::from(name.to_string())
+pub fn key(name: &str) -> DistkitRedisKey {
+    DistkitRedisKey::from(name.to_string())
 }

@@ -5,17 +5,22 @@
 //! key, contributing to a shared cumulative total. When an instance stops
 //! sending heartbeats, its contribution is automatically removed.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicI64, AtomicU64, Ordering},
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc,
+        atomic::{AtomicI64, AtomicU64, Ordering},
+    },
 };
 
 use dashmap::DashMap;
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
-    ActivityTracker, EPOCH_CHANGE_INTERVAL, RedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
+    ActivityTracker, CounterComparator, DistkitRedisKey, EPOCH_CHANGE_INTERVAL, RedisKeyGenerator,
+    RedisKeyGeneratorTypeKey,
     error::DistkitError,
+    execute_pipeline_with_script_retry,
     icounter::{InstanceAwareCounterTrait, generate_instance_id},
 };
 
@@ -42,6 +47,8 @@ impl SingleStore {
         }
     }
 }
+
+const MAX_BATCH_SIZE: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Lua helpers — prepended to all scripts except `clear`
@@ -84,6 +91,22 @@ local function check_and_zadd(instances_key, instance_id, ts)
     redis.call('ZADD', instances_key, ts, instance_id)
     return created
 end
+
+local function compare_values(current, comparator, expected)
+    if comparator == 'nil' then
+        return true
+    elseif comparator == 'eq' then
+        return current == expected
+    elseif comparator == 'lt' then
+        return current < expected
+    elseif comparator == 'gt' then
+        return current > expected
+    elseif comparator == 'ne' then
+        return current ~= expected
+    end
+
+    return false
+end
 "#;
 
 // ---------------------------------------------------------------------------
@@ -98,11 +121,14 @@ local keys_key       = KEYS[4]
 local inst_count_key = KEYS[5]
 
 local counter_key    = ARGV[1]
-local delta          = tonumber(ARGV[2])
-local local_epoch    = tonumber(ARGV[3])
-local dead_threshold = tonumber(ARGV[4])
-local prefix         = ARGV[5]
-local instance_id    = ARGV[6]
+local comparator     = ARGV[2]
+local compare_against = tonumber(ARGV[3])
+local delta          = tonumber(ARGV[4])
+local local_epoch    = tonumber(ARGV[5])
+local local_count    = tonumber(ARGV[6]) or 0
+local dead_threshold = tonumber(ARGV[7])
+local prefix         = ARGV[8]
+local instance_id    = ARGV[9]
 
 local ts = now_ms()
 local instance_created = check_and_zadd(instances_key, instance_id, ts)
@@ -110,6 +136,19 @@ delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_thre
 
 local redis_epoch = tonumber(redis.call('HGET', epoch_key, counter_key) or 0) or 0
 local is_stale    = (local_epoch ~= redis_epoch)
+local cumulative  = tonumber(redis.call('HGET', cumulative_key, counter_key) or 0) or 0
+local inst_count  = tonumber(redis.call('HGET', inst_count_key, counter_key) or 0) or 0
+
+if instance_created ~= 0 and not is_stale and local_count > 0 then
+    redis.call('HSET', inst_count_key, counter_key, local_count)
+    cumulative = tonumber(redis.call('HINCRBY', cumulative_key, counter_key, local_count))
+    inst_count = local_count
+    redis.call('SADD', keys_key, counter_key)
+end
+
+if not compare_values(cumulative, comparator, compare_against) then
+    return {counter_key, cumulative, inst_count, redis_epoch, instance_created, 0}
+end
 
 local new_inst_count
 if is_stale then
@@ -122,7 +161,7 @@ end
 local new_cumulative = tonumber(redis.call('HINCRBY', cumulative_key, counter_key, delta))
 redis.call('SADD', keys_key, counter_key)
 
-return {counter_key, new_cumulative, new_inst_count, redis_epoch, instance_created}
+return {counter_key, new_cumulative, new_inst_count, redis_epoch, instance_created, 1}
 "#;
 
 const SET_LUA: &str = r#"
@@ -133,19 +172,37 @@ local keys_key       = KEYS[4]
 local inst_count_key = KEYS[5]
 
 local counter_key    = ARGV[1]
-local count          = tonumber(ARGV[2])
-local local_epoch    = tonumber(ARGV[3])
-local dead_threshold = tonumber(ARGV[4])
-local prefix         = ARGV[5]
-local instance_id    = ARGV[6]
-local max_epoch      = tonumber(ARGV[7])
+local comparator     = ARGV[2]
+local compare_against = tonumber(ARGV[3])
+local count          = tonumber(ARGV[4])
+local local_epoch    = tonumber(ARGV[5])
+local local_count    = tonumber(ARGV[6]) or 0
+local dead_threshold = tonumber(ARGV[7])
+local prefix         = ARGV[8]
+local instance_id    = ARGV[9]
+local max_epoch      = tonumber(ARGV[10])
 
 local ts = now_ms()
 local instance_created = check_and_zadd(instances_key, instance_id, ts)
 delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts)
 
-local old_epoch = tonumber(redis.call('HGET', epoch_key, counter_key) or 0) or 0
-local new_epoch = old_epoch + 1
+local redis_epoch = tonumber(redis.call('HGET', epoch_key, counter_key) or 0) or 0
+local cumulative  = tonumber(redis.call('HGET', cumulative_key, counter_key) or 0) or 0
+local inst_count  = tonumber(redis.call('HGET', inst_count_key, counter_key) or 0) or 0
+local is_stale    = (local_epoch ~= redis_epoch)
+
+if instance_created ~= 0 and not is_stale and local_count > 0 then
+    redis.call('HSET', inst_count_key, counter_key, local_count)
+    cumulative = tonumber(redis.call('HINCRBY', cumulative_key, counter_key, local_count))
+    inst_count = local_count
+    redis.call('SADD', keys_key, counter_key)
+end
+
+if not compare_values(cumulative, comparator, compare_against) then
+    return {counter_key, cumulative, inst_count, redis_epoch, instance_created, 0}
+end
+
+local new_epoch = redis_epoch + 1
 if new_epoch > max_epoch then
     new_epoch = 0
 end
@@ -155,7 +212,7 @@ redis.call('HSET', cumulative_key, counter_key, count)
 redis.call('HSET', inst_count_key, counter_key, count)
 redis.call('SADD', keys_key,       counter_key)
 
-return {count, count, new_epoch, instance_created}
+return {counter_key, count, count, new_epoch, instance_created, 1}
 "#;
 
 const SET_ON_INSTANCE_LUA: &str = r#"
@@ -166,11 +223,14 @@ local keys_key       = KEYS[4]
 local inst_count_key = KEYS[5]
 
 local counter_key    = ARGV[1]
-local count          = tonumber(ARGV[2])
-local local_epoch    = tonumber(ARGV[3])
-local dead_threshold = tonumber(ARGV[4])
-local prefix         = ARGV[5]
-local instance_id    = ARGV[6]
+local comparator     = ARGV[2]
+local compare_against = tonumber(ARGV[3])
+local count          = tonumber(ARGV[4])
+local local_epoch    = tonumber(ARGV[5])
+local local_count    = tonumber(ARGV[6]) or 0
+local dead_threshold = tonumber(ARGV[7])
+local prefix         = ARGV[8]
+local instance_id    = ARGV[9]
 
 local ts = now_ms()
 local instance_created = check_and_zadd(instances_key, instance_id, ts)
@@ -178,16 +238,27 @@ delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_thre
 
 local redis_epoch = tonumber(redis.call('HGET', epoch_key, counter_key) or 0) or 0
 local inst_count  = tonumber(redis.call('HGET', inst_count_key, counter_key) or 0) or 0
+local cumulative  = tonumber(redis.call('HGET', cumulative_key, counter_key) or 0) or 0
 local is_stale    = (local_epoch ~= redis_epoch)
 
-local effective_old = is_stale and 0 or inst_count
-local delta = count - effective_old
+if instance_created ~= 0 and not is_stale and local_count > 0 then
+    redis.call('HSET', inst_count_key, counter_key, local_count)
+    cumulative = tonumber(redis.call('HINCRBY', cumulative_key, counter_key, local_count))
+    inst_count = local_count
+    redis.call('SADD', keys_key, counter_key)
+end
 
+local current_inst_count = is_stale and 0 or inst_count
+if not compare_values(current_inst_count, comparator, compare_against) then
+    return {counter_key, cumulative, current_inst_count, redis_epoch, instance_created, 0}
+end
+
+local delta = count - current_inst_count
 redis.call('HSET', inst_count_key, counter_key, count)
 local new_cumulative = tonumber(redis.call('HINCRBY', cumulative_key, counter_key, delta))
 redis.call('SADD', keys_key, counter_key)
 
-return {new_cumulative, count, redis_epoch, instance_created}
+return {counter_key, new_cumulative, count, redis_epoch, instance_created, 1}
 "#;
 
 const GET_LUA: &str = r#"
@@ -211,7 +282,7 @@ local redis_epoch = tonumber(redis.call('HGET', epoch_key, counter_key) or 0) or
 local cumulative  = tonumber(redis.call('HGET', cumulative_key, counter_key) or 0) or 0
 local inst_count  = tonumber(redis.call('HGET', inst_count_key, counter_key) or 0) or 0
 
-return {cumulative, inst_count, redis_epoch, instance_created}
+return {counter_key, cumulative, inst_count, redis_epoch, instance_created}
 "#;
 
 const DEL_LUA: &str = r#"
@@ -383,7 +454,7 @@ return {counter_key, new_cumulative, new_inst_count, redis_epoch}
 #[derive(Debug, Clone)]
 pub struct StrictInstanceAwareCounterOptions {
     /// Redis key prefix used to namespace all counter keys.
-    pub prefix: RedisKey,
+    pub prefix: DistkitRedisKey,
     /// Redis connection manager.
     pub connection_manager: ConnectionManager,
     /// Milliseconds without a heartbeat before an instance is considered dead.
@@ -397,7 +468,7 @@ impl StrictInstanceAwareCounterOptions {
     /// # Examples
     ///
     /// ```rust
-    /// use distkit::{RedisKey, icounter::StrictInstanceAwareCounterOptions};
+    /// use distkit::{DistkitRedisKey, icounter::StrictInstanceAwareCounterOptions};
     ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -405,13 +476,13 @@ impl StrictInstanceAwareCounterOptions {
     ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     /// let client = redis::Client::open(redis_url)?;
     /// let conn = client.get_connection_manager().await?;
-    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
     /// let opts = StrictInstanceAwareCounterOptions::new(prefix, conn);
     /// assert_eq!(opts.dead_instance_threshold_ms, 30_000);
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
+    pub fn new(prefix: DistkitRedisKey, connection_manager: ConnectionManager) -> Self {
         Self {
             prefix,
             connection_manager,
@@ -439,7 +510,7 @@ pub struct StrictInstanceAwareCounter {
     instance_id: String,
     dead_instance_threshold_ms: u64,
     /// Per-key in-memory state: epoch, last-seen cumulative, and this instance's count.
-    local_store: DashMap<RedisKey, SingleStore>,
+    local_store: DashMap<DistkitRedisKey, SingleStore>,
     /// Maximum epoch value before wrapping. Set to `u64::MAX / 2`.
     max_epoch: u64,
     inc_script: Script,
@@ -501,7 +572,7 @@ impl StrictInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// use distkit::{RedisKey, icounter::{StrictInstanceAwareCounter, StrictInstanceAwareCounterOptions}};
+    /// use distkit::{DistkitRedisKey, icounter::{StrictInstanceAwareCounter, StrictInstanceAwareCounterOptions}};
     ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -509,7 +580,7 @@ impl StrictInstanceAwareCounter {
     ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     /// let client = redis::Client::open(redis_url)?;
     /// let conn = client.get_connection_manager().await?;
-    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
     /// let counter = StrictInstanceAwareCounter::new(StrictInstanceAwareCounterOptions::new(prefix, conn));
     /// assert!(!counter.instance_id().is_empty());
     /// # Ok(())
@@ -584,21 +655,27 @@ impl StrictInstanceAwareCounter {
     // local_store helpers
     // -----------------------------------------------------------------------
 
-    fn get_local_epoch(&self, key: &RedisKey) -> u64 {
+    fn get_local_epoch(&self, key: &DistkitRedisKey) -> u64 {
         self.local_store
             .get(key)
             .map(|s| s.epoch.load(Ordering::Acquire))
             .unwrap_or(0)
     }
 
-    fn get_local_count(&self, key: &RedisKey) -> i64 {
+    fn get_local_count(&self, key: &DistkitRedisKey) -> i64 {
         self.local_store
             .get(key)
             .map(|s| s.local_count.load(Ordering::Acquire))
             .unwrap_or(0)
     }
 
-    fn update_local_store(&self, key: &RedisKey, epoch: u64, cumulative: i64, local_count: i64) {
+    fn update_local_store(
+        &self,
+        key: &DistkitRedisKey,
+        epoch: u64,
+        cumulative: i64,
+        local_count: i64,
+    ) {
         match self.local_store.get(key) {
             Some(s) => {
                 s.epoch.store(epoch, Ordering::Release);
@@ -650,44 +727,13 @@ impl StrictInstanceAwareCounter {
         });
     }
 
-    /// Builds a Redis pipeline with one `INC_IF_EPOCH_MATCHES_LUA` invocation per
-    /// item in `chunk`. `load_script = true` prepends a `LOAD SCRIPT` command to
-    /// handle cache misses (mirrors `LaxCounter::build_commit_pipeline`).
-    fn build_recovery_pipeline(
-        &self,
-        chunk: &[(RedisKey, i64, u64)],
-        load_script: bool,
-    ) -> redis::Pipeline {
-        let mut pipe = redis::Pipeline::new();
-        if load_script {
-            pipe.load_script(&self.inc_if_epoch_matches_script).ignore();
-        }
-        for (key, count, local_epoch) in chunk {
-            pipe.invoke_script(
-                self.inc_if_epoch_matches_script
-                    .key(self.epoch_key())
-                    .key(self.instances_key())
-                    .key(self.cumulative_key())
-                    .key(self.keys_key())
-                    .key(self.inst_count_key())
-                    .arg(key.as_str())
-                    .arg(*count)
-                    .arg(*local_epoch)
-                    .arg(self.dead_instance_threshold_ms)
-                    .arg(self.prefix_str())
-                    .arg(&self.instance_id),
-            );
-        }
-        pipe
-    }
-
     /// Sends recovery increments for all keys in `recoveries` using pipelined
     /// `INC_IF_EPOCH_MATCHES_LUA` calls, chunked to avoid oversized pipelines.
     /// After each chunk the returned `(key, cumulative, inst_count, redis_epoch)`
     /// tuples are used to update `local_store` before the next chunk begins.
     async fn recover_contributions_batched(
         &self,
-        recoveries: Vec<(RedisKey, i64, u64)>,
+        recoveries: Vec<(DistkitRedisKey, i64, u64)>,
         chunk_size: usize,
     ) -> Result<(), DistkitError> {
         if recoveries.is_empty() {
@@ -700,26 +746,29 @@ impl StrictInstanceAwareCounter {
         while processed < recoveries.len() {
             let end = (processed + chunk_size).min(recoveries.len());
             let chunk = &recoveries[processed..end];
+            let script = &self.inc_if_epoch_matches_script;
 
-            let results: Vec<(String, i64, i64, i64)> = {
-                let pipe = self.build_recovery_pipeline(chunk, false);
-                match pipe.query_async(&mut conn).await {
-                    Ok(r) => r,
-                    Err(err) => {
-                        if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript)
-                        {
-                            return Err(DistkitError::RedisError(err));
-                        }
-                        // Script not in cache — reload and retry.
-                        let pipe = self.build_recovery_pipeline(chunk, true);
-                        pipe.query_async(&mut conn).await?
-                    }
-                }
-            };
+            let results: Vec<(String, i64, i64, i64)> =
+                execute_pipeline_with_script_retry(&mut conn, script, chunk, |item| {
+                    let (key, count, local_epoch) = item;
+                    let mut inv = script.key(self.epoch_key());
+                    inv.key(self.instances_key());
+                    inv.key(self.cumulative_key());
+                    inv.key(self.keys_key());
+                    inv.key(self.inst_count_key());
+                    inv.arg(key.as_str());
+                    inv.arg(*count);
+                    inv.arg(*local_epoch);
+                    inv.arg(self.dead_instance_threshold_ms);
+                    inv.arg(self.prefix_str());
+                    inv.arg(&self.instance_id);
+                    inv
+                })
+                .await?;
 
             // Each result carries its own key — no zip required.
             for (key_str, cumulative, inst_count, redis_epoch) in results {
-                if let Ok(key) = RedisKey::try_from(key_str) {
+                if let Ok(key) = DistkitRedisKey::try_from(key_str) {
                     self.update_local_store(&key, redis_epoch as u64, cumulative, inst_count);
                 }
             }
@@ -730,113 +779,32 @@ impl StrictInstanceAwareCounter {
         Ok(())
     }
 
-    /// Builds a Redis pipeline with one `inc_script` invocation per item in
-    /// `chunk`. Because `INC_LUA` now echoes `counter_key` as its first return
-    /// element, results are self-identifying — no zip required.
-    fn build_inc_batch_pipeline(
+    pub(crate) async fn inc_batch(
         &self,
-        chunk: &[(RedisKey, i64)],
-        load_script: bool,
-    ) -> redis::Pipeline {
-        let mut pipe = redis::Pipeline::new();
-        if load_script {
-            pipe.load_script(&self.inc_script).ignore();
-        }
-        for (key, delta) in chunk {
-            let local_epoch = self.get_local_epoch(key);
-            pipe.invoke_script(
-                self.inc_script
-                    .key(self.epoch_key())
-                    .key(self.instances_key())
-                    .key(self.cumulative_key())
-                    .key(self.keys_key())
-                    .key(self.inst_count_key())
-                    .arg(key.as_str())
-                    .arg(*delta)
-                    .arg(local_epoch)
-                    .arg(self.dead_instance_threshold_ms)
-                    .arg(self.prefix_str())
-                    .arg(&self.instance_id),
-            );
-        }
-        pipe
-    }
-
-    /// Sends multiple increments in a pipelined batch, chunked to `max_batch_size` per
-    /// pipeline. Takes `&mut Vec` so successfully committed entries are drained
-    /// in-place; on failure the remaining entries stay in the vector for the
-    /// caller to retry.
-    ///
-    /// Returns `(counter_key, cumulative, instance_count)` for every entry that
-    /// was committed. Also updates `local_store` from each result.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use distkit::RedisKey;
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
-    /// let k1 = RedisKey::try_from("a".to_string())?;
-    /// let k2 = RedisKey::try_from("b".to_string())?;
-    /// let mut increments = vec![(k1, 3_i64), (k2, 7_i64)];
-    /// let results = counter.inc_batch(&mut increments, 50).await?;
-    /// // Successful entries are drained from the input vec.
-    /// assert!(increments.is_empty());
-    /// assert_eq!(results.len(), 2);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn inc_batch(
-        &self,
-        increments: &mut Vec<(RedisKey, i64)>,
+        increments: &mut Vec<(DistkitRedisKey, i64)>,
         max_batch_size: usize,
     ) -> Result<Vec<(String, i64, i64)>, DistkitError> {
         if increments.is_empty() {
             return Ok(vec![]);
         }
 
-        self.activity.signal();
-
-        let mut conn = self.connection_manager.clone();
         let mut processed = 0;
         let mut output: Vec<(String, i64, i64)> = Vec::with_capacity(increments.len());
 
         while processed < increments.len() {
             let end = (processed + max_batch_size).min(increments.len());
             let chunk = &increments[processed..end];
+            let conditional_chunk: Vec<(&DistkitRedisKey, CounterComparator, i64)> = chunk
+                .iter()
+                .map(|(key, delta)| (key, CounterComparator::Nil, *delta))
+                .collect();
+            let chunk_results = self.inc_if_batch(&conditional_chunk).await?;
 
-            // Build and run the pipeline inside a block so the `chunk` slice
-            // borrow ends before we potentially drain `increments`.
-            // Results: (counter_key, cumulative, inst_count, redis_epoch, instance_created)
-            let first_attempt = {
-                let pipe = self.build_inc_batch_pipeline(chunk, false);
-                pipe.query_async::<Vec<(String, i64, i64, u64, i64)>>(&mut conn)
-                    .await
-            };
-
-            let chunk_results: Vec<(String, i64, i64, u64, i64)> = match first_attempt {
-                Ok(r) => r,
-                Err(err) => {
-                    if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) {
-                        return Err(DistkitError::RedisError(err));
-                    }
-                    // Script not cached — reload and retry. After the drain the
-                    // current chunk is now at indices [0..chunk_len].
-                    let pipe = self.build_inc_batch_pipeline(chunk, true);
-                    match pipe.query_async(&mut conn).await {
-                        Ok(r) => r,
-                        Err(e) => return Err(DistkitError::RedisError(e)),
-                    }
-                }
-            };
-
-            for (key_str, cumulative, inst_count, redis_epoch, _) in chunk_results {
-                if let Ok(key) = RedisKey::try_from(key_str.clone()) {
-                    self.update_local_store(&key, redis_epoch, cumulative, inst_count);
-                }
-                output.push((key_str, cumulative, inst_count));
-            }
+            output.extend(
+                chunk_results
+                    .into_iter()
+                    .map(|(key, cumulative, inst_count)| (key.to_string(), cumulative, inst_count)),
+            );
 
             processed = end;
         }
@@ -845,6 +813,311 @@ impl StrictInstanceAwareCounter {
         increments.drain(..processed);
 
         Ok(output)
+    }
+
+    pub(crate) async fn inc_if_batch<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        if updates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        self.activity.signal();
+
+        let mut conn = self.connection_manager.clone();
+        let mut processed = 0;
+        let mut output = Vec::with_capacity(updates.len());
+
+        while processed < updates.len() {
+            let mut seen = HashSet::new();
+            let mut end = processed;
+            while end < updates.len() && seen.insert(updates[end].0.as_str()) {
+                end += 1;
+            }
+
+            let chunk = &updates[processed..end];
+            let script = &self.inc_script;
+            let local_epochs: Vec<u64> = chunk
+                .iter()
+                .map(|(key, _, _)| self.get_local_epoch(key))
+                .collect();
+
+            let chunk_results: Vec<(String, i64, i64, u64, i64, i64)> =
+                execute_pipeline_with_script_retry(&mut conn, script, chunk, |update| {
+                    let (key, comparator, delta) = update;
+                    let (lua_comparator, compare_against) = comparator.as_lua_parts();
+                    let mut inv = script.key(self.epoch_key());
+                    inv.key(self.instances_key());
+                    inv.key(self.cumulative_key());
+                    inv.key(self.keys_key());
+                    inv.key(self.inst_count_key());
+                    inv.arg(key.as_str());
+                    inv.arg(lua_comparator);
+                    inv.arg(compare_against);
+                    inv.arg(*delta);
+                    inv.arg(self.get_local_epoch(key));
+                    inv.arg(self.get_local_count(key));
+                    inv.arg(self.dead_instance_threshold_ms);
+                    inv.arg(self.prefix_str());
+                    inv.arg(&self.instance_id);
+                    inv
+                })
+                .await?;
+
+            for (
+                ((key, _, _), local_epoch),
+                (_, cumulative, inst_count, redis_epoch, _, matched_raw),
+            ) in chunk
+                .iter()
+                .zip(local_epochs.iter())
+                .zip(chunk_results.into_iter())
+            {
+                if matched_raw != 0 || *local_epoch == redis_epoch {
+                    self.update_local_store(key, redis_epoch, cumulative, inst_count);
+                }
+
+                output.push((*key, cumulative, inst_count));
+            }
+
+            processed = end;
+        }
+
+        Ok(output)
+    }
+
+    pub(crate) async fn get_batch<'k>(
+        &self,
+        keys: &[&'k DistkitRedisKey],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        self.activity.signal();
+
+        let mut conn = self.connection_manager.clone();
+        let mut map: HashMap<String, (i64, i64)> = HashMap::with_capacity(keys.len());
+        let mut recovery_keys: Vec<(DistkitRedisKey, i64)> = Vec::new();
+
+        let mut processed = 0;
+        while processed < keys.len() {
+            let end = (processed + MAX_BATCH_SIZE).min(keys.len());
+            let chunk = &keys[processed..end];
+            let script = &self.get_script;
+
+            let chunk_results: Vec<(String, i64, i64, u64, i64)> =
+                execute_pipeline_with_script_retry(&mut conn, script, chunk, |key| {
+                    let local_epoch = self.get_local_epoch(key);
+                    let mut inv = script.key(self.epoch_key());
+                    inv.key(self.instances_key());
+                    inv.key(self.cumulative_key());
+                    inv.key(self.keys_key());
+                    inv.key(self.inst_count_key());
+                    inv.arg(key.as_str());
+                    inv.arg(local_epoch);
+                    inv.arg(self.dead_instance_threshold_ms);
+                    inv.arg(self.prefix_str());
+                    inv.arg(&self.instance_id);
+                    inv
+                })
+                .await?;
+
+            for (key_str, cumulative, inst_count, redis_epoch, instance_created_raw) in
+                chunk_results
+            {
+                if let Ok(key) = DistkitRedisKey::try_from(key_str.clone()) {
+                    let instance_created = instance_created_raw != 0;
+                    let local_epoch = self.get_local_epoch(&key);
+                    let old_local_count = self.get_local_count(&key);
+                    self.update_local_store(&key, redis_epoch, cumulative, inst_count);
+                    if instance_created && local_epoch == redis_epoch && old_local_count > 0 {
+                        recovery_keys.push((key.clone(), old_local_count));
+                    }
+                    map.insert(key_str, (cumulative, inst_count));
+                }
+            }
+
+            processed = end;
+        }
+
+        // Sequential recovery fallback (rare: instance was cleaned up as dead).
+        for (key, old_count) in recovery_keys {
+            let (cumulative, inst_count) = self.inc(&key, old_count).await?;
+            map.insert(key.to_string(), (cumulative, inst_count));
+        }
+
+        Ok(keys
+            .iter()
+            .map(|k| {
+                let (cum, inst) = map.get(k.as_str()).copied().unwrap_or((0, 0));
+                (*k, cum, inst)
+            })
+            .collect())
+    }
+
+    pub(crate) async fn set_batch<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&DistkitRedisKey, CounterComparator, i64)> = updates
+            .iter()
+            .map(|(key, count)| (*key, CounterComparator::Nil, *count))
+            .collect();
+
+        self.set_if_batch(&conditional_updates).await
+    }
+
+    pub(crate) async fn set_if_batch<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        if updates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        self.activity.signal();
+
+        let mut conn = self.connection_manager.clone();
+        let mut map: HashMap<DistkitRedisKey, (i64, i64)> = HashMap::with_capacity(updates.len());
+        let mut processed = 0;
+
+        while processed < updates.len() {
+            let end = (processed + MAX_BATCH_SIZE).min(updates.len());
+            let chunk = &updates[processed..end];
+            let script = &self.set_script;
+            let local_epochs: HashMap<DistkitRedisKey, u64> = chunk
+                .iter()
+                .map(|(key, _, _)| ((*key).clone(), self.get_local_epoch(key)))
+                .collect();
+
+            let chunk_results: Vec<(String, i64, i64, u64, i64, i64)> =
+                execute_pipeline_with_script_retry(&mut conn, script, chunk, |update| {
+                    let (key, comparator, count) = update;
+                    let (lua_comparator, compare_against) = comparator.as_lua_parts();
+                    let mut inv = script.key(self.epoch_key());
+                    inv.key(self.instances_key());
+                    inv.key(self.cumulative_key());
+                    inv.key(self.keys_key());
+                    inv.key(self.inst_count_key());
+                    inv.arg(key.as_str());
+                    inv.arg(lua_comparator);
+                    inv.arg(compare_against);
+                    inv.arg(*count);
+                    inv.arg(self.get_local_epoch(key));
+                    inv.arg(self.get_local_count(key));
+                    inv.arg(self.dead_instance_threshold_ms);
+                    inv.arg(self.prefix_str());
+                    inv.arg(&self.instance_id);
+                    inv.arg(self.max_epoch);
+                    inv
+                })
+                .await?;
+
+            for (key, cumulative, inst_count, redis_epoch, _, matched_raw) in chunk_results {
+                let Ok(key) = DistkitRedisKey::try_from(key.clone()) else {
+                    continue;
+                };
+
+                let local_epoch = local_epochs.get(&key).copied().unwrap_or(0);
+                if matched_raw != 0 || local_epoch == redis_epoch {
+                    self.update_local_store(&key, redis_epoch, cumulative, inst_count);
+                }
+
+                map.insert(key, (cumulative, inst_count));
+            }
+
+            processed = end;
+        }
+
+        Ok(updates
+            .iter()
+            .map(|(k, _, _)| {
+                let (cum, inst) = map.get(k).copied().unwrap_or((0, 0));
+                (*k, cum, inst)
+            })
+            .collect())
+    }
+
+    async fn set_on_instance_batch<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&DistkitRedisKey, CounterComparator, i64)> = updates
+            .iter()
+            .map(|(key, count)| (*key, CounterComparator::Nil, *count))
+            .collect();
+
+        self.set_on_instance_if_batch(&conditional_updates).await
+    }
+
+    async fn set_on_instance_if_batch<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        if updates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        self.activity.signal();
+
+        let mut conn = self.connection_manager.clone();
+        let mut map: HashMap<DistkitRedisKey, (i64, i64)> = HashMap::with_capacity(updates.len());
+        let mut processed = 0;
+
+        while processed < updates.len() {
+            let end = (processed + MAX_BATCH_SIZE).min(updates.len());
+            let chunk = &updates[processed..end];
+            let script = &self.set_on_instance_script;
+            let local_epochs: HashMap<DistkitRedisKey, u64> = chunk
+                .iter()
+                .map(|(key, _, _)| ((*key).clone(), self.get_local_epoch(key)))
+                .collect();
+
+            let chunk_results: Vec<(String, i64, i64, u64, i64, i64)> =
+                execute_pipeline_with_script_retry(&mut conn, script, chunk, |update| {
+                    let (key, comparator, count) = update;
+                    let (lua_comparator, compare_against) = comparator.as_lua_parts();
+                    let mut inv = script.key(self.epoch_key());
+                    inv.key(self.instances_key());
+                    inv.key(self.cumulative_key());
+                    inv.key(self.keys_key());
+                    inv.key(self.inst_count_key());
+                    inv.arg(key.as_str());
+                    inv.arg(lua_comparator);
+                    inv.arg(compare_against);
+                    inv.arg(*count);
+                    inv.arg(self.get_local_epoch(key));
+                    inv.arg(self.get_local_count(key));
+                    inv.arg(self.dead_instance_threshold_ms);
+                    inv.arg(self.prefix_str());
+                    inv.arg(&self.instance_id);
+                    inv
+                })
+                .await?;
+
+            for (key, cumulative, inst_count, redis_epoch, _, matched_raw) in chunk_results {
+                let Ok(key) = DistkitRedisKey::try_from(key.clone()) else {
+                    continue;
+                };
+
+                let local_epoch = local_epochs.get(&key).copied().unwrap_or(0);
+                if matched_raw != 0 || local_epoch == redis_epoch {
+                    self.update_local_store(&key, redis_epoch, cumulative, inst_count);
+                }
+
+                map.insert(key, (cumulative, inst_count));
+            }
+            processed = end;
+        }
+
+        Ok(updates
+            .iter()
+            .map(|(k, _, _)| {
+                let (cum, inst) = map.get(k).copied().unwrap_or((0, 0));
+                (*k, cum, inst)
+            })
+            .collect())
     }
 
     #[cfg(test)]
@@ -871,7 +1144,7 @@ impl StrictInstanceAwareCounter {
             // The instance was cleaned up while offline. Recover contributions
             // for all keys that still have a positive local count, but only
             // when the per-key epoch in Redis still matches — epoch-safe recovery.
-            let recoveries: Vec<(RedisKey, i64, u64)> = self
+            let recoveries: Vec<(DistkitRedisKey, i64, u64)> = self
                 .local_store
                 .iter()
                 .filter_map(|e| {
@@ -900,7 +1173,7 @@ impl StrictInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::RedisKey;
+    /// # use distkit::DistkitRedisKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
@@ -920,11 +1193,11 @@ impl StrictInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::RedisKey;
+    /// # use distkit::DistkitRedisKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// let (cumulative_a, slice_a) = server_a.inc(&key, 3).await?;
     /// assert_eq!(cumulative_a, 3);
     /// assert_eq!(slice_a, 3);
@@ -934,17 +1207,33 @@ impl StrictInstanceAwareCounter {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn inc(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
+    pub async fn inc(&self, key: &DistkitRedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
+        self.inc_if(key, CounterComparator::Nil, count).await
+    }
+
+    /// Conditionally adds `count` to this instance's contribution for `key`
+    /// when the cumulative total satisfies `comparator`.
+    ///
+    /// Returns `(cumulative, instance_count)` after evaluation. If the
+    /// condition fails, the returned values reflect the current state.
+    pub async fn inc_if(
+        &self,
+        key: &DistkitRedisKey,
+        comparator: CounterComparator,
+        count: i64,
+    ) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
         let mut conn = self.connection_manager.clone();
         let local_epoch = self.get_local_epoch(key);
+        let (lua_comparator, compare_against) = comparator.as_lua_parts();
 
-        let (_, cumulative, inst_count, redis_epoch, instance_created_raw): (
+        let (_, cumulative, inst_count, redis_epoch, _, matched_raw): (
             String,
             i64,
             i64,
             u64,
+            i64,
             i64,
         ) = self
             .inc_script
@@ -954,22 +1243,19 @@ impl StrictInstanceAwareCounter {
             .key(self.keys_key())
             .key(self.inst_count_key())
             .arg(key.as_str())
+            .arg(lua_comparator)
+            .arg(compare_against)
             .arg(count)
             .arg(local_epoch)
+            .arg(self.get_local_count(key))
             .arg(self.dead_instance_threshold_ms)
             .arg(self.prefix_str())
             .arg(&self.instance_id)
             .invoke_async(&mut conn)
             .await?;
 
-        let instance_created = instance_created_raw != 0;
-        let should_recover = instance_created && local_epoch == redis_epoch;
-
-        let old_local_count = self.get_local_count(key);
-        self.update_local_store(key, redis_epoch, cumulative, inst_count);
-
-        if should_recover && old_local_count > 0 {
-            return Box::pin(self.inc(key, old_local_count)).await;
+        if matched_raw != 0 || local_epoch == redis_epoch {
+            self.update_local_store(key, redis_epoch, cumulative, inst_count);
         }
 
         Ok((cumulative, inst_count))
@@ -984,11 +1270,11 @@ impl StrictInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::RedisKey;
+    /// # use distkit::DistkitRedisKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// server_a.inc(&key, 10).await?;
     /// server_b.inc(&key, 5).await?;
     /// // Epoch bumps; all previous per-instance contributions are cleared.
@@ -998,13 +1284,35 @@ impl StrictInstanceAwareCounter {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn set(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
+    pub async fn set(&self, key: &DistkitRedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
+        self.set_if(key, CounterComparator::Nil, count).await
+    }
+
+    /// Conditionally sets the cumulative total for `key` to `count` when the
+    /// current cumulative total satisfies `comparator`.
+    ///
+    /// Returns `(cumulative, instance_count)` after evaluation. If the
+    /// condition fails, the returned values reflect the current state.
+    pub async fn set_if(
+        &self,
+        key: &DistkitRedisKey,
+        comparator: CounterComparator,
+        count: i64,
+    ) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
         let mut conn = self.connection_manager.clone();
         let local_epoch = self.get_local_epoch(key);
+        let (lua_comparator, compare_against) = comparator.as_lua_parts();
 
-        let (cumulative, inst_count, new_epoch_raw, _): (i64, i64, u64, i64) = self
+        let (_, cumulative, inst_count, redis_epoch, _, matched_raw): (
+            String,
+            i64,
+            i64,
+            u64,
+            i64,
+            i64,
+        ) = self
             .set_script
             .key(self.epoch_key())
             .key(self.instances_key())
@@ -1012,8 +1320,11 @@ impl StrictInstanceAwareCounter {
             .key(self.keys_key())
             .key(self.inst_count_key())
             .arg(key.as_str())
+            .arg(lua_comparator)
+            .arg(compare_against)
             .arg(count)
             .arg(local_epoch)
+            .arg(self.get_local_count(key))
             .arg(self.dead_instance_threshold_ms)
             .arg(self.prefix_str())
             .arg(&self.instance_id)
@@ -1021,8 +1332,9 @@ impl StrictInstanceAwareCounter {
             .invoke_async(&mut conn)
             .await?;
 
-        // No recovery: epoch always bumps, so local_epoch != new_epoch
-        self.update_local_store(key, new_epoch_raw, cumulative, inst_count);
+        if matched_raw != 0 || local_epoch == redis_epoch {
+            self.update_local_store(key, redis_epoch, cumulative, inst_count);
+        }
 
         Ok((cumulative, inst_count))
     }
@@ -1035,11 +1347,11 @@ impl StrictInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::RedisKey;
+    /// # use distkit::DistkitRedisKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// server_a.inc(&key, 10).await?;
     /// server_b.inc(&key, 5).await?;
     /// // No epoch bump: server_b's slice is not evicted.
@@ -1051,15 +1363,38 @@ impl StrictInstanceAwareCounter {
     /// ```
     pub async fn set_on_instance(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
+        count: i64,
+    ) -> Result<(i64, i64), DistkitError> {
+        self.set_on_instance_if(key, CounterComparator::Nil, count)
+            .await
+    }
+
+    /// Conditionally sets this instance's contribution for `key` to `count`
+    /// when the current instance slice satisfies `comparator`.
+    ///
+    /// Returns `(cumulative, instance_count)` after evaluation. If the
+    /// condition fails, the returned values reflect the current state.
+    pub async fn set_on_instance_if(
+        &self,
+        key: &DistkitRedisKey,
+        comparator: CounterComparator,
         count: i64,
     ) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
         let mut conn = self.connection_manager.clone();
         let local_epoch = self.get_local_epoch(key);
+        let (lua_comparator, compare_against) = comparator.as_lua_parts();
 
-        let (cumulative, inst_count, redis_epoch_raw, _): (i64, i64, u64, i64) = self
+        let (_, cumulative, inst_count, redis_epoch, _, matched_raw): (
+            String,
+            i64,
+            i64,
+            u64,
+            i64,
+            i64,
+        ) = self
             .set_on_instance_script
             .key(self.epoch_key())
             .key(self.instances_key())
@@ -1067,16 +1402,20 @@ impl StrictInstanceAwareCounter {
             .key(self.keys_key())
             .key(self.inst_count_key())
             .arg(key.as_str())
+            .arg(lua_comparator)
+            .arg(compare_against)
             .arg(count)
             .arg(local_epoch)
+            .arg(self.get_local_count(key))
             .arg(self.dead_instance_threshold_ms)
             .arg(self.prefix_str())
             .arg(&self.instance_id)
             .invoke_async(&mut conn)
             .await?;
 
-        // No recovery: caller is explicitly setting their contribution to a specific value.
-        self.update_local_store(key, redis_epoch_raw, cumulative, inst_count);
+        if matched_raw != 0 || local_epoch == redis_epoch {
+            self.update_local_store(key, redis_epoch, cumulative, inst_count);
+        }
 
         Ok((cumulative, inst_count))
     }
@@ -1088,11 +1427,11 @@ impl StrictInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::RedisKey;
+    /// # use distkit::DistkitRedisKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// // A missing key returns (0, 0).
     /// assert_eq!(counter.get(&key).await?, (0, 0));
     /// counter.inc(&key, 5).await?;
@@ -1100,26 +1439,32 @@ impl StrictInstanceAwareCounter {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn get(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
+    pub async fn get(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
         let mut conn = self.connection_manager.clone();
         let local_epoch = self.get_local_epoch(key);
 
-        let (cumulative, inst_count, redis_epoch, instance_created_raw): (i64, i64, u64, i64) =
-            self.get_script
-                .key(self.epoch_key())
-                .key(self.instances_key())
-                .key(self.cumulative_key())
-                .key(self.keys_key())
-                .key(self.inst_count_key())
-                .arg(key.as_str())
-                .arg(local_epoch)
-                .arg(self.dead_instance_threshold_ms)
-                .arg(self.prefix_str())
-                .arg(&self.instance_id)
-                .invoke_async(&mut conn)
-                .await?;
+        let (_, cumulative, inst_count, redis_epoch, instance_created_raw): (
+            String,
+            i64,
+            i64,
+            u64,
+            i64,
+        ) = self
+            .get_script
+            .key(self.epoch_key())
+            .key(self.instances_key())
+            .key(self.cumulative_key())
+            .key(self.keys_key())
+            .key(self.inst_count_key())
+            .arg(key.as_str())
+            .arg(local_epoch)
+            .arg(self.dead_instance_threshold_ms)
+            .arg(self.prefix_str())
+            .arg(&self.instance_id)
+            .invoke_async(&mut conn)
+            .await?;
 
         let instance_created = instance_created_raw != 0;
         let should_recover = instance_created && local_epoch == redis_epoch;
@@ -1142,11 +1487,11 @@ impl StrictInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::RedisKey;
+    /// # use distkit::DistkitRedisKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// server_a.inc(&key, 3).await?;
     /// server_b.inc(&key, 7).await?;
     /// let (old_cumulative, _) = server_a.del(&key).await?;
@@ -1156,7 +1501,7 @@ impl StrictInstanceAwareCounter {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn del(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
+    pub async fn del(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
         let mut conn = self.connection_manager.clone();
@@ -1194,11 +1539,11 @@ impl StrictInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::RedisKey;
+    /// # use distkit::DistkitRedisKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (server_a, server_b) = distkit::__doctest_helpers::two_strict_icounters().await?;
-    /// let key = RedisKey::try_from("connections".to_string())?;
+    /// let key = DistkitRedisKey::try_from("connections".to_string())?;
     /// server_a.inc(&key, 3).await?;
     /// server_b.inc(&key, 7).await?;
     /// // Only server_a's slice is removed; server_b is unaffected.
@@ -1208,7 +1553,7 @@ impl StrictInstanceAwareCounter {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn del_on_instance(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
+    pub async fn del_on_instance(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
         let mut conn = self.connection_manager.clone();
@@ -1240,12 +1585,12 @@ impl StrictInstanceAwareCounter {
     /// # Examples
     ///
     /// ```rust
-    /// # use distkit::RedisKey;
+    /// # use distkit::DistkitRedisKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let counter = distkit::__doctest_helpers::strict_icounter().await?;
-    /// let k1 = RedisKey::try_from("a".to_string())?;
-    /// let k2 = RedisKey::try_from("b".to_string())?;
+    /// let k1 = DistkitRedisKey::try_from("a".to_string())?;
+    /// let k2 = DistkitRedisKey::try_from("b".to_string())?;
     /// counter.inc(&k1, 10).await?;
     /// counter.inc(&k2, 20).await?;
     /// counter.clear().await?;
@@ -1312,35 +1657,62 @@ impl InstanceAwareCounterTrait for StrictInstanceAwareCounter {
         self.instance_id()
     }
 
-    async fn inc(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
+    async fn inc(&self, key: &DistkitRedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.inc(key, count).await
     }
 
-    async fn dec(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
+    async fn inc_if(
+        &self,
+        key: &DistkitRedisKey,
+        comparator: CounterComparator,
+        count: i64,
+    ) -> Result<(i64, i64), DistkitError> {
+        self.inc_if(key, comparator, count).await
+    }
+
+    async fn dec(&self, key: &DistkitRedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.inc(key, -count).await
     }
 
-    async fn set(&self, key: &RedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
+    async fn set(&self, key: &DistkitRedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
         self.set(key, count).await
+    }
+
+    async fn set_if(
+        &self,
+        key: &DistkitRedisKey,
+        comparator: CounterComparator,
+        count: i64,
+    ) -> Result<(i64, i64), DistkitError> {
+        self.set_if(key, comparator, count).await
     }
 
     async fn set_on_instance(
         &self,
-        key: &RedisKey,
+        key: &DistkitRedisKey,
         count: i64,
     ) -> Result<(i64, i64), DistkitError> {
         self.set_on_instance(key, count).await
     }
 
-    async fn get(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
+    async fn set_on_instance_if(
+        &self,
+        key: &DistkitRedisKey,
+        comparator: CounterComparator,
+        count: i64,
+    ) -> Result<(i64, i64), DistkitError> {
+        self.set_on_instance_if(key, comparator, count).await
+    }
+
+    async fn get(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError> {
         self.get(key).await
     }
 
-    async fn del(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
+    async fn del(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError> {
         self.del(key).await
     }
 
-    async fn del_on_instance(&self, key: &RedisKey) -> Result<(i64, i64), DistkitError> {
+    async fn del_on_instance(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError> {
         self.del_on_instance(key).await
     }
 
@@ -1350,5 +1722,67 @@ impl InstanceAwareCounterTrait for StrictInstanceAwareCounter {
 
     async fn clear_on_instance(&self) -> Result<(), DistkitError> {
         self.clear_on_instance().await
+    }
+
+    async fn get_all<'k>(
+        &self,
+        keys: &[&'k DistkitRedisKey],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        self.get_batch(keys).await
+    }
+
+    async fn get_all_on_instance<'k>(
+        &self,
+        keys: &[&'k DistkitRedisKey],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
+        let pairs = self.get_batch(keys).await?;
+        Ok(pairs.into_iter().map(|(k, _, inst)| (k, inst)).collect())
+    }
+
+    async fn inc_all<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&DistkitRedisKey, CounterComparator, i64)> = updates
+            .iter()
+            .map(|(key, count)| (*key, CounterComparator::Nil, *count))
+            .collect();
+
+        self.inc_all_if(&conditional_updates).await
+    }
+
+    async fn inc_all_if<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        self.inc_if_batch(updates).await
+    }
+
+    async fn set_all<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        self.set_batch(updates).await
+    }
+
+    async fn set_all_if<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        self.set_if_batch(updates).await
+    }
+
+    async fn set_all_on_instance<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        self.set_on_instance_batch(updates).await
+    }
+
+    async fn set_all_on_instance_if<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+        self.set_on_instance_if_batch(updates).await
     }
 }

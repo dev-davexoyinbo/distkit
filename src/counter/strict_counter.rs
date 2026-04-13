@@ -1,16 +1,42 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
-    DistkitError, RedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
+    CounterComparator, DistkitError, DistkitRedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
     counter::{CounterOptions, CounterTrait},
+    execute_pipeline_with_script_retry,
 };
+
+const HELPER_LUA: &str = r#"
+    local function compare_values(current, comparator, expected)
+        if comparator == 'nil' then
+            return true
+        elseif comparator == 'eq' then
+            return current == expected
+        elseif comparator == 'lt' then
+            return current < expected
+        elseif comparator == 'gt' then
+            return current > expected
+        elseif comparator == 'ne' then
+            return current ~= expected
+        end
+
+        return false
+    end
+"#;
 
 const INC_LUA: &str = r#"
     local container_key = KEYS[1]
     local key = KEYS[2]
-    local count = tonumber(ARGV[1]) or 0
+    local comparator = ARGV[1]
+    local compare_against = tonumber(ARGV[2]) or 0
+    local count = tonumber(ARGV[3]) or 0
+
+    local current = tonumber(redis.call('HGET', container_key, key)) or 0
+    if not compare_values(current, comparator, compare_against) then
+        return current
+    end
 
     return redis.call('HINCRBY', container_key, key, count)
 "#;
@@ -18,18 +44,24 @@ const INC_LUA: &str = r#"
 const SET_LUA: &str = r#"
     local container_key = KEYS[1]
     local key = KEYS[2]
-    local count = tonumber(ARGV[1]) or 0
+    local comparator = ARGV[1]
+    local compare_against = tonumber(ARGV[2]) or 0
+    local count = tonumber(ARGV[3]) or 0
+
+    local current = tonumber(redis.call('HGET', container_key, key)) or 0
+    if not compare_values(current, comparator, compare_against) then
+        return {key, current}
+    end
 
     redis.call('HSET', container_key, key, count)
-
-    return count
+    return {key, count}
 "#;
 
 const GET_LUA: &str = r#"
     local container_key = KEYS[1]
     local key = KEYS[2]
 
-    return redis.call('HGET', container_key, key) or 0
+    return {key, tonumber(redis.call('HGET', container_key, key)) or 0}
 "#;
 
 const DEL_LUA: &str = r#"
@@ -70,7 +102,7 @@ impl StrictCounter {
     /// # Examples
     ///
     /// ```rust
-    /// use distkit::{RedisKey, counter::{StrictCounter, CounterOptions}};
+    /// use distkit::{DistkitRedisKey, counter::{StrictCounter, CounterOptions}};
     ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -78,7 +110,7 @@ impl StrictCounter {
     ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     /// let client = redis::Client::open(redis_url)?;
     /// let conn = client.get_connection_manager().await?;
-    /// let prefix = RedisKey::try_from("my_app".to_string())?;
+    /// let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
     /// let counter = StrictCounter::new(CounterOptions::new(prefix, conn));
     /// # Ok(())
     /// # }
@@ -91,9 +123,9 @@ impl StrictCounter {
         } = options;
 
         let key_generator = RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::Strict);
-        let inc_script = Script::new(INC_LUA);
+        let inc_script = Script::new(&format!("{HELPER_LUA}\n{INC_LUA}"));
         let get_script = Script::new(GET_LUA);
-        let set_script = Script::new(SET_LUA);
+        let set_script = Script::new(&format!("{HELPER_LUA}\n{SET_LUA}"));
         let del_script = Script::new(DEL_LUA);
         let clear_script = Script::new(CLEAR_LUA);
 
@@ -111,58 +143,82 @@ impl StrictCounter {
 
 #[async_trait::async_trait]
 impl CounterTrait for StrictCounter {
-    async fn inc(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+    async fn inc(&self, key: &DistkitRedisKey, count: i64) -> Result<i64, DistkitError> {
+        self.inc_if(key, CounterComparator::Nil, count).await
+    }
+
+    async fn inc_if(
+        &self,
+        key: &DistkitRedisKey,
+        comparator: CounterComparator,
+        count: i64,
+    ) -> Result<i64, DistkitError> {
         let mut conn = self.connection_manager.clone();
+        let (lua_comparator, compare_against) = comparator.as_lua_parts();
 
         let total: i64 = self
             .inc_script
             .key(self.key_generator.container_key())
-            .key(key.to_string())
+            .key(key.as_str())
+            .arg(lua_comparator)
+            .arg(compare_against)
             .arg(count)
             .invoke_async(&mut conn)
             .await?;
 
         Ok(total)
-    } // end function inc
+    }
 
-    async fn dec(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
+    async fn dec(&self, key: &DistkitRedisKey, count: i64) -> Result<i64, DistkitError> {
         self.inc(key, -count).await
-    } // end function dec
+    }
 
-    async fn get(&self, key: &RedisKey) -> Result<i64, DistkitError> {
+    async fn get(&self, key: &DistkitRedisKey) -> Result<i64, DistkitError> {
         let mut conn = self.connection_manager.clone();
 
-        let total: i64 = self
+        let (_, total): (String, i64) = self
             .get_script
             .key(self.key_generator.container_key())
-            .key(key.to_string())
+            .key(key.as_str())
             .invoke_async(&mut conn)
             .await?;
 
         Ok(total)
     } // end function get
 
-    async fn set(&self, key: &RedisKey, count: i64) -> Result<i64, DistkitError> {
-        let mut conn = self.connection_manager.clone();
+    async fn set(&self, key: &DistkitRedisKey, count: i64) -> Result<i64, DistkitError> {
+        self.set_if(key, CounterComparator::Nil, count).await
+    }
 
-        let total: i64 = self
+    async fn set_if(
+        &self,
+        key: &DistkitRedisKey,
+        comparator: CounterComparator,
+        count: i64,
+    ) -> Result<i64, DistkitError> {
+        let mut conn = self.connection_manager.clone();
+        let (lua_comparator, compare_against) = comparator.as_lua_parts();
+
+        let (_, total): (String, i64) = self
             .set_script
             .key(self.key_generator.container_key())
-            .key(key.to_string())
+            .key(key.as_str())
+            .arg(lua_comparator)
+            .arg(compare_against)
             .arg(count)
             .invoke_async(&mut conn)
             .await?;
 
         Ok(total)
-    } // end function set
+    }
 
-    async fn del(&self, key: &RedisKey) -> Result<i64, DistkitError> {
+    async fn del(&self, key: &DistkitRedisKey) -> Result<i64, DistkitError> {
         let mut conn = self.connection_manager.clone();
 
         let total: i64 = self
             .del_script
             .key(self.key_generator.container_key())
-            .key(key.to_string())
+            .key(key.as_str())
             .invoke_async(&mut conn)
             .await?;
 
@@ -180,4 +236,118 @@ impl CounterTrait for StrictCounter {
 
         Ok(())
     } // end function clear
+
+    async fn get_all<'k>(
+        &self,
+        keys: &[&'k DistkitRedisKey],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut conn = self.connection_manager.clone();
+        let script = &self.get_script;
+
+        let raw: Vec<(String, i64)> =
+            execute_pipeline_with_script_retry(&mut conn, script, keys, |key| {
+                let mut inv = script.key(self.key_generator.container_key());
+                inv.key(key.as_str());
+                inv
+            })
+            .await?;
+
+        let map: HashMap<String, i64> = raw.into_iter().collect();
+
+        Ok(keys
+            .iter()
+            .map(|k| (*k, map.get(k.as_str()).copied().unwrap_or(0)))
+            .collect())
+    } // end function get_all
+
+    async fn inc_all<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&DistkitRedisKey, CounterComparator, i64)> = updates
+            .iter()
+            .map(|(key, count)| (*key, CounterComparator::Nil, *count))
+            .collect();
+
+        self.inc_all_if(&conditional_updates).await
+    }
+
+    async fn inc_all_if<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
+        if updates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut conn = self.connection_manager.clone();
+        let script = &self.inc_script;
+
+        let raw: Vec<i64> =
+            execute_pipeline_with_script_retry(&mut conn, script, updates, |update| {
+                let (key, comparator, count) = update;
+                let (lua_comparator, compare_against) = comparator.as_lua_parts();
+                let mut inv = script.key(self.key_generator.container_key());
+                inv.key(key.as_str());
+                inv.arg(lua_comparator);
+                inv.arg(compare_against);
+                inv.arg(*count);
+                inv
+            })
+            .await?;
+
+        Ok(updates
+            .iter()
+            .zip(raw.into_iter())
+            .map(|((key, _, _), total)| (*key, total))
+            .collect())
+    }
+
+    async fn set_all<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
+        let conditional_updates: Vec<(&DistkitRedisKey, CounterComparator, i64)> = updates
+            .iter()
+            .map(|(key, count)| (*key, CounterComparator::Nil, *count))
+            .collect();
+
+        self.set_all_if(&conditional_updates).await
+    }
+
+    async fn set_all_if<'k>(
+        &self,
+        updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
+        if updates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut conn = self.connection_manager.clone();
+        let script = &self.set_script;
+
+        let raw: Vec<(String, i64)> =
+            execute_pipeline_with_script_retry(&mut conn, script, updates, |update| {
+                let (key, comparator, count) = update;
+                let (lua_comparator, compare_against) = comparator.as_lua_parts();
+                let mut inv = script.key(self.key_generator.container_key());
+                inv.key(key.as_str());
+                inv.arg(lua_comparator);
+                inv.arg(compare_against);
+                inv.arg(*count);
+                inv
+            })
+            .await?;
+
+        let map: HashMap<String, i64> = raw.into_iter().collect();
+
+        Ok(updates
+            .iter()
+            .map(|(k, _, _)| (*k, map.get(k.as_str()).copied().unwrap_or(0)))
+            .collect())
+    }
 } // end impl CounterTrait for StrictCounter

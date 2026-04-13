@@ -27,17 +27,17 @@ currently offers three modules and they all run on the tokio runtime:
 # Quick start
 
 ```rust
-# use distkit::{RedisKey, counter::{StrictCounter, LaxCounter, CounterOptions, CounterTrait}};
+# use distkit::{DistkitRedisKey, counter::{StrictCounter, LaxCounter, CounterOptions, CounterTrait}};
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 # let client = redis::Client::open("redis://127.0.0.1/")?;
 # let conn = client.get_connection_manager().await?;
 // Servers sharing the same prefix coordinate through the same Redis keys.
-let prefix = RedisKey::try_from("my_app".to_string())?;
+let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
 let options = CounterOptions::new(prefix, conn);
 
 // Strict: every call hits Redis immediately
 let strict = StrictCounter::new(options.clone());
-let key = RedisKey::try_from("page_views".to_string())?;
+let key = DistkitRedisKey::try_from("page_views".to_string())?;
 strict.inc(&key, 1).await?;
 let total = strict.get(&key).await?;
 
@@ -66,18 +66,18 @@ let approx = lax.get(&key).await?;
 types implement [`InstanceAwareCounterTrait`]. Write generic code against either trait:
 
 ```rust
-# use distkit::{DistkitError, RedisKey, counter::CounterTrait};
+# use distkit::{DistkitError, DistkitRedisKey, counter::CounterTrait};
 // Example: bumping a counter by 1 (strict or lax)
-async fn bump<C: CounterTrait>(counter: &C, key: &RedisKey) -> Result<i64, DistkitError> {
+async fn bump<C: CounterTrait>(counter: &C, key: &DistkitRedisKey) -> Result<i64, DistkitError> {
     counter.inc(key, 1).await
 }
 ```
 
 ```rust,no_run
-# use distkit::{DistkitError, RedisKey, icounter::InstanceAwareCounterTrait};
+# use distkit::{DistkitError, DistkitRedisKey, icounter::InstanceAwareCounterTrait};
 async fn report_connection<C: InstanceAwareCounterTrait>(
     counter: &C,
-    key: &RedisKey,
+    key: &DistkitRedisKey,
     delta: i64,
 ) -> Result<i64, DistkitError> {
     let (total, _mine) = counter.inc(key, delta).await?;
@@ -87,19 +87,61 @@ async fn report_connection<C: InstanceAwareCounterTrait>(
 
 # Key types
 
-- [`RedisKey`] -- A validated key string (non-empty, 255 chars max, no colons).
-  Constructed via `TryFrom<String>`.
+- [`DistkitRedisKey`] -- A validated key string (non-empty, 255 chars max, no
+  colons), with helpers like `new`, `new_or_panic`, and `try_sanitize`.
+- [`CounterComparator`] -- The comparison operator used by conditional writes:
+  [`Eq`](crate::CounterComparator::Eq), [`Lt`](crate::CounterComparator::Lt),
+  [`Gt`](crate::CounterComparator::Gt), [`Ne`](crate::CounterComparator::Ne),
+  or [`Nil`](crate::CounterComparator::Nil).
 - [`CounterOptions`] -- Configuration bundle for counter construction. Carries
   a prefix, Redis connection, and the `allowed_lag` duration (default 20 ms).
   Implements `Clone`, so the same options can be passed to both counter types.
 - [`CounterTrait`] -- The async trait that both counter types implement:
-  `inc`, `dec`, `get`, `set`, `del`, `clear`.
+  `inc`, `inc_if`, `dec`, `get`, `set`, `set_if`, `del`, `clear`, and
+  multi-key helpers including `inc_all_if` and `set_all_if`.
+
+# Conditional writes
+
+Use [`CounterComparator`] with the `*_if` methods to apply a write only when
+the current value matches a condition. Failed comparisons return the current
+value unchanged.
+
+```rust,no_run
+# use distkit::{CounterComparator, DistkitRedisKey, counter::{CounterOptions, CounterTrait, StrictCounter}};
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+# let client = redis::Client::open("redis://127.0.0.1/")?;
+# let conn = client.get_connection_manager().await?;
+# let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
+# let counter = StrictCounter::new(CounterOptions::new(prefix, conn));
+let key = DistkitRedisKey::try_from("orders".to_string())?;
+counter.set(&key, 10).await?;
+
+assert_eq!(
+    counter.inc_if(&key, CounterComparator::Eq(10), 5).await?,
+    15
+);
+assert_eq!(
+    counter.set_if(&key, CounterComparator::Gt(20), 99).await?,
+    15
+);
+assert_eq!(
+    counter
+        .inc_all_if(&[
+            (&key, CounterComparator::Eq(15), 2),
+            (&key, CounterComparator::Nil, 3),
+        ])
+        .await?,
+    vec![(&key, 17), (&key, 20)]
+);
+# Ok(())
+# }
+```
 
 # Error handling
 
 All fallible operations return [`DistkitError`]:
 
-- **`InvalidRedisKey`** -- Returned by `RedisKey::try_from` when the input is
+- **`InvalidRedisKey`** -- Returned by `DistkitRedisKey::try_from` when the input is
   empty, longer than 255 characters, or contains a colon.
 - **`RedisError`** -- A Redis operation failed (connection lost, script error,
   etc.). Wraps [`redis::RedisError`].
@@ -135,6 +177,12 @@ This makes them well-suited for:
   restarts or crashes.
 - **Per-node metrics** -- see both the global total and each instance's slice.
 
+Conditional instance-aware writes follow the same pattern:
+
+- `inc_if` and `set_if` compare against the cumulative total.
+- `set_on_instance_if` and `set_all_on_instance_if` compare against this
+  instance's current slice.
+
 ## StrictInstanceAwareCounter
 
 Every call is immediately consistent with Redis. `set` and `del` bump a
@@ -146,16 +194,16 @@ their next operation, preventing double-counting.
 #     InstanceAwareCounterTrait,
 #     StrictInstanceAwareCounter, StrictInstanceAwareCounterOptions,
 # };
-# use distkit::RedisKey;
+# use distkit::DistkitRedisKey;
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 # let client = redis::Client::open("redis://127.0.0.1/")?;
 # let conn = client.get_connection_manager().await?;
-let prefix = RedisKey::try_from("my_app".to_string())?;
+let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
 let counter = StrictInstanceAwareCounter::new(
     StrictInstanceAwareCounterOptions::new(prefix, conn),
 );
 
-let key = RedisKey::try_from("connections".to_string())?;
+let key = DistkitRedisKey::try_from("connections".to_string())?;
 
 // Increment this instance's contribution; returns (cumulative, instance_count).
 let (total, mine) = counter.inc(&key, 5).await?;
@@ -194,13 +242,13 @@ them touches the same key.
 #     InstanceAwareCounterTrait,
 #     StrictInstanceAwareCounter, StrictInstanceAwareCounterOptions,
 # };
-# use distkit::RedisKey;
+# use distkit::DistkitRedisKey;
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 # let client = redis::Client::open("redis://127.0.0.1/")?;
 # let conn1 = client.get_connection_manager().await?;
 # let conn2 = client.get_connection_manager().await?;
-let prefix = RedisKey::try_from("my_app".to_string())?;
-let key = RedisKey::try_from("connections".to_string())?;
+let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
+let key = DistkitRedisKey::try_from("connections".to_string())?;
 
 // Two independent instances sharing the same prefix.
 let opts = |conn| StrictInstanceAwareCounterOptions {
@@ -236,12 +284,12 @@ small consistency lag.
 #     InstanceAwareCounterTrait,
 #     LaxInstanceAwareCounter, LaxInstanceAwareCounterOptions,
 # };
-# use distkit::RedisKey;
+# use distkit::DistkitRedisKey;
 # use std::time::Duration;
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 # let client = redis::Client::open("redis://127.0.0.1/")?;
 # let conn = client.get_connection_manager().await?;
-let prefix = RedisKey::try_from("my_app".to_string())?;
+let prefix = DistkitRedisKey::try_from("my_app".to_string())?;
 
 // options: LaxInstanceAwareCounterOptions::new(prefix, conn) would give the same result.
 let counter = LaxInstanceAwareCounter::new(LaxInstanceAwareCounterOptions {
@@ -252,7 +300,7 @@ let counter = LaxInstanceAwareCounter::new(LaxInstanceAwareCounterOptions {
     allowed_lag:    Duration::from_millis(20),
 });
 
-let key = RedisKey::try_from("connections".to_string())?;
+let key = DistkitRedisKey::try_from("connections".to_string())?;
 
 // Returns the local estimate immediately — no Redis round-trip on warm path.
 let (local_total, mine) = counter.inc(&key, 1).await?;

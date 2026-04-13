@@ -7,15 +7,15 @@
 // function uses a distinct member key so there is no cross-bench state
 // interference. Destructive operations (del, del_on_instance, clear,
 // clear_on_instance) use `iter_batched` to re-seed the key before every
-// measured call. `inc_batch_10` rebuilds its input Vec via `iter_batched`
-// because the vec is drained after each call.
+// measured call. `inc_all_10` rebuilds its borrowed input Vec each iteration.
 
 mod common;
 
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use distkit::RedisKey;
+use distkit::DistkitRedisKey;
+use distkit::icounter::InstanceAwareCounterTrait;
 use tokio::runtime::Runtime;
 
 fn bench_strict_instance_aware_counter(c: &mut Criterion) {
@@ -91,17 +91,17 @@ fn bench_strict_instance_aware_counter(c: &mut Criterion) {
         );
     });
 
-    // inc_batch_10 — pipeline 10 distinct keys in a single batch.
-    // The Vec is rebuilt each iteration (inc_batch drains it). The allocation
-    // is negligible compared to the Redis round-trip being measured.
-    let batch_keys: Vec<RedisKey> = (0..10)
+    // inc_all_10 — pipeline 10 distinct keys in a single batch.
+    // The borrowed input Vec is rebuilt each iteration. The allocation is
+    // negligible compared to the Redis round-trip being measured.
+    let batch_keys: Vec<DistkitRedisKey> = (0..10)
         .map(|i| common::key(&format!("batch_{i}")))
         .collect();
-    group.bench_function("inc_batch_10", |b| {
+    group.bench_function("inc_all_10", |b| {
         b.to_async(&rt).iter(|| async {
-            let mut increments: Vec<(RedisKey, i64)> =
-                batch_keys.iter().map(|k| (k.clone(), 1i64)).collect();
-            counter.inc_batch(&mut increments, 50).await.unwrap();
+            let increments: Vec<(&DistkitRedisKey, i64)> =
+                batch_keys.iter().map(|k| (k, 1i64)).collect();
+            counter.inc_all(&increments).await.unwrap();
         });
     });
 
