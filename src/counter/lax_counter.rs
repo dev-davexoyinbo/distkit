@@ -422,7 +422,7 @@ impl CounterTrait for LaxCounter {
     /// # }
     /// ```
     async fn inc(&self, key: &DistkitRedisKey, count: i64) -> Result<i64, DistkitError> {
-        self.inc_if(key, CounterComparator::Nil, count).await
+        Ok(self.inc_if(key, CounterComparator::Nil, count).await?.0)
     }
 
     async fn inc_if(
@@ -430,7 +430,7 @@ impl CounterTrait for LaxCounter {
         key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
-    ) -> Result<i64, DistkitError> {
+    ) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
         let store = match self.store.get(key) {
@@ -459,7 +459,7 @@ impl CounterTrait for LaxCounter {
         let current = remote_total + store.delta.load(Ordering::Acquire);
 
         if !comparator.matches(current) {
-            return Ok(current);
+            return Ok((current, current));
         }
 
         let prev_delta = if count > 0 {
@@ -468,7 +468,7 @@ impl CounterTrait for LaxCounter {
             store.delta.fetch_sub(count.abs(), Ordering::AcqRel)
         };
 
-        Ok(remote_total + prev_delta + count)
+        Ok((remote_total + prev_delta + count, current))
     }
 
     /// Buffers `-count` locally and returns the updated local estimate without
@@ -564,7 +564,7 @@ impl CounterTrait for LaxCounter {
     /// # }
     /// ```
     async fn set(&self, key: &DistkitRedisKey, count: i64) -> Result<i64, DistkitError> {
-        self.set_if(key, CounterComparator::Nil, count).await
+        Ok(self.set_if(key, CounterComparator::Nil, count).await?.0)
     }
 
     async fn set_if(
@@ -572,7 +572,7 @@ impl CounterTrait for LaxCounter {
         key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
-    ) -> Result<i64, DistkitError> {
+    ) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
         let store = match self.store.get(key) {
             Some(store)
@@ -599,12 +599,12 @@ impl CounterTrait for LaxCounter {
         let current = remote_total + store.delta.load(Ordering::Acquire);
 
         if !comparator.matches(current) {
-            return Ok(current);
+            return Ok((current, current));
         }
 
         store.delta.store(count - remote_total, Ordering::Release);
 
-        Ok(count)
+        Ok((count, current))
     }
 
     /// Cancels any pending local delta for `key`, then immediately deletes
@@ -732,13 +732,18 @@ impl CounterTrait for LaxCounter {
             .map(|(key, count)| (*key, CounterComparator::Nil, *count))
             .collect();
 
-        self.inc_all_if(&conditional_updates).await
+        Ok(self
+            .inc_all_if(&conditional_updates)
+            .await?
+            .into_iter()
+            .map(|(key, new, _)| (key, new))
+            .collect())
     }
 
     async fn inc_all_if<'k>(
         &self,
         updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
         }
@@ -762,9 +767,9 @@ impl CounterTrait for LaxCounter {
                         store.delta.fetch_sub(count.abs(), Ordering::AcqRel)
                     };
 
-                    Ok((*key, remote_total + prev_delta + *count))
+                    Ok((*key, remote_total + prev_delta + *count, current))
                 } else {
-                    Ok((*key, current))
+                    Ok((*key, current, current))
                 }
             })
             .collect()
@@ -779,13 +784,18 @@ impl CounterTrait for LaxCounter {
             .map(|(key, count)| (*key, CounterComparator::Nil, *count))
             .collect();
 
-        self.set_all_if(&conditional_updates).await
+        Ok(self
+            .set_all_if(&conditional_updates)
+            .await?
+            .into_iter()
+            .map(|(key, new, _)| (key, new))
+            .collect())
     }
 
     async fn set_all_if<'k>(
         &self,
         updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
         }
@@ -804,9 +814,9 @@ impl CounterTrait for LaxCounter {
 
                 if comparator.matches(current) {
                     store.delta.store(count - remote_total, Ordering::Release);
-                    Ok((*key, *count))
+                    Ok((*key, *count, current))
                 } else {
-                    Ok((*key, current))
+                    Ok((*key, current, current))
                 }
             })
             .collect()

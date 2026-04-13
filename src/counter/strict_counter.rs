@@ -35,10 +35,10 @@ const INC_LUA: &str = r#"
 
     local current = tonumber(redis.call('HGET', container_key, key)) or 0
     if not compare_values(current, comparator, compare_against) then
-        return current
+        return {current, current}
     end
 
-    return redis.call('HINCRBY', container_key, key, count)
+    return {tonumber(redis.call('HINCRBY', container_key, key, count)), current}
 "#;
 
 const SET_LUA: &str = r#"
@@ -50,11 +50,11 @@ const SET_LUA: &str = r#"
 
     local current = tonumber(redis.call('HGET', container_key, key)) or 0
     if not compare_values(current, comparator, compare_against) then
-        return {key, current}
+        return {key, current, current}
     end
 
     redis.call('HSET', container_key, key, count)
-    return {key, count}
+    return {key, count, current}
 "#;
 
 const GET_LUA: &str = r#"
@@ -144,7 +144,7 @@ impl StrictCounter {
 #[async_trait::async_trait]
 impl CounterTrait for StrictCounter {
     async fn inc(&self, key: &DistkitRedisKey, count: i64) -> Result<i64, DistkitError> {
-        self.inc_if(key, CounterComparator::Nil, count).await
+        Ok(self.inc_if(key, CounterComparator::Nil, count).await?.0)
     }
 
     async fn inc_if(
@@ -152,11 +152,11 @@ impl CounterTrait for StrictCounter {
         key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
-    ) -> Result<i64, DistkitError> {
+    ) -> Result<(i64, i64), DistkitError> {
         let mut conn = self.connection_manager.clone();
         let (lua_comparator, compare_against) = comparator.as_lua_parts();
 
-        let total: i64 = self
+        let totals: (i64, i64) = self
             .inc_script
             .key(self.key_generator.container_key())
             .key(key.as_str())
@@ -166,7 +166,7 @@ impl CounterTrait for StrictCounter {
             .invoke_async(&mut conn)
             .await?;
 
-        Ok(total)
+        Ok(totals)
     }
 
     async fn dec(&self, key: &DistkitRedisKey, count: i64) -> Result<i64, DistkitError> {
@@ -187,7 +187,7 @@ impl CounterTrait for StrictCounter {
     } // end function get
 
     async fn set(&self, key: &DistkitRedisKey, count: i64) -> Result<i64, DistkitError> {
-        self.set_if(key, CounterComparator::Nil, count).await
+        Ok(self.set_if(key, CounterComparator::Nil, count).await?.0)
     }
 
     async fn set_if(
@@ -195,11 +195,11 @@ impl CounterTrait for StrictCounter {
         key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
-    ) -> Result<i64, DistkitError> {
+    ) -> Result<(i64, i64), DistkitError> {
         let mut conn = self.connection_manager.clone();
         let (lua_comparator, compare_against) = comparator.as_lua_parts();
 
-        let (_, total): (String, i64) = self
+        let (_, total, old): (String, i64, i64) = self
             .set_script
             .key(self.key_generator.container_key())
             .key(key.as_str())
@@ -209,7 +209,7 @@ impl CounterTrait for StrictCounter {
             .invoke_async(&mut conn)
             .await?;
 
-        Ok(total)
+        Ok((total, old))
     }
 
     async fn del(&self, key: &DistkitRedisKey) -> Result<i64, DistkitError> {
@@ -273,13 +273,18 @@ impl CounterTrait for StrictCounter {
             .map(|(key, count)| (*key, CounterComparator::Nil, *count))
             .collect();
 
-        self.inc_all_if(&conditional_updates).await
+        Ok(self
+            .inc_all_if(&conditional_updates)
+            .await?
+            .into_iter()
+            .map(|(key, new, _)| (key, new))
+            .collect())
     }
 
     async fn inc_all_if<'k>(
         &self,
         updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
         }
@@ -287,7 +292,7 @@ impl CounterTrait for StrictCounter {
         let mut conn = self.connection_manager.clone();
         let script = &self.inc_script;
 
-        let raw: Vec<i64> =
+        let raw: Vec<(i64, i64)> =
             execute_pipeline_with_script_retry(&mut conn, script, updates, |update| {
                 let (key, comparator, count) = update;
                 let (lua_comparator, compare_against) = comparator.as_lua_parts();
@@ -302,8 +307,8 @@ impl CounterTrait for StrictCounter {
 
         Ok(updates
             .iter()
-            .zip(raw.into_iter())
-            .map(|((key, _, _), total)| (*key, total))
+            .zip(raw)
+            .map(|((key, _, _), (new, old))| (*key, new, old))
             .collect())
     }
 
@@ -316,13 +321,18 @@ impl CounterTrait for StrictCounter {
             .map(|(key, count)| (*key, CounterComparator::Nil, *count))
             .collect();
 
-        self.set_all_if(&conditional_updates).await
+        Ok(self
+            .set_all_if(&conditional_updates)
+            .await?
+            .into_iter()
+            .map(|(key, new, _)| (key, new))
+            .collect())
     }
 
     async fn set_all_if<'k>(
         &self,
         updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
+    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
         }
@@ -330,7 +340,7 @@ impl CounterTrait for StrictCounter {
         let mut conn = self.connection_manager.clone();
         let script = &self.set_script;
 
-        let raw: Vec<(String, i64)> =
+        let raw: Vec<(String, i64, i64)> =
             execute_pipeline_with_script_retry(&mut conn, script, updates, |update| {
                 let (key, comparator, count) = update;
                 let (lua_comparator, compare_against) = comparator.as_lua_parts();
@@ -343,11 +353,17 @@ impl CounterTrait for StrictCounter {
             })
             .await?;
 
-        let map: HashMap<String, i64> = raw.into_iter().collect();
+        let map: HashMap<String, (i64, i64)> = raw
+            .into_iter()
+            .map(|(key, new, old)| (key, (new, old)))
+            .collect();
 
         Ok(updates
             .iter()
-            .map(|(k, _, _)| (*k, map.get(k.as_str()).copied().unwrap_or(0)))
+            .map(|(k, _, _)| {
+                let (new, old) = map.get(k.as_str()).copied().unwrap_or((0, 0));
+                (*k, new, old)
+            })
             .collect())
     }
 } // end impl CounterTrait for StrictCounter

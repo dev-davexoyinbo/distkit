@@ -447,7 +447,7 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # }
     /// ```
     async fn inc(&self, key: &DistkitRedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
-        self.inc_if(key, CounterComparator::Nil, count).await
+        Ok(self.inc_if(key, CounterComparator::Nil, count).await?.0)
     }
 
     async fn inc_if(
@@ -455,7 +455,7 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
-    ) -> Result<(i64, i64), DistkitError> {
+    ) -> Result<((i64, i64), (i64, i64)), DistkitError> {
         self.activity.signal();
 
         let store = match self.local_store.get(key) {
@@ -489,14 +489,17 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
             store.instance_count.load(Ordering::Acquire) + delta_before,
         );
         if !comparator.matches(current.0) {
-            return Ok(current);
+            return Ok((current, current));
         }
 
         let delta_after = store.delta.fetch_add(count, Ordering::AcqRel) + count;
         let cumulative = store.cumulative.load(Ordering::Acquire);
         let instance_count = store.instance_count.load(Ordering::Acquire);
 
-        Ok((cumulative + delta_after, instance_count + delta_after))
+        Ok((
+            (cumulative + delta_after, instance_count + delta_after),
+            current,
+        ))
     }
 
     /// Decrements the counter locally. Equivalent to `inc(key, -count)`.
@@ -545,7 +548,7 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// # }
     /// ```
     async fn set(&self, key: &DistkitRedisKey, count: i64) -> Result<(i64, i64), DistkitError> {
-        self.set_if(key, CounterComparator::Nil, count).await
+        Ok(self.set_if(key, CounterComparator::Nil, count).await?.0)
     }
 
     async fn set_if(
@@ -553,10 +556,10 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
-    ) -> Result<(i64, i64), DistkitError> {
+    ) -> Result<((i64, i64), (i64, i64)), DistkitError> {
         let current = self.get(key).await?;
         if !comparator.matches(current.0) {
-            return Ok(current);
+            return Ok((current, current));
         }
 
         self.activity.signal();
@@ -566,7 +569,7 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
 
         self.update_local(key, cumulative, instance_count);
 
-        Ok((cumulative, instance_count))
+        Ok(((cumulative, instance_count), current))
     }
 
     /// Adjusts the local delta so this instance's contribution reaches `count`,
@@ -599,8 +602,10 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         key: &DistkitRedisKey,
         count: i64,
     ) -> Result<(i64, i64), DistkitError> {
-        self.set_on_instance_if(key, CounterComparator::Nil, count)
-            .await
+        Ok(self
+            .set_on_instance_if(key, CounterComparator::Nil, count)
+            .await?
+            .0)
     }
 
     async fn set_on_instance_if(
@@ -608,7 +613,7 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         key: &DistkitRedisKey,
         comparator: CounterComparator,
         count: i64,
-    ) -> Result<(i64, i64), DistkitError> {
+    ) -> Result<((i64, i64), (i64, i64)), DistkitError> {
         self.activity.signal();
 
         let store = match self.local_store.get(key) {
@@ -641,12 +646,12 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         let instance_count = store.instance_count.load(Ordering::Acquire);
         let current = (cumulative + delta, instance_count + delta);
         if !comparator.matches(current.1) {
-            return Ok(current);
+            return Ok((current, current));
         }
 
         store.delta.store(count - instance_count, Ordering::Release);
 
-        Ok((cumulative - instance_count + count, count))
+        Ok(((cumulative - instance_count + count, count), current))
     }
 
     /// Returns `(cumulative + pending_delta, instance_count + pending_delta)`.
@@ -879,13 +884,18 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
             .map(|(key, count)| (*key, CounterComparator::Nil, *count))
             .collect();
 
-        self.inc_all_if(&conditional_updates).await
+        Ok(self
+            .inc_all_if(&conditional_updates)
+            .await?
+            .into_iter()
+            .map(|(key, new_state, _)| (key, new_state.0, new_state.1))
+            .collect())
     }
 
     async fn inc_all_if<'k>(
         &self,
         updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+    ) -> Result<Vec<(&'k DistkitRedisKey, (i64, i64), (i64, i64))>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
         }
@@ -912,9 +922,13 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
                     let delta_after = store.delta.fetch_add(*count, Ordering::AcqRel) + *count;
                     let cumulative = store.cumulative.load(Ordering::Acquire);
                     let instance_count = store.instance_count.load(Ordering::Acquire);
-                    Ok((*key, cumulative + delta_after, instance_count + delta_after))
+                    Ok((
+                        *key,
+                        (cumulative + delta_after, instance_count + delta_after),
+                        current,
+                    ))
                 } else {
-                    Ok((*key, current.0, current.1))
+                    Ok((*key, current, current))
                 }
             })
             .collect()
@@ -929,13 +943,18 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
             .map(|(key, count)| (*key, CounterComparator::Nil, *count))
             .collect();
 
-        self.set_all_if(&conditional_updates).await
+        Ok(self
+            .set_all_if(&conditional_updates)
+            .await?
+            .into_iter()
+            .map(|(key, new_state, _)| (key, new_state.0, new_state.1))
+            .collect())
     }
 
     async fn set_all_if<'k>(
         &self,
         updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+    ) -> Result<Vec<(&'k DistkitRedisKey, (i64, i64), (i64, i64))>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
         }
@@ -985,7 +1004,13 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
                     .copied()
                     .or_else(|| current_map.get(*key).copied())
                     .unwrap_or((0, 0));
-                (*key, cumulative, instance_count)
+                let (old_cumulative, old_instance_count) =
+                    current_map.get(*key).copied().unwrap_or((0, 0));
+                (
+                    *key,
+                    (cumulative, instance_count),
+                    (old_cumulative, old_instance_count),
+                )
             })
             .collect())
     } // end function set_all_if
@@ -999,13 +1024,18 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
             .map(|(key, count)| (*key, CounterComparator::Nil, *count))
             .collect();
 
-        self.set_all_on_instance_if(&conditional_updates).await
+        Ok(self
+            .set_all_on_instance_if(&conditional_updates)
+            .await?
+            .into_iter()
+            .map(|(key, new_state, _)| (key, new_state.0, new_state.1))
+            .collect())
     }
 
     async fn set_all_on_instance_if<'k>(
         &self,
         updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],
-    ) -> Result<Vec<(&'k DistkitRedisKey, i64, i64)>, DistkitError> {
+    ) -> Result<Vec<(&'k DistkitRedisKey, (i64, i64), (i64, i64))>, DistkitError> {
         if updates.is_empty() {
             return Ok(vec![]);
         }
@@ -1029,9 +1059,9 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
 
                 if comparator.matches(current.1) {
                     store.delta.store(count - instance_count, Ordering::Release);
-                    Ok((*key, cumulative - instance_count + count, *count))
+                    Ok((*key, (cumulative - instance_count + count, *count), current))
                 } else {
-                    Ok((*key, current.0, current.1))
+                    Ok((*key, current, current))
                 }
             })
             .collect()
