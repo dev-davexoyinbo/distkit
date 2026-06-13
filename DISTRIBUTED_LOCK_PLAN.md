@@ -3,7 +3,7 @@
 Library-friendly distributed locks for `distkit`: **`DistMutex`** and **`DistRwLock`**, with a
 surface that mirrors `tokio::sync::Mutex` / `tokio::sync::RwLock` as closely as a network lock allows.
 
-> Status: **plan only — no implementation in this version.**
+> Status: **Stage 0 (scaffolding) done; Stages 1–6 unimplemented.**
 
 ---
 
@@ -217,9 +217,24 @@ Redis failures continue to surface as `DistkitError::RedisError`.
 
 Each stage compiles and is green via `make test` before the next begins.
 
-- **Stage 0 — Scaffolding.** Add `lock` feature in `Cargo.toml` (+ to `full`); `pub mod lock` gate
-  in `lib.rs`; `LockError` + the `DistkitError` variant; `LockOptions`, `LockMode`, empty module
-  skeleton. Compiles, no behavior.
+- **Stage 0 — Scaffolding. ✅ Done.** Feature wiring, public option/mode types, error plumbing, and
+  empty internal skeletons. No behavior — build + the `LockOptions::new` doctest are the gate.
+  - `Cargo.toml`: `lock = []` feature; added to `full`. No new deps, no bench entry yet.
+  - `src/lib.rs`: `#[cfg(feature = "lock")] pub mod lock;` beside the `counter` gate.
+  - `src/error.rs`: feature-gated `use crate::lock::LockError;` + `DistkitError::LockError(#[from] LockError)`.
+  - `src/lock/error.rs`: `LockError { WouldBlock, Timeout { waited }, LockLost, NotOwner }`
+    (`Debug, thiserror::Error, PartialEq`).
+  - `src/lock/mod.rs`: `LockMode { Shared, Exclusive }` (`Copy`); `LockOptions` (`Debug, Clone`) +
+    `LockOptions::new(key, conn)` with defaults `ttl 30s`, `owner_id Some(UUIDv4)`, `max_wait None`,
+    `retry_interval 50ms`, `auto_refresh true`; live-Redis doctest mirroring `CounterOptions::new`.
+  - `src/lock/{backend,mutex,rwlock}.rs`: module-doc-only stubs (satisfy `deny(missing_docs)`).
+    `pub use mutex::*` / `pub use rwlock::*` carry `#[allow(unused_imports)]` until Stages 2/5 add
+    types. Doc references to `DistMutex` / `DistRwLock` are plain code spans (not intra-doc links)
+    until those types exist.
+  - `src/lock/tests/{mod,common}.rs`: `make_options(name)` unique-prefix harness (mirrors
+    `counter/tests/common.rs`), `#![allow(dead_code)]` until Stage 2+ test modules use it.
+  - Verified: `cargo build` (lock off / `--features lock` / `--all-features`), `cargo doc
+    --all-features` clean, `make test` green (77 passed incl. the new doctest).
 - **Stage 1 — Mutex backend.** Lua consts (acquire/refresh/release) + low-level fns in `backend.rs`
   via `execute_pipeline_with_script_retry`. Direct-against-Redis unit tests for owner semantics.
 - **Stage 2 — `DistMutex` + guard.** `acquire` core + `lock`/`try_lock`/`try_lock_for`;
