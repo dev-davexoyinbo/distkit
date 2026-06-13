@@ -10,6 +10,9 @@ pub use comparator::*;
 #[cfg(feature = "counter")]
 pub mod counter;
 
+#[cfg(feature = "lock")]
+pub mod lock;
+
 #[cfg(feature = "instance-aware-counter")]
 pub mod icounter;
 
