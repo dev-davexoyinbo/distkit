@@ -122,12 +122,21 @@ impl Mutex {
     ) -> Result<MutexGuard, DistkitError> {
         let start = Instant::now();
         let mut connection = self.connection_manager.clone();
-        let mut retry_interval = interval(retry_interval);
-        retry_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut retry_interval = if retry_interval.is_zero() {
+            None
+        } else {
+            let mut retry_interval = interval(retry_interval);
+            retry_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            Some(retry_interval)
+        };
 
         loop {
-            // First tick is immediately, subsequent ticks are delayed.
-            retry_interval.tick().await;
+            if let Some(retry_interval) = &mut retry_interval {
+                // First tick is immediately, subsequent ticks are delayed.
+                retry_interval.tick().await;
+            }
+
             let acquired =
                 backend::acquire(&mut connection, &self.full_key, &self.owner, self.ttl_ms).await?;
 
@@ -142,6 +151,10 @@ impl Mutex {
                     refresh_handle: Some(refresh_handle),
                     lost,
                 });
+            }
+
+            if retry_interval.is_none() {
+                return Err(LockError::AcquireFail.into());
             }
 
             if let Some(ttl) = timeout {
