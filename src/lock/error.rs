@@ -7,9 +7,9 @@ use std::time::Duration;
 /// [`DistkitError::RedisError`](crate::DistkitError::RedisError).
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum LockError {
-    /// The lock is currently held and a non-blocking attempt was made.
-    #[error("lock is held (would block)")]
-    WouldBlock,
+    /// The lock was held by another process.
+    #[error("failed to acquire lock (would block)")]
+    AcquireFail,
     /// A bounded acquire exceeded its deadline without acquiring the lock.
     #[error("timed out after {waited:?}")]
     Timeout {
