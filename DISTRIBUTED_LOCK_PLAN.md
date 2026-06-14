@@ -199,12 +199,14 @@ A writer-preference "pending writers" key is **future work**, not v1.
   key(s), a cloned `ConnectionManager`, and the refresh task `JoinHandle`.
 - **Drop:** abort the refresh task; `tokio::spawn` a fire-and-forget release (Drop is sync, release
   is async) — same approach as the current `DistributedLockGuard`. An explicit
-  `async fn release(self) -> Result<(), DistkitError>` lets callers await and see errors (tokio has
-  no such method; useful addition here).
+  `async fn release(self) -> Result<MutexLockState, DistkitError>` lets callers await and observe the
+  final lock state (`Released` or `Lost`); tokio has no such method.
 - **auto-refresh (always on):** on a successful acquire, spawn a task that renews the lease every
-  `ttl/3`. On any failed refresh — lost ownership (`Ok(false)`) or a transport error — it stops and
-  flips an `AtomicBool`, so a later `release()` reports `LockError::LockLost`. Refresh is
-  unconditional by contract; there is no opt-out.
+  `ttl/3`. On any failed refresh — lost ownership (`Ok(false)`) or a transport error — it sets a
+  shared `Arc<AtomicBool>` (`lost`) but **keeps ticking**; a later successful refresh clears the flag
+  (the lease self-heals). The flag is surfaced as `MutexLockState::Lost` via `MutexGuard::get_state`
+  and the value returned by `release`. Refresh is unconditional by contract; there is no opt-out.
+  (`RwLock` guards in Stage 5 follow the same shape.)
 
 ---
 
@@ -292,27 +294,48 @@ Each stage compiles and is green via `make test` before the next begins.
     every field, `LockOptions::builder` entry point).
   - Verified: `make test` green (205 unit + 79 doctest, incl. new `Mutex::new` and
     `LockOptions::builder` doctests); `cargo doc --all-features` clean.
-- **Stage 3 — Auto-refresh. ✅ Done.** Background renewal task, abort-on-drop, lost-lock handling.
+- **Stage 3 — Auto-refresh. ✅ Done.** Background renewal task, abort-on-drop, lost-lease handling,
+  observable lock state.
   - **Removed the `auto_refresh` opt-out** (struct field, builder setter, option tests): renewal is
-    l by contract — a `Mutex` that can silently lose its lease mid-hold is unsafe.
-  - `src/lock/mutex.rs`: `spawn_refresh(conn, full_key, owner, ttl_ms, lost)` ticks a
-    `tokio::time::interval` every `(ttl_ms/3).max(1)` ms (`MissedTickBehavior::Delay`, first
-    immediate tick skipped — acquire just set the lease). `Ok(true)` continues; `Ok(false)` or
-    `Err` flips a shared `Arc<AtomicBool>` and stops. `acquire_core` spawns it on every successful
-    acquire and stores the `JoinHandle` + `lost` flag on the guard.
-  - `MutexGuard`: new `refresh_handle: Option<JoinHandle<()>>` + `lost: Arc<AtomicBool>`. `release`
-    aborts the handle, returns `LockError::LockLost` if `lost` (skipping the DEL we no longer own),
-    else does the owner-checked release. `Drop` aborts the handle first, then the existing
-    fire-and-forget release.
-  - **Drive-by fix:** `acquire_core` no longer builds `tokio::time::interval(retry_interval)` — a
-    newer tokio panics on a zero period, which `try_lock` (zero interval) hit. Replaced with a
-    poll-then-`sleep` loop that tight-spins when the interval is zero (documented behavior).
+    unconditional by contract — a `Mutex` that can silently lose its lease mid-hold is unsafe.
+  - **`MutexLockState`** (new `pub enum` in `src/lock/mutex.rs`, re-exported via `lock::*`):
+    `Acquired` / `Lost` / `Released`. Replaces the earlier scratch `LockState` in `mod.rs` and the
+    `LockError::LockLost`-on-release design — a lost lease is now a *state*, not an error.
+  - `Mutex` gains a `ttl_duration: Duration` field (alongside `ttl_ms`) so the refresh ticker can use
+    `ttl_duration / 3` directly.
+  - `Mutex::spawn_refresh(&self, lost: Arc<AtomicBool>) -> JoinHandle<()>`: ticks a
+    `tokio::time::interval(ttl_duration / 3)` (`MissedTickBehavior::Delay`, first immediate tick
+    skipped — acquire just set the lease). On each tick it calls `backend::refresh`:
+    - `Ok(true)` → lease renewed; if `lost` was set, clears it (`swap(false, AcqRel)`) and logs that
+      the lease was re-acquired — **the task self-heals rather than stopping**.
+    - `Ok(false)` / `Err` → sets `lost` (`store(true, Release)`) and keeps ticking (a later success
+      can recover it). The task runs until the guard aborts it on release/drop.
+    `acquire_core` spawns it on every successful acquire and stores the `JoinHandle` + shared
+    `Arc<AtomicBool>` (`lost`) on the guard.
+  - `MutexGuard` fields: `refresh_handle: Option<JoinHandle<()>>` + `lost: Arc<AtomicBool>`
+    (no `is_released` flag — `refresh_handle == None` means released).
+    - `get_state(&self) -> MutexLockState`: `None` handle → `Released`; `lost` set → `Lost`; else
+      `Acquired`.
+    - `release(self) -> Result<MutexLockState, DistkitError>`: aborts the handle; if `lost`, returns
+      `Ok(Lost)` **without** issuing a DEL (the key is no longer ours); else owner-checked release →
+      `Ok(Released)`.
+    - `Drop`: takes the handle (absent ⇒ already released, bail), aborts it, then spawns the
+      fire-and-forget owner-checked release.
+  - `LockError::LockLost` is retained in `error.rs` but no longer produced by the mutex path
+    (superseded by `MutexLockState::Lost`).
   - Tests (`src/lock/tests/mutex.rs`): `auto_refresh_keeps_lease_alive` (held lease survives past
-    `ttl`), `lost_lease_reports_lock_lost` (external `DEL` → next refresh tick → `release` returns
-    `LockLost`); replaces the now-invalid `lease_expiry_frees_lock`. Harness gains
-    `make_options_with_key` + `raw_connection` in `tests/common.rs`.
-  - Verified: `make test` green (206 unit + 79 doctest); `cargo clippy --features lock` clean for the
-    lock module.
+    `ttl`), `get_state_reports_acquired_while_held`, and `lost_lease_reports_lost_state` (external
+    `DEL` → next refresh tick → `get_state()` is `Lost` and `release()` returns `Ok(Lost)`);
+    replaces the now-invalid `lease_expiry_frees_lock`. Harness gains `make_options_with_key` +
+    `raw_connection` in `tests/common.rs`.
+  - **One-shot acquire / zero-interval fix:** `acquire_core` now builds the poll ticker lazily — a
+    zero `retry_interval` yields `None` (no `tokio::time::interval`, which panics on a zero period).
+    With no ticker the loop makes a single attempt and returns `LockError::AcquireFail` on failure,
+    so `try_lock` (zero interval) is a true one-shot; non-zero intervals tick as before
+    (`MissedTickBehavior::Delay`, first tick immediate) and still honor the bounded-`timeout`
+    `Timeout { waited }` path.
+  - Verified: `make test` green (207 unit + 79 doctest, incl. the 8 mutex tests); `cargo clippy
+    --features lock` clean for the lock module.
 - **Stage 4 — RwLock backend.** ZSET reader model + writer key Lua (read/write acquire/refresh/
   release, server `TIME`, lazy purge). Direct-Redis tests for shared-read / exclusive-write /
   expiry purge.
