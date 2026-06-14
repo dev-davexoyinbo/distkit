@@ -26,7 +26,6 @@ async fn new_sets_documented_defaults() {
     assert_eq!(options.ttl, Duration::from_secs(30));
     assert_eq!(options.max_wait, None);
     assert_eq!(options.retry_interval, Duration::from_millis(50));
-    assert!(options.auto_refresh);
     assert!(
         options.owner_id.is_some_and(|owner| !owner.is_empty()),
         "owner_id should default to a non-empty UUID"
@@ -57,7 +56,6 @@ async fn builder_defaults_match_new() {
     assert_eq!(from_builder.ttl, from_new.ttl);
     assert_eq!(from_builder.max_wait, from_new.max_wait);
     assert_eq!(from_builder.retry_interval, from_new.retry_interval);
-    assert_eq!(from_builder.auto_refresh, from_new.auto_refresh);
 }
 
 #[tokio::test]
@@ -71,7 +69,6 @@ async fn builder_overrides_every_field() {
         .owner_id("fixed-owner")
         .max_wait(Duration::from_secs(2))
         .retry_interval(Duration::from_millis(10))
-        .auto_refresh(false)
         .build();
 
     assert_eq!(options.namespace, custom_namespace);
@@ -79,7 +76,6 @@ async fn builder_overrides_every_field() {
     assert_eq!(options.owner_id.as_deref(), Some("fixed-owner"));
     assert_eq!(options.max_wait, Some(Duration::from_secs(2)));
     assert_eq!(options.retry_interval, Duration::from_millis(10));
-    assert!(!options.auto_refresh);
 }
 
 #[tokio::test]
@@ -95,5 +91,4 @@ async fn lock_options_builder_entry_point_matches_builder_new() {
     assert_eq!(*options.namespace, "distkit-locks");
     assert_eq!(options.ttl, Duration::from_secs(7));
     assert_eq!(options.retry_interval, Duration::from_millis(50));
-    assert!(options.auto_refresh);
 }

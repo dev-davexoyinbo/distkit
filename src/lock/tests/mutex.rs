@@ -1,12 +1,13 @@
-//! Live-Redis tests for the Stage 2 [`Mutex`](crate::lock::Mutex) and its
-//! [`MutexGuard`](crate::lock::MutexGuard): exclusion, bounded waiting, and
-//! release-frees semantics. No auto-refresh yet (Stage 3).
+//! Live-Redis tests for the [`Mutex`](crate::lock::Mutex) and its
+//! [`MutexGuard`](crate::lock::MutexGuard): exclusion, bounded waiting,
+//! release-frees semantics, and Stage 3 auto-refresh (lease kept alive past
+//! `ttl`; a lost lease surfaces as [`MutexLockState::Lost`]).
 
 use std::time::Duration;
 
 use crate::DistkitError;
-use crate::lock::tests::common::make_options;
-use crate::lock::{LockError, Mutex};
+use crate::lock::tests::common::{make_options, make_options_with_key, raw_connection};
+use crate::lock::{LockError, Mutex, MutexLockState};
 
 /// Two mutexes (distinct owners) on the same key: the second `try_lock` is
 /// excluded while the first guard is held.
@@ -121,24 +122,78 @@ async fn drop_frees_lock() {
         .expect("lock should be acquirable after the guard drops");
 }
 
-/// With auto-refresh not yet implemented, an unreleased lease simply expires and
-/// the key becomes acquirable again.
+/// Background auto-refresh keeps a held lease alive well past its `ttl`: a second
+/// owner is still excluded long after the lease would otherwise have expired.
 #[tokio::test]
-async fn lease_expiry_frees_lock() {
-    let mut options = make_options("lease_expiry_frees_lock").await;
-    options.ttl = Duration::from_millis(100);
+async fn auto_refresh_keeps_lease_alive() {
+    let mut options = make_options("auto_refresh_keeps_lease_alive").await;
+    options.ttl = Duration::from_millis(150);
     let mutex_a = Mutex::new(options);
-    let mutex_b = Mutex::new(make_options("lease_expiry_frees_lock").await);
+    let mutex_b = Mutex::new(make_options("auto_refresh_keeps_lease_alive").await);
 
     let _guard = mutex_a
         .try_lock()
         .await
         .expect("first try_lock should take the lock");
 
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    // Well past ttl (150 ms) — without refresh the lease would have expired.
+    tokio::time::sleep(Duration::from_millis(400)).await;
 
-    mutex_b
+    match mutex_b.try_lock().await {
+        Err(DistkitError::LockError(LockError::AcquireFail)) => {}
+        other => panic!("expected AcquireFail — refresh should keep lease alive, got {other:?}"),
+    }
+}
+
+/// A healthy held lock reports [`MutexLockState::Acquired`].
+#[tokio::test]
+async fn get_state_reports_acquired_while_held() {
+    let mutex = Mutex::new(make_options("get_state_reports_acquired_while_held").await);
+
+    let guard = mutex
         .try_lock()
         .await
-        .expect("lock should be acquirable once the lease expires");
+        .expect("try_lock should take the lock");
+
+    assert_eq!(guard.get_state().await, MutexLockState::Acquired);
+}
+
+/// If the lease is lost while held (key deleted out from under us), the refresh
+/// task marks it [`MutexLockState::Lost`]: `get_state` reports it and `release`
+/// returns `Ok(MutexLockState::Lost)` without issuing a DEL we no longer own.
+#[tokio::test]
+async fn lost_lease_reports_lost_state() {
+    let (mut options, full_key) = make_options_with_key("lost_lease_reports_lost_state").await;
+    options.ttl = Duration::from_millis(150);
+    let mutex = Mutex::new(options);
+
+    let guard = mutex
+        .try_lock()
+        .await
+        .expect("try_lock should take the lock");
+
+    // Delete the key out from under the holder; the next refresh tick (~50 ms)
+    // sees GET != owner -> Ok(false) -> lost.
+    let mut conn = raw_connection().await;
+    let _: () = redis::cmd("DEL")
+        .arg(&full_key)
+        .query_async(&mut conn)
+        .await
+        .expect("DEL should succeed");
+
+    // Past at least one ttl/3 (~50 ms) refresh tick.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(
+        guard.get_state().await,
+        MutexLockState::Lost,
+        "lease should be marked lost after the key was deleted"
+    );
+
+    match guard.release().await {
+        Ok(MutexLockState::Lost) => {}
+        other => {
+            panic!("expected Ok(MutexLockState::Lost) after the lease was deleted, got {other:?}")
+        }
+    }
 }

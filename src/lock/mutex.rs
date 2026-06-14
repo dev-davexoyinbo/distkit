@@ -5,7 +5,7 @@
 //! inner data — it is a pure release token. Acquire is fallible and async over
 //! the network; release is best-effort on `Drop` plus an explicit awaitable
 //! [`MutexGuard::release`]. A held lock renews its lease in the background every
-//! `ttl/3`; a failed renewal marks the lease [`LockState::Lost`], but the task
+//! `ttl/3`; a failed renewal marks the lease [`MutexLockState::Lost`], but the task
 //! keeps retrying and clears the mark if ownership is later regained. The current
 //! state is observable via [`MutexGuard::get_state`] and is also returned by
 //! [`MutexGuard::release`].
@@ -164,7 +164,7 @@ impl Mutex {
     /// renewal — lost ownership (`Ok(false)`) or a transport error (`Err`) — it sets
     /// the shared `lost` flag but keeps ticking; if a later refresh succeeds it
     /// clears the flag again. The flag is surfaced via [`MutexGuard::get_state`] /
-    /// [`MutexGuard::release`] as [`LockState::Lost`]. The task runs until the guard
+    /// [`MutexGuard::release`] as [`MutexLockState::Lost`]. The task runs until the guard
     /// aborts it on release or drop.
     fn spawn_refresh(&self, lost: Arc<AtomicBool>) -> JoinHandle<()> {
         let mut connection_manager = self.connection_manager.clone();
