@@ -4,16 +4,20 @@
 //! Mirrors the surface of [`tokio::sync::Mutex`] over Redis. The guard guards no
 //! inner data — it is a pure release token. Acquire is fallible and async over
 //! the network; release is best-effort on `Drop` plus an explicit awaitable
-//! [`MutexGuard::release`]. Auto-refresh lands in Stage 3.
+//! [`MutexGuard::release`]. A held lock renews its lease in the background every
+//! `ttl/3`; if a renewal fails the lease is treated as lost and a later
+//! [`MutexGuard::release`] reports [`LockError::LockLost`].
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use redis::aio::ConnectionManager;
+use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::DistkitError;
-use crate::lock::{LockError, LockOptions, backend};
+use crate::lock::{LockError, LockOptions, LockState, backend};
 
 /// A distributed mutual-exclusion lock backed by Redis.
 ///
@@ -27,6 +31,7 @@ pub struct Mutex {
     full_key: String,
     owner: String,
     ttl_ms: i64,
+    ttl_duration: Duration,
     max_wait: Option<Duration>,
     retry_interval: Duration,
 }
@@ -68,13 +73,13 @@ impl Mutex {
 
         let full_key = format!("{}:{}", *namespace, *key);
         let owner = owner_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let ttl_ms = ttl.as_millis() as i64;
 
         Arc::new(Self {
             connection_manager,
             full_key,
             owner,
-            ttl_ms,
+            ttl_ms: ttl.as_millis() as i64,
+            ttl_duration: ttl,
             max_wait,
             retry_interval,
         })
@@ -125,11 +130,15 @@ impl Mutex {
                 backend::acquire(&mut connection, &self.full_key, &self.owner, self.ttl_ms).await?;
 
             if acquired {
+                let lost = Arc::new(AtomicBool::new(false));
+                let refresh_handle = self.spawn_refresh(lost.clone());
+
                 return Ok(MutexGuard {
                     connection_manager: self.connection_manager.clone(),
                     full_key: self.full_key.clone(),
                     owner: self.owner.clone(),
-                    is_released: false,
+                    refresh_handle: Some(refresh_handle),
+                    lost,
                 });
             }
 
@@ -145,6 +154,63 @@ impl Mutex {
             }
         }
     }
+
+    /// Spawns the background lease-renewal task for a held lock.
+    ///
+    /// Ticks every `ttl/3`, refreshing the lease while we still own it. The first
+    /// (immediate) tick is skipped since `acquire` just set the lease. On any failed
+    /// renewal — lost ownership (`Ok(false)`) or a transport error (`Err`) — it flips
+    /// `lost` and stops, so a later [`MutexGuard::release`] reports
+    /// [`LockError::LockLost`].
+    fn spawn_refresh(&self, lost: Arc<AtomicBool>) -> JoinHandle<()> {
+        let mut connection_manager = self.connection_manager.clone();
+        let full_key = self.full_key.clone();
+        let owner = self.owner.clone();
+        let ttl_ms = self.ttl_ms;
+        let ttl_duration = self.ttl_duration;
+
+        tokio::spawn(async move {
+            let mut ticker = interval(ttl_duration / 3);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            // Skip the first immediate tick — acquire just set the lease.
+            ticker.tick().await;
+
+            loop {
+                ticker.tick().await;
+
+                match backend::refresh(&mut connection_manager, &full_key, &owner, ttl_ms).await {
+                    Ok(true) => {
+                        // if we got back a lost lease
+                        if lost.swap(false, Ordering::AcqRel) {
+                            tracing::debug!(
+                                full_key,
+                                owner,
+                                "Lost distributed lock reaquired during refresh"
+                            );
+                        }
+                    }
+                    Ok(false) => {
+                        tracing::debug!(
+                            full_key,
+                            owner,
+                            "Lost distributed lock lease during refresh"
+                        );
+                        lost.store(true, Ordering::Release);
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            ?error,
+                            full_key,
+                            owner,
+                            "Error refreshing distributed lock lease"
+                        );
+                        lost.store(true, Ordering::Release);
+                    }
+                }
+            }
+        })
+    } // end spawn_refresh
 }
 
 /// RAII release token for a held [`Mutex`].
@@ -157,26 +223,50 @@ pub struct MutexGuard {
     connection_manager: ConnectionManager,
     full_key: String,
     owner: String,
-    is_released: bool,
+    refresh_handle: Option<JoinHandle<()>>,
+    lost: Arc<AtomicBool>,
 }
 
 impl MutexGuard {
-    /// Releases the lock, awaiting the round-trip so callers can observe errors.
-    pub async fn release(mut self) -> Result<(), DistkitError> {
+    /// Returns the state of the lock.
+    pub async fn get_state(&self) -> LockState {
+        if self.refresh_handle.is_none() {
+            return LockState::Released;
+        }
+
+        if self.lost.load(Ordering::Acquire) {
+            return LockState::Lost;
+        }
+
+        LockState::Acquired
+    }
+
+    /// Releases the lock, awaiting the round-trip so callers can observe errors. Returns the state
+    /// of the lock.
+    pub async fn release(mut self) -> Result<LockState, DistkitError> {
+        if let Some(handle) = self.refresh_handle.take() {
+            handle.abort();
+        }
+
+        if self.lost.load(Ordering::Acquire) {
+            return Ok(LockState::Lost);
+        }
+
         let mut connection = self.connection_manager.clone();
         backend::release(&mut connection, &self.full_key, &self.owner).await?;
 
-        self.is_released = true;
-
-        Ok(())
+        Ok(LockState::Released)
     }
 }
 
 impl Drop for MutexGuard {
     fn drop(&mut self) {
-        if self.is_released {
+        let Some(handle) = self.refresh_handle.take() else {
+            // Already released
             return;
-        }
+        };
+
+        handle.abort();
 
         let mut connection = self.connection_manager.clone();
         let full_key = self.full_key.clone();

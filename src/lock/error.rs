@@ -16,9 +16,6 @@ pub enum LockError {
         /// How long the acquire waited before giving up.
         waited: Duration,
     },
-    /// The lease was lost (a background refresh failed before release).
-    #[error("lock lease lost (refresh failed)")]
-    LockLost,
     /// The caller is not the recorded owner of the lock.
     #[error("not the lock owner")]
     NotOwner,

@@ -3,7 +3,7 @@
 Library-friendly distributed locks for `distkit`: **`Mutex`** and **`RwLock`**, with a
 surface that mirrors `tokio::sync::Mutex` / `tokio::sync::RwLock` as closely as a network lock allows.
 
-> Status: **Stages 0–2 done (scaffolding + mutex backend + `Mutex`/guard); Stages 3–6 unimplemented.**
+> Status: **Stages 0–3 done (scaffolding + mutex backend + `Mutex`/guard + auto-refresh); Stages 4–6 unimplemented.**
 
 ---
 
@@ -86,12 +86,12 @@ pub struct LockOptions {
     pub owner_id: Option<String>,      // default: UUID v4 (uuid crate, already a dep)
     pub max_wait: Option<Duration>,    // bound for lock()/read()/write(); None => wait until acquired
     pub retry_interval: Duration,      // poll gap for the waiting forms (default 50ms)
-    pub auto_refresh: bool,            // default true; background lease renewal every ttl/3
+    // NOTE: lease auto-refresh (every ttl/3) is unconditional/by-contract — no opt-out field.
 }
 
 impl LockOptions {
     // defaults: namespace="distkit-locks", ttl=30s, owner_id=UUIDv4, max_wait=None,
-    //           retry_interval=50ms, auto_refresh=true
+    //           retry_interval=50ms
     pub fn new(key: DistkitRedisKey, connection_manager: ConnectionManager) -> Self;
     // Fluent alternative (sugar for LockOptionsBuilder::new); same defaults.
     pub fn builder(key: DistkitRedisKey, connection_manager: ConnectionManager) -> LockOptionsBuilder;
@@ -106,7 +106,6 @@ impl LockOptionsBuilder {
     pub fn owner_id(self, owner_id: impl Into<String>) -> Self;
     pub fn max_wait(self, max_wait: Duration) -> Self;
     pub fn retry_interval(self, retry_interval: Duration) -> Self;
-    pub fn auto_refresh(self, auto_refresh: bool) -> Self;
     pub fn build(self) -> LockOptions;
 }
 ```
@@ -202,9 +201,10 @@ A writer-preference "pending writers" key is **future work**, not v1.
   is async) — same approach as the current `DistributedLockGuard`. An explicit
   `async fn release(self) -> Result<(), DistkitError>` lets callers await and see errors (tokio has
   no such method; useful addition here).
-- **auto_refresh:** on a successful acquire, if enabled, spawn a task that renews the lease every
-  `ttl/3`. On a failed refresh (lease lost) it stops and flips an `AtomicBool`, so a later
-  `release()` reports `LockError::LockLost`.
+- **auto-refresh (always on):** on a successful acquire, spawn a task that renews the lease every
+  `ttl/3`. On any failed refresh — lost ownership (`Ok(false)`) or a transport error — it stops and
+  flips an `AtomicBool`, so a later `release()` reports `LockError::LockLost`. Refresh is
+  unconditional by contract; there is no opt-out.
 
 ---
 
@@ -255,7 +255,7 @@ Each stage compiles and is green via `make test` before the next begins.
   - `src/lock/tests/{mod,common}.rs`: `make_options(name)` unique-prefix harness (mirrors
     `counter/tests/common.rs`), `#![allow(dead_code)]` until Stage 2+ test modules use it.
   - Verified: `cargo build` (lock off / `--features lock` / `--all-features`), `cargo doc
-    --all-features` clean, `make test` green (77 passed incl. the new doctest).
+--all-features` clean, `make test` green (77 passed incl. the new doctest).
 - **Stage 1 — Mutex backend. ✅ Done.** Three crate-internal async ops in `src/lock/backend.rs`,
   each an atomic Redis round-trip keyed on `owner_id`, taking a fully-formed (already namespaced) key:
   - `acquire(conn, key, owner, ttl_ms) -> bool` — plain `SET key owner NX PX ttl_ms` (no Lua).
@@ -292,8 +292,27 @@ Each stage compiles and is green via `make test` before the next begins.
     every field, `LockOptions::builder` entry point).
   - Verified: `make test` green (205 unit + 79 doctest, incl. new `Mutex::new` and
     `LockOptions::builder` doctests); `cargo doc --all-features` clean.
-- **Stage 3 — Auto-refresh.** Background renewal task, abort-on-drop, lost-lock handling. Tests:
-  lease survives past `ttl`; killed refresh → `LockLost`.
+- **Stage 3 — Auto-refresh. ✅ Done.** Background renewal task, abort-on-drop, lost-lock handling.
+  - **Removed the `auto_refresh` opt-out** (struct field, builder setter, option tests): renewal is
+    l by contract — a `Mutex` that can silently lose its lease mid-hold is unsafe.
+  - `src/lock/mutex.rs`: `spawn_refresh(conn, full_key, owner, ttl_ms, lost)` ticks a
+    `tokio::time::interval` every `(ttl_ms/3).max(1)` ms (`MissedTickBehavior::Delay`, first
+    immediate tick skipped — acquire just set the lease). `Ok(true)` continues; `Ok(false)` or
+    `Err` flips a shared `Arc<AtomicBool>` and stops. `acquire_core` spawns it on every successful
+    acquire and stores the `JoinHandle` + `lost` flag on the guard.
+  - `MutexGuard`: new `refresh_handle: Option<JoinHandle<()>>` + `lost: Arc<AtomicBool>`. `release`
+    aborts the handle, returns `LockError::LockLost` if `lost` (skipping the DEL we no longer own),
+    else does the owner-checked release. `Drop` aborts the handle first, then the existing
+    fire-and-forget release.
+  - **Drive-by fix:** `acquire_core` no longer builds `tokio::time::interval(retry_interval)` — a
+    newer tokio panics on a zero period, which `try_lock` (zero interval) hit. Replaced with a
+    poll-then-`sleep` loop that tight-spins when the interval is zero (documented behavior).
+  - Tests (`src/lock/tests/mutex.rs`): `auto_refresh_keeps_lease_alive` (held lease survives past
+    `ttl`), `lost_lease_reports_lock_lost` (external `DEL` → next refresh tick → `release` returns
+    `LockLost`); replaces the now-invalid `lease_expiry_frees_lock`. Harness gains
+    `make_options_with_key` + `raw_connection` in `tests/common.rs`.
+  - Verified: `make test` green (206 unit + 79 doctest); `cargo clippy --features lock` clean for the
+    lock module.
 - **Stage 4 — RwLock backend.** ZSET reader model + writer key Lua (read/write acquire/refresh/
   release, server `TIME`, lazy purge). Direct-Redis tests for shared-read / exclusive-write /
   expiry purge.

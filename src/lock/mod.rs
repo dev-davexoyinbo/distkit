@@ -49,6 +49,17 @@ pub enum LockMode {
     Exclusive,
 }
 
+/// The state of a distributed lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockState {
+    /// The lock was successfully released.
+    Released,
+    /// The lock was lost and could not be released.
+    Lost,
+    /// The lock was acquired
+    Acquired,
+}
+
 /// Configuration for distributed-lock construction.
 ///
 /// One [`LockOptions`] describes exactly one resource: the `key` and `owner_id`
@@ -74,14 +85,15 @@ pub struct LockOptions {
     pub max_wait: Option<Duration>,
     /// Poll gap between acquire attempts for the waiting forms (default 50 ms).
     pub retry_interval: Duration,
-    /// When `true` (default), a background task renews the lease every `ttl/3`.
-    pub auto_refresh: bool,
 }
 
 impl LockOptions {
     /// Creates lock options with the documented defaults: `namespace`
     /// `distkit-locks`, `ttl` 30 s, `owner_id` a fresh UUID v4, `max_wait`
-    /// `None`, `retry_interval` 50 ms, `auto_refresh` `true`.
+    /// `None`, `retry_interval` 50 ms.
+    ///
+    /// A held lock always renews its lease in the background (every `ttl/3`);
+    /// this is unconditional and not configurable.
     ///
     /// # Examples
     ///
@@ -109,7 +121,6 @@ impl LockOptions {
             owner_id: Some(uuid::Uuid::new_v4().to_string()),
             max_wait: None,
             retry_interval: Duration::from_millis(50),
-            auto_refresh: true,
         }
     }
 
@@ -131,7 +142,7 @@ impl LockOptions {
     /// let key = DistkitRedisKey::try_from("my_resource".to_string())?;
     /// let options = LockOptions::builder(key, conn)
     ///     .ttl(Duration::from_secs(10))
-    ///     .auto_refresh(false)
+    ///     .retry_interval(Duration::from_millis(20))
     ///     .build();
     /// // options.ttl == Duration::from_secs(10)
     /// # Ok(())
@@ -194,13 +205,6 @@ impl LockOptionsBuilder {
     /// (default 50 ms).
     pub fn retry_interval(mut self, retry_interval: Duration) -> Self {
         self.options.retry_interval = retry_interval;
-        self
-    }
-
-    /// Sets whether a background task renews the lease every `ttl/3`
-    /// (default `true`).
-    pub fn auto_refresh(mut self, auto_refresh: bool) -> Self {
-        self.options.auto_refresh = auto_refresh;
         self
     }
 
