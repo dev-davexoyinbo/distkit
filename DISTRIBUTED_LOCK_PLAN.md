@@ -1,9 +1,9 @@
 # Distributed Lock Plan — `distkit`
 
-Library-friendly distributed locks for `distkit`: **`DistMutex`** and **`DistRwLock`**, with a
+Library-friendly distributed locks for `distkit`: **`Mutex`** and **`RwLock`**, with a
 surface that mirrors `tokio::sync::Mutex` / `tokio::sync::RwLock` as closely as a network lock allows.
 
-> Status: **Stage 0 (scaffolding) done; Stages 1–6 unimplemented.**
+> Status: **Stages 0–1 done (scaffolding + mutex backend); Stages 2–6 unimplemented.**
 
 ---
 
@@ -39,7 +39,7 @@ here.
 
 ### Divergences from tokio (documented, intentional)
 
-- `DistMutex` / `DistRwLock` guard **no inner data** — they are pure mutual exclusion, like
+- `Mutex` / `RwLock` guard **no inner data** — they are pure mutual exclusion, like
   `tokio::Mutex<()>`. Guards are release tokens; they do **not** `Deref` to a `T`.
 - One lock object = one resource. The key + owner are bound at construction (`LockOptions`),
   matching `tokio::Mutex::new(x)`.
@@ -58,8 +58,8 @@ src/lock/
   mod.rs        # LockOptions, LockMode, re-exports, module docs
   error.rs      # LockError enum
   backend.rs    # shared Lua consts + low-level Redis ops (acquire/refresh/release)
-  mutex.rs      # DistMutex + DistMutexGuard
-  rwlock.rs     # DistRwLock + DistRwLockReadGuard + DistRwLockWriteGuard
+  mutex.rs      # Mutex + MutexGuard
+  rwlock.rs     # RwLock + RwLockReadGuard + RwLockWriteGuard
   tests/
     common.rs   # make_mutex / make_rwlock + unique-prefix key helper
     mutex.rs
@@ -81,6 +81,7 @@ pub mod lock;
 pub struct LockOptions {
     pub key: DistkitRedisKey,
     pub connection_manager: ConnectionManager,
+    pub namespace: DistkitRedisKey,    // key prefix; default "distkit-locks". Full key = {namespace}:{key}
     pub ttl: Duration,                 // lease length (default 30s)
     pub owner_id: Option<String>,      // default: UUID v4 (uuid crate, already a dep)
     pub max_wait: Option<Duration>,    // bound for lock()/read()/write(); None => wait until acquired
@@ -89,7 +90,8 @@ pub struct LockOptions {
 }
 
 impl LockOptions {
-    // defaults: ttl=30s, owner_id=UUIDv4, max_wait=None, retry_interval=50ms, auto_refresh=true
+    // defaults: namespace="distkit-locks", ttl=30s, owner_id=UUIDv4, max_wait=None,
+    //           retry_interval=50ms, auto_refresh=true
     pub fn new(key: DistkitRedisKey, connection_manager: ConnectionManager) -> Self;
 }
 ```
@@ -97,13 +99,13 @@ impl LockOptions {
 ### Mutex — looks like `tokio::sync::Mutex`
 
 ```rust
-let m = DistMutex::new(options);                 // -> Arc<DistMutex>
+let m = Mutex::new(options);                 // -> Arc<Mutex>
 
 let g = m.lock().await?;                          // wait up to max_wait (or until acquired)
 let g = m.try_lock().await?;                      // one attempt; Err(LockError::WouldBlock) if held
 let g = m.try_lock_for(timeout, retry).await?;    // bounded wait
 
-// g: DistMutexGuard
+// g: MutexGuard
 //   - drop releases (best-effort, fire-and-forget)
 //   - g.release().await? to release and observe errors
 ```
@@ -111,7 +113,7 @@ let g = m.try_lock_for(timeout, retry).await?;    // bounded wait
 ### RwLock — looks like `tokio::sync::RwLock`
 
 ```rust
-let rw = DistRwLock::new(options);               // -> Arc<DistRwLock>
+let rw = RwLock::new(options);               // -> Arc<RwLock>
 
 let r = rw.read().await?;
 let r = rw.try_read().await?;
@@ -143,19 +145,20 @@ else if the deadline is exceeded return `LockError::WouldBlock` (timeout == 0) o
 ## Redis data model
 
 All timestamps come from `redis.call('TIME')` **inside Lua** (server clock — avoids cross-node
-skew). Keys are namespaced under the existing `{prefix}:` convention (see `RedisKeyGenerator`).
+skew). Keys are namespaced as `{namespace}:{key}`, where `namespace` comes from
+`LockOptions.namespace` (default `distkit-locks`, user-overridable).
 
 ### Mutex (same proven pattern as celeris-realtime today)
 
-- Key `{prefix}:lock:{key}` holds `owner_id`.
+- Key `{namespace}:{key}` holds `owner_id`.
 - **acquire:** `SET key owner NX PX ttl`.
 - **refresh:** Lua — `GET == owner ? PEXPIRE : 0`.
 - **release:** Lua — `GET == owner ? DEL : 0`.
 
 ### RwLock (read-preferring, v1)
 
-- Writer key `{prefix}:rwlock:{key}:w` holds the writer `owner_id` (PX ttl).
-- Readers `{prefix}:rwlock:{key}:r` = a ZSET of `reader_owner_id` scored by expiry (`now + ttl`).
+- Writer key `{namespace}:{key}:w` holds the writer `owner_id` (PX ttl).
+- Readers `{namespace}:{key}:r` = a ZSET of `reader_owner_id` scored by expiry (`now + ttl`).
 
 | Operation     | Lua (atomic)                                                                                                               |
 | ------------- | -------------------------------------------------------------------------------------------------------------------------- |
@@ -175,7 +178,7 @@ A writer-preference "pending writers" key is **future work**, not v1.
 
 ## Guards & auto-refresh
 
-- `DistMutexGuard` / `DistRwLockReadGuard` / `DistRwLockWriteGuard` each hold: the owner, the
+- `MutexGuard` / `RwLockReadGuard` / `RwLockWriteGuard` each hold: the owner, the
   key(s), a cloned `ConnectionManager`, and the refresh task `JoinHandle`.
 - **Drop:** abort the refresh task; `tokio::spawn` a fire-and-forget release (Drop is sync, release
   is async) — same approach as the current `DistributedLockGuard`. An explicit
@@ -229,23 +232,35 @@ Each stage compiles and is green via `make test` before the next begins.
     `retry_interval 50ms`, `auto_refresh true`; live-Redis doctest mirroring `CounterOptions::new`.
   - `src/lock/{backend,mutex,rwlock}.rs`: module-doc-only stubs (satisfy `deny(missing_docs)`).
     `pub use mutex::*` / `pub use rwlock::*` carry `#[allow(unused_imports)]` until Stages 2/5 add
-    types. Doc references to `DistMutex` / `DistRwLock` are plain code spans (not intra-doc links)
+    types. Doc references to `Mutex` / `RwLock` are plain code spans (not intra-doc links)
     until those types exist.
   - `src/lock/tests/{mod,common}.rs`: `make_options(name)` unique-prefix harness (mirrors
     `counter/tests/common.rs`), `#![allow(dead_code)]` until Stage 2+ test modules use it.
   - Verified: `cargo build` (lock off / `--features lock` / `--all-features`), `cargo doc
     --all-features` clean, `make test` green (77 passed incl. the new doctest).
-- **Stage 1 — Mutex backend.** Lua consts (acquire/refresh/release) + low-level fns in `backend.rs`
-  via `execute_pipeline_with_script_retry`. Direct-against-Redis unit tests for owner semantics.
-- **Stage 2 — `DistMutex` + guard.** `acquire` core + `lock`/`try_lock`/`try_lock_for`;
-  `DistMutexGuard` Drop-release + explicit `release()`. (No refresh yet.) Tests: exclusion,
-  try_lock contention, timeout, release frees.
+- **Stage 1 — Mutex backend. ✅ Done.** Three crate-internal async ops in `src/lock/backend.rs`,
+  each an atomic Redis round-trip keyed on `owner_id`, taking a fully-formed (already namespaced) key:
+  - `acquire(conn, key, owner, ttl_ms) -> bool` — plain `SET key owner NX PX ttl_ms` (no Lua).
+  - `refresh(conn, key, owner, ttl_ms) -> bool` — owner-checked `GET == owner ? PEXPIRE : 0` Lua.
+  - `release(conn, key, owner) -> bool` — owner-checked `GET == owner ? DEL : 0` Lua.
+  - Each Lua script is compiled once into a function-local `static OnceLock<Script>` (keeps the SHA
+    so the connection's EVALSHA cache stays warm); `Script::invoke_async` handles `NOSCRIPT`
+    fallback, so single-op locks need **no** `execute_pipeline_with_script_retry`. Redis failures
+    surface as `DistkitError::RedisError` via `?`.
+  - Tests: `src/lock/tests/backend.rs` (registered in `tests/mod.rs`) — 5 direct-against-Redis owner
+    cases: acquire exclusion, owner-gated refresh (+PTTL bump), owner-gated release, re-acquire after
+    release, lease-expiry frees key. Drives the backend on raw keys via `make_options`.
+  - Verified: `make test` green (194 unit + 77 doctest, all passing).
+- **Stage 2 — `Mutex` + guard.** Add `LockOptions.namespace` (`DistkitRedisKey`, default
+  `distkit-locks`, user-overridable) and assemble the backend key as `{namespace}:{key}`. `acquire`
+  core + `lock`/`try_lock`/`try_lock_for`; `MutexGuard` Drop-release + explicit `release()`. (No
+  refresh yet.) Tests: exclusion, try_lock contention, timeout, release frees.
 - **Stage 3 — Auto-refresh.** Background renewal task, abort-on-drop, lost-lock handling. Tests:
   lease survives past `ttl`; killed refresh → `LockLost`.
 - **Stage 4 — RwLock backend.** ZSET reader model + writer key Lua (read/write acquire/refresh/
   release, server `TIME`, lazy purge). Direct-Redis tests for shared-read / exclusive-write /
   expiry purge.
-- **Stage 5 — `DistRwLock` + guards.** `read`/`write` + `try_*` + `try_*_for` over the shared
+- **Stage 5 — `RwLock` + guards.** `read`/`write` + `try_*` + `try_*_for` over the shared
   `acquire` core; three guard types with Drop + refresh. Tests: N concurrent readers, writer waits
   for readers, reader waits for writer.
 - **Stage 6 — Docs, doctests, benches.** Module + type rustdoc (satisfy `#![deny(missing_docs)]`);
@@ -262,7 +277,7 @@ Each stage compiles and is green via `make test` before the next begins.
 **New**
 
 - `src/lock/{mod,error,backend,mutex,rwlock}.rs`
-- `src/lock/tests/{common,mutex,rwlock}.rs`
+- `src/lock/tests/{common,backend,mutex,rwlock}.rs`
 - `benches/lock.rs`
 
 **Edit**
@@ -295,7 +310,7 @@ Each stage compiles and is green via `make test` before the next begins.
   if `make test` does not already cover them) for the `docs/lib.md` examples.
 - `make bench` — criterion lock benches.
 - **Manual sanity:**
-  - Two `DistMutex` instances (distinct owners) on one key → the second `try_lock` returns
+  - Two `Mutex` instances (distinct owners) on one key → the second `try_lock` returns
     `WouldBlock`; `lock()` blocks then succeeds after the first guard drops.
-  - `DistRwLock` → multiple concurrent `read()` succeed; `write()` waits for all readers/the writer
+  - `RwLock` → multiple concurrent `read()` succeed; `write()` waits for all readers/the writer
     to drop.
