@@ -49,17 +49,6 @@ pub enum LockMode {
     Exclusive,
 }
 
-/// The state of a distributed lock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LockState {
-    /// The lock was successfully released.
-    Released,
-    /// The lock was lost and could not be released.
-    Lost,
-    /// The lock was acquired
-    Acquired,
-}
-
 /// Configuration for distributed-lock construction.
 ///
 /// One [`LockOptions`] describes exactly one resource: the `key` and `owner_id`

@@ -5,8 +5,10 @@
 //! inner data — it is a pure release token. Acquire is fallible and async over
 //! the network; release is best-effort on `Drop` plus an explicit awaitable
 //! [`MutexGuard::release`]. A held lock renews its lease in the background every
-//! `ttl/3`; if a renewal fails the lease is treated as lost and a later
-//! [`MutexGuard::release`] reports [`LockError::LockLost`].
+//! `ttl/3`; a failed renewal marks the lease [`LockState::Lost`], but the task
+//! keeps retrying and clears the mark if ownership is later regained. The current
+//! state is observable via [`MutexGuard::get_state`] and is also returned by
+//! [`MutexGuard::release`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +19,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::DistkitError;
-use crate::lock::{LockError, LockOptions, LockState, backend};
+use crate::lock::{LockError, LockOptions, backend};
 
 /// A distributed mutual-exclusion lock backed by Redis.
 ///
@@ -159,9 +161,11 @@ impl Mutex {
     ///
     /// Ticks every `ttl/3`, refreshing the lease while we still own it. The first
     /// (immediate) tick is skipped since `acquire` just set the lease. On any failed
-    /// renewal — lost ownership (`Ok(false)`) or a transport error (`Err`) — it flips
-    /// `lost` and stops, so a later [`MutexGuard::release`] reports
-    /// [`LockError::LockLost`].
+    /// renewal — lost ownership (`Ok(false)`) or a transport error (`Err`) — it sets
+    /// the shared `lost` flag but keeps ticking; if a later refresh succeeds it
+    /// clears the flag again. The flag is surfaced via [`MutexGuard::get_state`] /
+    /// [`MutexGuard::release`] as [`LockState::Lost`]. The task runs until the guard
+    /// aborts it on release or drop.
     fn spawn_refresh(&self, lost: Arc<AtomicBool>) -> JoinHandle<()> {
         let mut connection_manager = self.connection_manager.clone();
         let full_key = self.full_key.clone();
@@ -181,7 +185,8 @@ impl Mutex {
 
                 match backend::refresh(&mut connection_manager, &full_key, &owner, ttl_ms).await {
                     Ok(true) => {
-                        // if we got back a lost lease
+                        // Refresh succeeded; if the lease had been marked lost, we
+                        // just regained ownership — clear the flag.
                         if lost.swap(false, Ordering::AcqRel) {
                             tracing::debug!(
                                 full_key,
@@ -229,33 +234,33 @@ pub struct MutexGuard {
 
 impl MutexGuard {
     /// Returns the state of the lock.
-    pub async fn get_state(&self) -> LockState {
+    pub async fn get_state(&self) -> MutexLockState {
         if self.refresh_handle.is_none() {
-            return LockState::Released;
+            return MutexLockState::Released;
         }
 
         if self.lost.load(Ordering::Acquire) {
-            return LockState::Lost;
+            return MutexLockState::Lost;
         }
 
-        LockState::Acquired
+        MutexLockState::Acquired
     }
 
     /// Releases the lock, awaiting the round-trip so callers can observe errors. Returns the state
     /// of the lock.
-    pub async fn release(mut self) -> Result<LockState, DistkitError> {
+    pub async fn release(mut self) -> Result<MutexLockState, DistkitError> {
         if let Some(handle) = self.refresh_handle.take() {
             handle.abort();
         }
 
         if self.lost.load(Ordering::Acquire) {
-            return Ok(LockState::Lost);
+            return Ok(MutexLockState::Lost);
         }
 
         let mut connection = self.connection_manager.clone();
         backend::release(&mut connection, &self.full_key, &self.owner).await?;
 
-        Ok(LockState::Released)
+        Ok(MutexLockState::Released)
     }
 }
 
@@ -278,4 +283,15 @@ impl Drop for MutexGuard {
             }
         });
     }
+}
+
+/// The state of a distributed mutex lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutexLockState {
+    /// The lock was successfully released.
+    Released,
+    /// The lock was lost and could not be released.
+    Lost,
+    /// The lock was acquired
+    Acquired,
 }
