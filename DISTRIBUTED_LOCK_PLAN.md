@@ -3,7 +3,7 @@
 Library-friendly distributed locks for `distkit`: **`Mutex`** and **`RwLock`**, with a
 surface that mirrors `tokio::sync::Mutex` / `tokio::sync::RwLock` as closely as a network lock allows.
 
-> Status: **Stages 0–1 done (scaffolding + mutex backend); Stages 2–6 unimplemented.**
+> Status: **Stages 0–2 done (scaffolding + mutex backend + `Mutex`/guard); Stages 3–6 unimplemented.**
 
 ---
 
@@ -93,21 +93,36 @@ impl LockOptions {
     // defaults: namespace="distkit-locks", ttl=30s, owner_id=UUIDv4, max_wait=None,
     //           retry_interval=50ms, auto_refresh=true
     pub fn new(key: DistkitRedisKey, connection_manager: ConnectionManager) -> Self;
+    // Fluent alternative (sugar for LockOptionsBuilder::new); same defaults.
+    pub fn builder(key: DistkitRedisKey, connection_manager: ConnectionManager) -> LockOptionsBuilder;
+}
+
+// Chainable builder seeded with the LockOptions::new defaults.
+pub struct LockOptionsBuilder { /* ... */ }
+impl LockOptionsBuilder {
+    pub fn new(key: DistkitRedisKey, connection_manager: ConnectionManager) -> Self;
+    pub fn namespace(self, namespace: DistkitRedisKey) -> Self;
+    pub fn ttl(self, ttl: Duration) -> Self;
+    pub fn owner_id(self, owner_id: impl Into<String>) -> Self;
+    pub fn max_wait(self, max_wait: Duration) -> Self;
+    pub fn retry_interval(self, retry_interval: Duration) -> Self;
+    pub fn auto_refresh(self, auto_refresh: bool) -> Self;
+    pub fn build(self) -> LockOptions;
 }
 ```
 
 ### Mutex — looks like `tokio::sync::Mutex`
 
 ```rust
-let m = Mutex::new(options);                 // -> Arc<Mutex>
+let mutex = Mutex::new(options);                      // -> Arc<Mutex>
 
-let g = m.lock().await?;                          // wait up to max_wait (or until acquired)
-let g = m.try_lock().await?;                      // one attempt; Err(LockError::WouldBlock) if held
-let g = m.try_lock_for(timeout, retry).await?;    // bounded wait
+let guard = mutex.lock().await?;                          // wait up to max_wait (or until acquired)
+let guard = mutex.try_lock().await?;                      // one attempt; Err(LockError::AcquireFail) if held
+let guard = mutex.try_lock_for(timeout, retry).await?;    // bounded wait
 
-// g: MutexGuard
+// guard: MutexGuard
 //   - drop releases (best-effort, fire-and-forget)
-//   - g.release().await? to release and observe errors
+//   - guard.release().await? to release and observe errors
 ```
 
 ### RwLock — looks like `tokio::sync::RwLock`
@@ -127,18 +142,21 @@ let w = rw.try_write_for(timeout, retry).await?;
 ### Internal core (the only place the retry loop lives)
 
 ```rust
-async fn acquire(&self, mode: LockMode, timeout: Duration, retry_interval: Duration)
-    -> Result<RawLease, DistkitError>;
+// As implemented (Stage 2, mutex): timeout is Option<Duration> — None = forever,
+// Some(ZERO) = single shot, Some(d) = bounded. (The mode arg arrives with RwLock in Stage 5.)
+async fn acquire_core(&self, timeout: Option<Duration>, retry_interval: Duration)
+    -> Result<MutexGuard, DistkitError>;
 
-// try_lock      => acquire(mode, ZERO, ZERO)                     (single shot, no sleep)
-// try_lock_for  => acquire(mode, timeout, retry_interval)
-// lock          => acquire(mode, max_wait_or_forever, options.retry_interval)
+// try_lock      => acquire_core(Some(ZERO), ZERO)                (single shot)
+// try_lock_for  => acquire_core(Some(timeout), retry_interval)
+// lock          => acquire_core(self.max_wait, self.retry_interval)   (None => forever)
 ```
 
-Loop: run the acquire Lua once → on success build the guard (and spawn refresh) and return `Ok` →
-else if the deadline is exceeded return `LockError::WouldBlock` (timeout == 0) or
-`LockError::Timeout` → else `sleep(retry_interval)` and retry. `retry_interval == 0` with
-`timeout > 0` is a tight spin (allowed, documented).
+Loop: run the acquire round-trip once → on success build the guard and return `Ok` → else if
+`timeout == Some(ZERO)` return `LockError::AcquireFail` → else if the deadline is exceeded return
+`LockError::Timeout { waited }` → else wait one `retry_interval` tick and retry. The poll cadence
+uses a `tokio::time::interval` with `MissedTickBehavior::Delay` (first tick fires immediately);
+a `retry_interval` of zero is a tight spin (allowed, documented).
 
 ---
 
@@ -205,7 +223,7 @@ New `src/lock/error.rs`:
 ```rust
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum LockError {
-    #[error("lock is held (would block)")]       WouldBlock,
+    #[error("failed to acquire lock")]            AcquireFail,
     #[error("timed out after {waited:?}")]        Timeout { waited: Duration },
     #[error("lock lease lost (refresh failed)")]  LockLost,
     #[error("not the lock owner")]                NotOwner,
@@ -251,10 +269,29 @@ Each stage compiles and is green via `make test` before the next begins.
     cases: acquire exclusion, owner-gated refresh (+PTTL bump), owner-gated release, re-acquire after
     release, lease-expiry frees key. Drives the backend on raw keys via `make_options`.
   - Verified: `make test` green (194 unit + 77 doctest, all passing).
-- **Stage 2 — `Mutex` + guard.** Add `LockOptions.namespace` (`DistkitRedisKey`, default
-  `distkit-locks`, user-overridable) and assemble the backend key as `{namespace}:{key}`. `acquire`
-  core + `lock`/`try_lock`/`try_lock_for`; `MutexGuard` Drop-release + explicit `release()`. (No
-  refresh yet.) Tests: exclusion, try_lock contention, timeout, release frees.
+- **Stage 2 — `Mutex` + guard. ✅ Done.** User-facing `Mutex` + RAII `MutexGuard` in
+  `src/lock/mutex.rs`, key namespacing, and the shared acquire core. No auto-refresh (Stage 3).
+  - `src/lock/mod.rs`: added `LockOptions.namespace` (`DistkitRedisKey`, default `distkit-locks`
+    via `DEFAULT_LOCK_NAMESPACE`); added `LockOptionsBuilder` (chainable setters seeded by
+    `LockOptions::new`) reachable via `LockOptionsBuilder::new` **and** `LockOptions::builder`.
+  - `Mutex::new(options) -> Arc<Self>` destructures options (mirrors `StrictCounter::new`),
+    precomputes `full_key = {namespace}:{key}`, resolves `owner` (UUIDv4 default) and
+    `ttl_ms = ttl.as_millis() as i64`.
+  - Shared `acquire_core(timeout: Option<Duration>, retry_interval)` retry loop: `None` = forever,
+    `Some(ZERO)` → `AcquireFail`, `Some(d)` bounded → `Timeout { waited }`. Polls via a
+    `tokio::time::interval` (`MissedTickBehavior::Delay`, first tick immediate). `lock` /
+    `try_lock` / `try_lock_for` are thin wrappers.
+  - `MutexGuard` holds conn + `full_key` + `owner` + an `is_released` flag. `release(self)` awaits
+    `backend::release` and sets the flag; `Drop` skips when already released, else `tokio::spawn`s a
+    fire-and-forget `backend::release` (logs on error). (Refresh `JoinHandle` field lands in
+    Stage 3.)
+  - `LockError::WouldBlock` was renamed to `LockError::AcquireFail`.
+  - Tests: `src/lock/tests/mutex.rs` (exclusion, lock-waits-then-succeeds, `try_lock_for` timeout,
+    explicit-release frees, drop frees, lease-expiry frees) + `src/lock/tests/options.rs`
+    (`LockOptions` defaults, unique owner per `new`, builder defaults match `new`, builder overrides
+    every field, `LockOptions::builder` entry point).
+  - Verified: `make test` green (205 unit + 79 doctest, incl. new `Mutex::new` and
+    `LockOptions::builder` doctests); `cargo doc --all-features` clean.
 - **Stage 3 — Auto-refresh.** Background renewal task, abort-on-drop, lost-lock handling. Tests:
   lease survives past `ttl`; killed refresh → `LockLost`.
 - **Stage 4 — RwLock backend.** ZSET reader model + writer key Lua (read/write acquire/refresh/
@@ -277,7 +314,7 @@ Each stage compiles and is green via `make test` before the next begins.
 **New**
 
 - `src/lock/{mod,error,backend,mutex,rwlock}.rs`
-- `src/lock/tests/{common,backend,mutex,rwlock}.rs`
+- `src/lock/tests/{common,backend,mutex,options,rwlock}.rs`
 - `benches/lock.rs`
 
 **Edit**
