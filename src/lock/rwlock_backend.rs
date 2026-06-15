@@ -80,12 +80,12 @@ const ACQUIRE_WRITE_SCRIPT_BODY: &str = r#"
     end
 
     purge_expired_pending_writers(pending_writers_key, now, ttl_ms)
-    local pending_writers_count = redis.call('ZCARD', pending_writers_key)
+    local oldest_pending_writer = redis.call('ZRANGE', pending_writers_key, '-inf', '+inf', 'BYSCORE', 'LIMIT', 0, 1)[1]
 
     purge_expired_x_in_zset(readers_key, now, ttl_ms)
     local readers_count = redis.call('ZCARD', readers_key)
 
-    if pending_writers_count > 0 || readers_count > 0 then
+    if readers_count > 0 or (oldest_pending_writer ~= nil and oldest_pending_writer ~= owner) then
         redis.call('ZADD', pending_writers_key, 'NX', now, owner)
         redis.call('ZADD', pending_writers_heartbeat_key, now, owner)
         reset_ttl_on_keys({pending_writers_key, pending_writers_heartbeat_key}, ttl_ms)
@@ -94,11 +94,14 @@ const ACQUIRE_WRITE_SCRIPT_BODY: &str = r#"
 
 
     local res = redis.call('SET', writer_key, owner, 'NX', 'PX', ttl_ms)
-    if res == 'OK' then
-        return 1
+    if res ~= 'OK' then
+        return 0 
     end
 
-    return 0
+    redis.call('ZREM', pending_writers_key, owner)
+    redis.call('ZREM', pending_writers_heartbeat_key, owner)
+
+    return 1
 "#;
 
 const REFRESH_READ_SCRIPT_BODY: &str = r#"
@@ -136,6 +139,7 @@ const RELEASE_WRITE_LUA: &str = r#"
         return 0
     end
 "#;
+
 fn rwlock_script(body: &str) -> Script {
     Script::new(&format!("{}{}", HELPERS, body))
 }
