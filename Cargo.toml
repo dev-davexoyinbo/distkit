@@ -7,6 +7,7 @@ authors = ["Oyinbo David Bayode <dev.davexoyinbo@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/dev-davexoyinbo/distkit"
 documentation = "https://docs.rs/distkit"
+homepage = "https://distkit.davidoyinbo.com/"
 readme = "README.md"
 categories = ["algorithms", "concurrency", "data-structures"]
 keywords = ["distributed", "counter", "redis", "async", "eventual-consistency"]
