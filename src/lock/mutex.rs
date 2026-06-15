@@ -23,10 +23,38 @@ use crate::lock::{LockError, LockOptions, backend};
 
 /// A distributed mutual-exclusion lock backed by Redis.
 ///
-/// One `Mutex` describes exactly one resource: its key and owner are fixed at
-/// construction (via [`LockOptions`]), mirroring `tokio::sync::Mutex::new(x)`.
-/// Acquiring returns a [`MutexGuard`]; dropping the guard releases the lock
-/// (best-effort), or call [`MutexGuard::release`] to await and observe errors.
+/// One `Mutex` stands for exactly one resource: its Redis key and owner id are
+/// fixed when you build it from [`LockOptions`], much like
+/// `tokio::sync::Mutex::new(x)` binds the value it protects. The guard it hands
+/// back protects no data of its own — it is purely a token that says "you hold
+/// this lock right now."
+///
+/// # How a lock is held
+///
+/// Acquiring writes `key -> owner` in Redis with a TTL (the lease) and only
+/// succeeds when nobody else holds the key, so you never receive a [`MutexGuard`]
+/// without a confirmed acquisition. While the guard is alive a background task
+/// renews the lease every `ttl / 3` so it never quietly expires under you.
+/// Releasing — explicitly through [`MutexGuard::release`] or implicitly on
+/// `Drop` — stops that task and deletes the key, but only while we still own it.
+///
+/// # When a held lock can still be lost
+///
+/// The lease lives in Redis, not in this process, so holding a guard is a strong
+/// signal that you own the lock rather than an ironclad guarantee. Each refresh
+/// asks Redis to confirm ownership and extend the lease. When a refresh can't be
+/// confirmed — Redis is unreachable, the round-trip errors, or the key no longer
+/// points at us — the lock is marked [`Lost`](MutexLockState::Lost). The refresh
+/// task keeps going after that, and the next refresh it *can* confirm clears the
+/// mark and returns the lock to [`Acquired`](MutexLockState::Acquired); a short
+/// network blip usually heals itself this way.
+///
+/// A long partition is the case to watch. If we can't reach Redis for longer than
+/// the TTL, the lease expires there and another owner is free to take the key —
+/// at that point the lock really is gone, a later refresh has nothing to reclaim,
+/// and it stays `Lost`. So if correctness depends on the lock, don't lean on the
+/// guard's existence alone: call [`MutexGuard::get_state`] to re-check what we
+/// currently believe before entering the critical section.
 #[derive(Debug)]
 pub struct Mutex {
     connection_manager: ConnectionManager,
@@ -231,11 +259,18 @@ impl Mutex {
     } // end spawn_refresh
 }
 
-/// RAII release token for a held [`Mutex`].
+/// A token proving the current task holds a [`Mutex`].
 ///
-/// Dropping the guard releases the lock best-effort (fire-and-forget). Call
-/// [`MutexGuard::release`] instead to await the release and observe errors.
-/// The guard guards no inner data.
+/// You only ever get a `MutexGuard` from a confirmed acquisition, so its very
+/// existence means the lock was yours at acquire time. It stays good for as long
+/// as the background refresh keeps renewing the lease — see [`Mutex`] for the
+/// cases where that can fail and the lock turns up [`Lost`](MutexLockState::Lost).
+///
+/// Dropping the guard releases the lock on a best-effort, fire-and-forget basis.
+/// Reach for [`release`](MutexGuard::release) when you want to wait for the
+/// release to land and learn the final [`MutexLockState`], and for
+/// [`get_state`](MutexGuard::get_state) when you want to re-check ownership while
+/// still holding it. The guard carries no inner data.
 #[derive(Debug)]
 pub struct MutexGuard {
     connection_manager: ConnectionManager,
@@ -246,7 +281,17 @@ pub struct MutexGuard {
 }
 
 impl MutexGuard {
-    /// Returns the state of the lock.
+    /// Re-checks what we currently believe the lock's state to be.
+    ///
+    /// Returns [`Acquired`](MutexLockState::Acquired) while the lease is being
+    /// renewed normally, [`Lost`](MutexLockState::Lost) when a recent refresh
+    /// couldn't confirm ownership (see [`Mutex`] for why that happens and when it
+    /// recovers), and [`Released`](MutexLockState::Released) once the guard has
+    /// been released.
+    ///
+    /// This reads the latest result the background refresh recorded — it does not
+    /// make its own Redis round-trip. Reach for it before a critical section when
+    /// you need more confidence than "I'm still holding the guard."
     pub async fn get_state(&self) -> MutexLockState {
         if self.refresh_handle.is_none() {
             return MutexLockState::Released;
@@ -259,8 +304,14 @@ impl MutexGuard {
         MutexLockState::Acquired
     }
 
-    /// Releases the lock, awaiting the round-trip so callers can observe errors. Returns the state
-    /// of the lock.
+    /// Releases the lock and reports its final [`MutexLockState`].
+    ///
+    /// Stops the background refresh, then deletes the key if we still own it,
+    /// awaiting the round-trip so the caller can act on the outcome. Returns
+    /// [`Released`](MutexLockState::Released) on a clean release, or
+    /// [`Lost`](MutexLockState::Lost) if the lease had already slipped away — in
+    /// that case no delete is issued, since the key may now belong to another
+    /// owner. A failed Redis round-trip surfaces as `Err`.
     pub async fn release(mut self) -> Result<MutexLockState, DistkitError> {
         if let Some(handle) = self.refresh_handle.take() {
             handle.abort();
@@ -298,13 +349,15 @@ impl Drop for MutexGuard {
     }
 }
 
-/// The state of a distributed mutex lock.
+/// What we currently know about a held — or formerly held — [`Mutex`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutexLockState {
-    /// The lock was successfully released.
+    /// The lock has been released and is no longer held.
     Released,
-    /// The lock was lost and could not be released.
+    /// A refresh couldn't confirm ownership, so the lease is presumed gone. This
+    /// can recover on a later confirmed refresh, but if Redis stays unreachable
+    /// past the TTL the lock is genuinely lost to another owner.
     Lost,
-    /// The lock was acquired
+    /// The lock is held and its lease is being renewed in the background.
     Acquired,
 }
