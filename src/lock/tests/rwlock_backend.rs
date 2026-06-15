@@ -404,21 +404,19 @@ async fn release_write_clears_pending_on_abandon() {
 }
 
 // ---------------------------------------------------------------------------
-// Edge-case / loophole characterization tests.
+// Edge-case behavior tests.
 //
-// Each test below pins *current* backend behavior for a known edge case or
-// loophole — several are flagged as limitations in the module docstring and in
-// DISTRIBUTED_LOCK_PLAN.md. They assert what the code does today, NOT what is
-// ideal; a deliberate logic fix should flip the relevant assertion. No backend
-// logic is changed by this suite.
+// These assert the EXPECTED behavior of the rwlock backend (as defined by the
+// lock's owner), NOT whatever the code happens to do today. A failing test here
+// therefore signals a real or potential bug to fix in the backend logic — it is
+// not a cue to relax the assertion. See AGENTS.md "Testing philosophy".
 // ---------------------------------------------------------------------------
 
-/// CHARACTERIZATION (writer-handoff): a writer blocked solely by a *held* writer
-/// enqueues into `:pw` — the acquire-write block condition includes `current_writer`
-/// (`rwlock_backend.rs:93`), so writer-preference survives the handoff: a later
-/// reader is blocked by the queued writer, and on release the queued writer (not a
-/// reader) wins. This pins the *fixed* behavior; flip it if the queue-on-held-writer
-/// path is ever removed.
+/// EXPECTED (lock model): we allow many readers XOR one writer. While readers
+/// hold the lock a writer enqueues; once any writer is pending, new readers are
+/// refused until the pending queue is drained, and the queued writer (not a
+/// reader) wins the handoff. So a writer blocked by a held writer enqueues, a
+/// later reader is blocked by that queued writer, and on release the writer wins.
 #[tokio::test]
 async fn writer_blocked_by_writer_enqueues_and_keeps_preference() {
     let (mut conn, k) =
@@ -439,38 +437,45 @@ async fn writer_blocked_by_writer_enqueues_and_keeps_preference() {
         "a later reader is blocked by the queued writer (writer-preference holds)"
     );
 
-    assert!(release_write(&mut conn, &k, WRITER_A).await, "holder releases");
+    assert!(
+        release_write(&mut conn, &k, WRITER_A).await,
+        "holder releases"
+    );
     assert!(
         write_waiting(&mut conn, &k, WRITER_B, LONG_TTL).await,
         "the queued writer wins the lock on handoff, not a reader"
     );
 }
 
-/// LOOPHOLE (mixed ttl on one key): purge thresholds use the *caller's* `ttl_ms`,
-/// not a per-member stored ttl, so a reader that took a long lease is purged early
-/// by any later op passing a short ttl.
+/// EXPECTED (caller-ttl purge): there is no per-member ttl — purge thresholds
+/// follow the calling op's `ttl_ms`. So a later op passing a shorter ttl may purge
+/// an older reader that took a longer lease, and the write then proceeds. Intended.
 #[tokio::test]
-async fn mixed_ttl_purges_long_reader_early() {
-    let (mut conn, k) = conn_and_keys("mixed_ttl_purges_long_reader_early").await;
+async fn purge_uses_caller_ttl_not_per_member() {
+    let (mut conn, k) = conn_and_keys("purge_uses_caller_ttl_not_per_member").await;
 
     assert!(acquire_read(&mut conn, &k, READER_A, LONG_TTL).await);
     tokio::time::sleep(PAST_SHORT_TTL).await; // past SHORT_TTL, far short of LONG_TTL
 
     assert!(
         write_oneshot(&mut conn, &k, WRITER_A, SHORT_TTL).await,
-        "LOOPHOLE: the long-lease reader is purged by a SHORT_TTL caller's threshold"
+        "a SHORT_TTL op purges the older LONG_TTL reader and acquires"
     );
 }
 
-/// LOOPHOLE (heartbeat lapse): a waiting writer that attempts once then idles past
-/// `ttl_ms` has its `:pwh` heartbeat purged (and thus its `:pw` slot), so a writer
-/// that arrived *later* is served first — FIFO position is lost.
+/// EXPECTED (heartbeat cadence): a waiting writer must keep re-attempting faster
+/// than `ttl_ms` to hold its queue slot. If it idles past `ttl_ms` its `:pwh`
+/// heartbeat (and `:pw` slot) is purged and a later writer proceeds — i.e. the
+/// caller's retry interval must stay `< ttl`. Intended.
 #[tokio::test]
 async fn idle_waiting_writer_loses_its_slot() {
     let (mut conn, k) = conn_and_keys("idle_waiting_writer_loses_its_slot").await;
 
     assert!(acquire_read(&mut conn, &k, READER_A, SHORT_TTL).await);
-    assert!(!write_waiting(&mut conn, &k, WRITER_A, SHORT_TTL).await, "WRITER_A queues first");
+    assert!(
+        !write_waiting(&mut conn, &k, WRITER_A, SHORT_TTL).await,
+        "WRITER_A queues first"
+    );
     assert_eq!(zcard(&mut conn, &k.pending).await, 1);
 
     // WRITER_A stops re-attempting; reader + WRITER_A's heartbeat both age out.
@@ -478,58 +483,97 @@ async fn idle_waiting_writer_loses_its_slot() {
 
     assert!(
         write_waiting(&mut conn, &k, WRITER_B, SHORT_TTL).await,
-        "LOOPHOLE: later WRITER_B acquires because idle WRITER_A was purged from the queue"
+        "later WRITER_B proceeds once idle WRITER_A is purged from the queue"
     );
 }
 
-/// EDGE (`ttl_ms <= 0`, no input validation): the backend forwards a non-positive
-/// ttl straight to Redis, which treats the two acquire paths *asymmetrically* —
-/// `acquire_read`'s `PEXPIRE key 0` deletes the readers key, so the read reports
-/// success yet holds nothing; `acquire_write`'s `SET ... PX 0` is rejected as a
-/// Redis error.
+/// EXPECTED (ttl validation): every backend op that takes a `ttl_ms` must reject a
+/// non-positive value (0 or negative) with an error, in the Rust layer, before
+/// touching Redis. One test per ttl-taking entry point so each missing guard fails
+/// independently.
 #[tokio::test]
-async fn nonpositive_ttl_read_drops_silently_write_errors() {
-    let (mut conn, k) = conn_and_keys("nonpositive_ttl_read_drops_silently_write_errors").await;
-
-    assert!(
-        acquire_read(&mut conn, &k, READER_A, 0).await,
-        "acquire_read reports success even with ttl_ms = 0"
-    );
-    assert_eq!(
-        zcard(&mut conn, &k.readers).await,
-        0,
-        "EDGE: PEXPIRE 0 deletes the readers key, so the reader silently holds nothing"
-    );
-
-    let write_res = rwlock_backend::acquire_write(&mut conn, opts(&k, WRITER_A, 0), false).await;
-    assert!(
-        write_res.is_err(),
-        "EDGE: acquire_write with ttl_ms = 0 errors (Redis rejects SET ... PX 0)"
-    );
+async fn acquire_read_rejects_nonpositive_ttl() {
+    let (mut conn, k) = conn_and_keys("acquire_read_rejects_nonpositive_ttl").await;
+    for ttl in [0_i64, -1] {
+        assert!(
+            rwlock_backend::acquire_read(&mut conn, opts(&k, READER_A, ttl))
+                .await
+                .is_err(),
+            "acquire_read must error for ttl_ms = {ttl}"
+        );
+    }
 }
 
-/// EDGE (`release_read` gating): releasing a non-member, or releasing twice,
-/// returns `false`; membership is the only gate.
+#[tokio::test]
+async fn acquire_write_rejects_nonpositive_ttl() {
+    let (mut conn, k) = conn_and_keys("acquire_write_rejects_nonpositive_ttl").await;
+    for ttl in [0_i64, -1] {
+        assert!(
+            rwlock_backend::acquire_write(&mut conn, opts(&k, WRITER_A, ttl), true)
+                .await
+                .is_err(),
+            "acquire_write must error for ttl_ms = {ttl}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn refresh_read_rejects_nonpositive_ttl() {
+    let (mut conn, k) = conn_and_keys("refresh_read_rejects_nonpositive_ttl").await;
+    for ttl in [0_i64, -1] {
+        assert!(
+            rwlock_backend::refresh_read(&mut conn, &k.readers, READER_A, ttl)
+                .await
+                .is_err(),
+            "refresh_read must error for ttl_ms = {ttl}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn refresh_write_rejects_nonpositive_ttl() {
+    let (mut conn, k) = conn_and_keys("refresh_write_rejects_nonpositive_ttl").await;
+    for ttl in [0_i64, -1] {
+        assert!(
+            rwlock_backend::refresh_write(&mut conn, &k.writer, WRITER_A, ttl)
+                .await
+                .is_err(),
+            "refresh_write must error for ttl_ms = {ttl}"
+        );
+    }
+}
+
+/// EXPECTED (release_read gating): releasing a slot you don't hold — a non-member
+/// or a second release — returns `Ok(false)`, not an error. Membership is the gate.
 #[tokio::test]
 async fn release_read_nonmember_and_double_release_return_false() {
-    let (mut conn, k) = conn_and_keys("release_read_nonmember_and_double_release_return_false").await;
+    let (mut conn, k) =
+        conn_and_keys("release_read_nonmember_and_double_release_return_false").await;
 
     assert!(
-        !rwlock_backend::release_read(&mut conn, &k.readers, READER_A).await.unwrap(),
+        !rwlock_backend::release_read(&mut conn, &k.readers, READER_A)
+            .await
+            .unwrap(),
         "releasing a reader that never acquired returns false"
     );
 
     assert!(acquire_read(&mut conn, &k, READER_A, LONG_TTL).await);
-    assert!(rwlock_backend::release_read(&mut conn, &k.readers, READER_A).await.unwrap());
     assert!(
-        !rwlock_backend::release_read(&mut conn, &k.readers, READER_A).await.unwrap(),
+        rwlock_backend::release_read(&mut conn, &k.readers, READER_A)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !rwlock_backend::release_read(&mut conn, &k.readers, READER_A)
+            .await
+            .unwrap(),
         "a second release of the same reader returns false"
     );
 }
 
-/// EDGE (writer key has no lazy purge): the `:w` key self-heals purely via Redis
-/// `PX`. Once it expires, `refresh_write` reports the loss and another writer
-/// can acquire.
+/// EXPECTED (writer self-heal via PX): the `:w` key has no lazy-purge logic — it
+/// self-heals purely through Redis `PX` expiry. Once it expires, `refresh_write`
+/// reports the loss and another writer can acquire. Intended.
 #[tokio::test]
 async fn writer_key_expires_via_px_only() {
     let (mut conn, k) = conn_and_keys("writer_key_expires_via_px_only").await;
@@ -537,7 +581,10 @@ async fn writer_key_expires_via_px_only() {
     assert!(write_oneshot(&mut conn, &k, WRITER_A, SHORT_TTL).await);
     tokio::time::sleep(PAST_SHORT_TTL).await;
 
-    assert!(!writer_exists(&mut conn, &k.writer).await, "PX expired the writer key");
+    assert!(
+        !writer_exists(&mut conn, &k.writer).await,
+        "PX expired the writer key"
+    );
     assert!(
         !rwlock_backend::refresh_write(&mut conn, &k.writer, WRITER_A, SHORT_TTL)
             .await
@@ -550,34 +597,35 @@ async fn writer_key_expires_via_px_only() {
     );
 }
 
-/// EDGE (degenerate owner): an empty-string owner round-trips through
-/// acquire / reentrancy / refresh / release, and is a *real* holder (it blocks
-/// other writers) — it must not silently alias "no writer".
+/// EXPECTED (owner validation): an empty owner must be rejected with an error so
+/// it can never become a lock holder. Asserted at the acquire entry points; fails
+/// until the Rust layer validates the owner.
 #[tokio::test]
-async fn empty_owner_round_trips() {
-    let (mut conn, k) = conn_and_keys("empty_owner_round_trips").await;
-
-    assert!(write_oneshot(&mut conn, &k, "", LONG_TTL).await, "empty owner acquires");
+async fn acquire_read_rejects_empty_owner() {
+    let (mut conn, k) = conn_and_keys("acquire_read_rejects_empty_owner").await;
     assert!(
-        write_oneshot(&mut conn, &k, "", LONG_TTL).await,
-        "empty owner re-acquires its own write (reentrant)"
+        rwlock_backend::acquire_read(&mut conn, opts(&k, "", LONG_TTL))
+            .await
+            .is_err(),
+        "acquire_read must error for an empty owner"
     );
-    assert!(
-        !write_oneshot(&mut conn, &k, WRITER_A, LONG_TTL).await,
-        "the empty owner is a real holder and blocks another writer"
-    );
-    assert!(
-        rwlock_backend::refresh_write(&mut conn, &k.writer, "", LONG_TTL).await.unwrap(),
-        "empty owner refreshes"
-    );
-    assert!(release_write(&mut conn, &k, "").await, "empty owner releases");
-    assert!(!writer_exists(&mut conn, &k.writer).await, "key gone after release");
 }
 
-/// LOOPHOLE (same-millisecond tie-break): `:pw` scores are arrival ms, so two
-/// writers enqueued in the same ms tie on score and Redis serves the
-/// lexicographically smaller member first — not the true earliest arrival. Seed
-/// the tie directly to make it deterministic.
+#[tokio::test]
+async fn acquire_write_rejects_empty_owner() {
+    let (mut conn, k) = conn_and_keys("acquire_write_rejects_empty_owner").await;
+    assert!(
+        rwlock_backend::acquire_write(&mut conn, opts(&k, "", LONG_TTL), true)
+            .await
+            .is_err(),
+        "acquire_write must error for an empty owner"
+    );
+}
+
+/// EXPECTED (FIFO granularity): writer FIFO is guaranteed only across distinct
+/// arrival milliseconds. Within the same ms the `:pw` scores tie and the order is
+/// broken lexically by owner id — same-ms ordering is not an arrival guarantee.
+/// Intended; this pins the documented granularity.
 #[tokio::test]
 async fn same_ms_writer_fifo_is_lexical() {
     let (mut conn, k) = conn_and_keys("same_ms_writer_fifo_is_lexical").await;
@@ -594,11 +642,11 @@ async fn same_ms_writer_fifo_is_lexical() {
     // No readers, no held writer: the queue front decides.
     assert!(
         !write_waiting(&mut conn, &k, WRITER_B, LONG_TTL).await,
-        "LOOPHOLE: WRITER_B yields to the lexically smaller member despite the tie"
+        "WRITER_B yields to the lexically smaller member on a same-ms tie"
     );
     assert!(
         write_waiting(&mut conn, &k, WRITER_A, LONG_TTL).await,
-        "the lexically smaller member wins the same-ms tie, not strict arrival order"
+        "the lexically smaller member wins the same-ms tie"
     );
 }
 
@@ -612,15 +660,26 @@ async fn write_held_until_all_readers_released() {
     assert!(acquire_read(&mut conn, &k, READER_A, LONG_TTL).await);
     assert!(acquire_read(&mut conn, &k, READER_B, LONG_TTL).await);
 
-    assert!(!write_waiting(&mut conn, &k, WRITER_A, LONG_TTL).await, "two readers block the write");
+    assert!(
+        !write_waiting(&mut conn, &k, WRITER_A, LONG_TTL).await,
+        "two readers block the write"
+    );
 
-    assert!(rwlock_backend::release_read(&mut conn, &k.readers, READER_A).await.unwrap());
+    assert!(
+        rwlock_backend::release_read(&mut conn, &k.readers, READER_A)
+            .await
+            .unwrap()
+    );
     assert!(
         !write_waiting(&mut conn, &k, WRITER_A, LONG_TTL).await,
         "still blocked while one reader remains"
     );
 
-    assert!(rwlock_backend::release_read(&mut conn, &k.readers, READER_B).await.unwrap());
+    assert!(
+        rwlock_backend::release_read(&mut conn, &k.readers, READER_B)
+            .await
+            .unwrap()
+    );
     assert!(
         write_waiting(&mut conn, &k, WRITER_A, LONG_TTL).await,
         "write acquires only once the last reader is gone"

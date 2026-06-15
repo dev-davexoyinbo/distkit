@@ -24,3 +24,9 @@
 - Public API docs usually need updates in `docs/lib.md` as well as module docs because `src/lib.rs` includes that file as the crate root docs.
 - Lax counters and lock guards use background Tokio tasks; drops/releases can be asynchronous, so tests often need explicit awaits or short sleeps rather than assuming immediate Redis state.
 - `DISTRIBUTED_LOCK_PLAN.md` is useful roadmap context, but current code wins where it conflicts; it still references future lock stages and unimplemented artifacts.
+
+## Testing Philosophy
+- Tests assert **expected** behavior — what the code *should* do — not the behavior the current implementation happens to exhibit. Never write a test whose assertions are reverse-engineered from the implementation, docs, or other tests.
+- A failing test is a signal of a real or potential bug in the **main code**, to be fixed there. It is never a cue to relax the assertion to match the code, and do not use `#[ignore]` to hide an expected-behavior failure.
+- When the expected behavior is unclear, ask the behavior's owner (the human) — do not infer it from `DISTRIBUTED_LOCK_PLAN.md`, the Lua/Rust source, or pre-existing tests.
+- It is fine (and expected) to commit tests that fail against today's code: they document the target behavior until the main logic is corrected.
