@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 use redis::{Script, aio::ConnectionManager};
 
 use crate::DistkitError;
+use crate::lock::error::{validate_owner, validate_ttl};
 
 /// Owner-checked PEXPIRE: extend the lease only if we still own it.
 const REFRESH_LUA: &str = r#"
@@ -36,6 +37,9 @@ pub(crate) async fn acquire(
     owner: &str,
     ttl_ms: i64,
 ) -> Result<bool, DistkitError> {
+    validate_owner(owner)?;
+    validate_ttl(ttl_ms)?;
+
     let res: Option<String> = redis::cmd("SET")
         .arg(key)
         .arg(owner)
@@ -55,6 +59,8 @@ pub(crate) async fn refresh(
     owner: &str,
     ttl_ms: i64,
 ) -> Result<bool, DistkitError> {
+    validate_ttl(ttl_ms)?;
+
     static REFRESH_SCRIPT: OnceLock<Script> = OnceLock::new();
     let script = REFRESH_SCRIPT.get_or_init(|| Script::new(REFRESH_LUA));
 

@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 use redis::{Script, aio::ConnectionManager};
 
 use crate::DistkitError;
+use crate::lock::error::{validate_owner, validate_ttl};
 
 pub(crate) const HELPERS: &str = r#"
 local function now_ms()
@@ -181,6 +182,9 @@ pub(crate) async fn acquire_read(
         pending_writers_heartbeat_key,
     }: AcquireOptions<'_>,
 ) -> Result<bool, DistkitError> {
+    validate_owner(owner)?;
+    validate_ttl(ttl_ms)?;
+
     static SCRIPT: OnceLock<Script> = OnceLock::new();
     let script = SCRIPT.get_or_init(|| rwlock_script(ACQUIRE_READ_SCRIPT_BODY));
 
@@ -210,6 +214,9 @@ pub(crate) async fn acquire_write(
     }: AcquireOptions<'_>,
     should_mark_pending: bool,
 ) -> Result<bool, DistkitError> {
+    validate_owner(owner)?;
+    validate_ttl(ttl_ms)?;
+
     static SCRIPT: OnceLock<Script> = OnceLock::new();
     let script = SCRIPT.get_or_init(|| rwlock_script(ACQUIRE_WRITE_SCRIPT_BODY));
 
@@ -234,6 +241,8 @@ pub(crate) async fn refresh_read(
     owner: &str,
     ttl_ms: i64,
 ) -> Result<bool, DistkitError> {
+    validate_ttl(ttl_ms)?;
+
     static SCRIPT: OnceLock<Script> = OnceLock::new();
     let script = SCRIPT.get_or_init(|| rwlock_script(REFRESH_READ_SCRIPT_BODY));
 
@@ -291,6 +300,8 @@ pub(crate) async fn refresh_write(
     owner: &str,
     ttl_ms: i64,
 ) -> Result<bool, DistkitError> {
+    validate_ttl(ttl_ms)?;
+
     static SCRIPT: OnceLock<Script> = OnceLock::new();
     let script = SCRIPT.get_or_init(|| rwlock_script(REFRESH_WRITE_SCRIPT_BODY));
 

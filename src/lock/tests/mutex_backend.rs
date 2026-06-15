@@ -127,6 +127,42 @@ async fn acquire_succeeds_after_release() {
     );
 }
 
+/// EXPECTED (ttl validation): `acquire` and `refresh` must reject a non-positive
+/// `ttl_ms` (0 or negative) with an error, in the Rust layer, before touching
+/// Redis. Mirrors the rwlock_backend validation tests.
+#[tokio::test]
+async fn acquire_rejects_nonpositive_ttl() {
+    let (mut conn, key) = conn_and_key("acquire_rejects_nonpositive_ttl").await;
+    for ttl in [0_i64, -1] {
+        assert!(
+            mutex_backend::acquire(&mut conn, &key, OWNER_A, ttl).await.is_err(),
+            "acquire must error for ttl_ms = {ttl}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn refresh_rejects_nonpositive_ttl() {
+    let (mut conn, key) = conn_and_key("refresh_rejects_nonpositive_ttl").await;
+    for ttl in [0_i64, -1] {
+        assert!(
+            mutex_backend::refresh(&mut conn, &key, OWNER_A, ttl).await.is_err(),
+            "refresh must error for ttl_ms = {ttl}"
+        );
+    }
+}
+
+/// EXPECTED (owner validation): an empty owner must be rejected with an error so
+/// it can never become a lock holder.
+#[tokio::test]
+async fn acquire_rejects_empty_owner() {
+    let (mut conn, key) = conn_and_key("acquire_rejects_empty_owner").await;
+    assert!(
+        mutex_backend::acquire(&mut conn, &key, "", 30_000).await.is_err(),
+        "acquire must error for an empty owner"
+    );
+}
+
 #[tokio::test]
 async fn lease_expiry_frees_key() {
     let (mut conn, key) = conn_and_key("lease_expiry_frees_key").await;
