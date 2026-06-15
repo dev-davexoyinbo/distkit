@@ -205,3 +205,18 @@ pub(crate) async fn refresh_read(
     Ok(n == 1)
 }
 
+///...
+pub(crate) async fn release_read(
+    conn: &mut ConnectionManager,
+    readers_key: &str,
+    owner: &str,
+) -> Result<bool, DistkitError> {
+    let n: i64 = redis::cmd("ZREM")
+        .arg(readers_key)
+        .arg(owner)
+        .query_async(conn)
+        .await?;
+
+    Ok(n == 1)
+}
+
