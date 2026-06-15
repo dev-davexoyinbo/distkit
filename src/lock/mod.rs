@@ -21,8 +21,6 @@ mod mutex;
 pub use mutex::*;
 
 mod rwlock;
-// Re-export is empty until Stage 5 adds `RwLock` + its guards.
-#[allow(unused_imports)]
 pub use rwlock::*;
 
 use std::time::Duration;

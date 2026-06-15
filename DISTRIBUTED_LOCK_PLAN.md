@@ -3,7 +3,7 @@
 Library-friendly distributed locks for `distkit`: **`Mutex`** and **`RwLock`**, with a
 surface that mirrors `tokio::sync::Mutex` / `tokio::sync::RwLock` as closely as a network lock allows.
 
-> Status: **Stages 0–4 done (scaffolding + mutex backend + `Mutex`/guard + auto-refresh + writer-preferring rwlock backend), plus Rust-layer input validation (`ttl_ms`/`owner`) on both backends; Stages 5–6 unimplemented.** `make test`: 238 unit + 79 doctest, green. Test suites follow the "Testing Philosophy" in `AGENTS.md` — they assert expected behavior, and a failure is a bug to fix in the backend.
+> Status: **Stages 0–5 done (scaffolding + mutex backend + `Mutex`/guard + auto-refresh + writer-preferring rwlock backend + `RwLock`/guards), plus Rust-layer input validation (`ttl_ms`/`owner`) on both backends; Stage 6 unimplemented.** `make test`: 249 unit + 80 doctest, green. Test suites follow the "Testing Philosophy" in `AGENTS.md` — they assert expected behavior, and a failure is a bug to fix in the backend.
 
 ---
 
@@ -450,9 +450,35 @@ Each stage compiles and is green via `make test` before the next begins.
   - Verified: `make test` green (238 unit + 79 doctest); `cargo clippy --features lock --tests`
     clean for the lock module. (The ops show `dead_code` in a plain non-test build until Stage 5
     consumes them — same interim as Stage 0's `allow(unused_imports)`.)
-- **Stage 5 — `RwLock` + guards.** `read`/`write` + `try_*` + `try_*_for` over the shared
-  `acquire` core; three guard types with Drop + refresh. Tests: N concurrent readers, writer waits
-  for readers, reader waits for writer.
+- **Stage 5 — `RwLock` + guards. ✅ Done.** User-facing `RwLock` + RAII `RwLockReadGuard` /
+  `RwLockWriteGuard` in `src/lock/rwlock.rs`, mirroring `Mutex`/`MutexGuard` and dispatching read vs
+  write via the existing `LockMode`. The `:w`/`:r`/`:pw`/`:pwh` keys are derived in `RwLock::new`.
+  - Six acquire forms (`read`/`try_read`/`try_read_for` + `write`/`try_write`/`try_write_for`) are
+    thin wrappers over `acquire_loop(mode, timeout, retry_interval)` — same retry/timeout/interval
+    skeleton as the mutex `acquire_core` (lazy `tokio::time::interval`, zero interval ⇒ one-shot,
+    `AcquireFail`/`Timeout { waited }`/forever). On success each `acquire_*` path builds its guard +
+    spawns the mode-appropriate refresh.
+  - **`mark_pending = !retry_interval.is_zero()`:** the waiting write forms enqueue into `:pw`/`:pwh`
+    (FIFO preference); one-shot `try_write` passes `false` so a failed attempt never blocks readers.
+  - **Give-up cleanup:** when a `mark_pending` writer exhausts its timeout / returns `AcquireFail`,
+    `acquire_loop` calls `release_write` to `ZREM` its `:pw`/`:pwh` slot (no new backend op needed;
+    `release_write` already clears pending and no-ops the writer DEL we don't own). A future dropped
+    mid-`await` self-heals via the `:pwh` heartbeat lapse.
+  - **Guards:** read guard carries `:r` + owner (release/refresh via `release_read`/`refresh_read`);
+    write guard carries `:w`/`:pw`/`:pwh` + owner (via `release_write`/`refresh_write`). Both follow
+    the `MutexGuard` shape — `refresh_handle: Option<JoinHandle>` + `lost: Arc<AtomicBool>`,
+    `get_state`, awaitable `release`, fire-and-forget `Drop`. `spawn_refresh(mode, lost)` dispatches
+    the per-mode refresh in one shared task body. New `RwLockState { Released, Lost, Acquired }`
+    mirrors `MutexLockState`.
+  - `src/lock/mod.rs`: dropped the `#[allow(unused_imports)]` on `pub use rwlock::*`; the rwlock
+    backend ops are no longer `dead_code`.
+  - Tests (`src/lock/tests/rwlock.rs`, registered in `tests/mod.rs`): `concurrent_reads_share`,
+    `writer_excludes_readers`, `writer_waits_for_readers`, `reader_waits_for_writer`,
+    `waiting_writer_blocks_new_readers` (writer preference), `write_release_frees`, `read_drop_frees`,
+    `auto_refresh_keeps_lease_alive`, `get_state_reports_acquired`, `lost_lease_reports_lost`,
+    `try_write_does_not_block_readers`.
+  - Verified: `make test` green (249 unit + 80 doctest, incl. the new `RwLock::new` doctest);
+    `cargo clippy --features lock --tests` clean for the lock module; `cargo build --features lock` ok.
 - **Stage 6 — Docs, doctests, benches.** Module + type rustdoc (satisfy `#![deny(missing_docs)]`);
   doctests in `docs/lib.md`; criterion bench `benches/lock.rs` mirroring `benches/strict_counter.rs`;
   update `README.md`, `CLAUDE.md`, and the `docs/lib.md` feature table.
