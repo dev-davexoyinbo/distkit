@@ -468,8 +468,10 @@ Each stage compiles and is green via `make test` before the next begins.
     write guard carries `:w`/`:pw`/`:pwh` + owner (via `release_write`/`refresh_write`). Both follow
     the `MutexGuard` shape — `refresh_handle: Option<JoinHandle>` + `lost: Arc<AtomicBool>`,
     `get_state`, awaitable `release`, fire-and-forget `Drop`. `spawn_refresh(mode, lost)` dispatches
-    the per-mode refresh in one shared task body. New `RwLockState { Released, Lost, Acquired }`
-    mirrors `MutexLockState`.
+    the per-mode refresh in one shared task body. Guard state is the shared
+    `LockGuardState { Released, Lost, Acquired }` in `src/lock/mod.rs` (the old per-type
+    `MutexLockState`/`RwLockState` were unified into it — every guard's `get_state`/`release`
+    returns it).
   - `src/lock/mod.rs`: dropped the `#[allow(unused_imports)]` on `pub use rwlock::*`; the rwlock
     backend ops are no longer `dead_code`.
   - Tests (`src/lock/tests/rwlock.rs`, registered in `tests/mod.rs`): `concurrent_reads_share`,

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::DistkitError;
 use crate::lock::tests::common::{make_options, make_options_with_rw_keys, raw_connection};
-use crate::lock::{LockError, RwLock, RwLockState};
+use crate::lock::{LockError, RwLock, LockGuardState};
 
 /// Multiple readers share the lock: two `try_read` guards are held at once.
 #[tokio::test]
@@ -166,18 +166,18 @@ async fn auto_refresh_keeps_lease_alive() {
     }
 }
 
-/// A healthy held read reports [`RwLockState::Acquired`].
+/// A healthy held read reports [`LockGuardState::Acquired`].
 #[tokio::test]
 async fn get_state_reports_acquired() {
     let reader = RwLock::new(make_options("get_state_reports_acquired").await);
 
     let guard = reader.try_read().await.expect("reader should acquire");
 
-    assert_eq!(guard.get_state().await, RwLockState::Acquired);
+    assert_eq!(guard.get_state().await, LockGuardState::Acquired);
 }
 
 /// If the write lease is lost (writer key deleted out from under us), the refresh
-/// task marks it [`RwLockState::Lost`]: `get_state` reports it and `release`
+/// task marks it [`LockGuardState::Lost`]: `get_state` reports it and `release`
 /// returns `Ok(Lost)` without issuing a delete we no longer own.
 #[tokio::test]
 async fn lost_lease_reports_lost() {
@@ -200,13 +200,13 @@ async fn lost_lease_reports_lost() {
 
     assert_eq!(
         guard.get_state().await,
-        RwLockState::Lost,
+        LockGuardState::Lost,
         "lease should be marked lost after the writer key was deleted"
     );
 
     match guard.release().await {
-        Ok(RwLockState::Lost) => {}
-        other => panic!("expected Ok(RwLockState::Lost) after the lease was deleted, got {other:?}"),
+        Ok(LockGuardState::Lost) => {}
+        other => panic!("expected Ok(LockGuardState::Lost) after the lease was deleted, got {other:?}"),
     }
 }
 

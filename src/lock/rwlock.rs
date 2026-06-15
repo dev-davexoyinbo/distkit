@@ -5,7 +5,7 @@
 //! inner data — they are pure access tokens. Acquire is fallible and async over
 //! the network; release is best-effort on `Drop` plus an explicit awaitable
 //! `release()`. A held lock renews its lease in the background every `ttl/3`; a
-//! failed renewal marks the lease [`RwLockState::Lost`], but the task keeps
+//! failed renewal marks the lease [`LockGuardState::Lost`], but the task keeps
 //! retrying and clears the mark if ownership is later regained. The current state
 //! is observable via `get_state` and is also returned by `release`.
 //!
@@ -24,7 +24,7 @@ use tokio::time::{MissedTickBehavior, interval};
 
 use crate::DistkitError;
 use crate::lock::rwlock_backend::AcquireOptions;
-use crate::lock::{LockError, LockMode, LockOptions, rwlock_backend};
+use crate::lock::{LockError, LockGuardState, LockMode, LockOptions, rwlock_backend};
 
 /// A distributed reader-writer lock backed by Redis.
 ///
@@ -53,7 +53,7 @@ use crate::lock::{LockError, LockMode, LockOptions, rwlock_backend};
 /// The lease lives in Redis, not in this process, so holding a guard is a strong
 /// signal rather than an ironclad guarantee. Each refresh asks Redis to confirm
 /// ownership and extend the lease; when a refresh can't be confirmed the lock is
-/// marked [`Lost`](RwLockState::Lost). The refresh task keeps going, and the next
+/// marked [`Lost`](LockGuardState::Lost). The refresh task keeps going, and the next
 /// refresh it *can* confirm clears the mark — a short network blip usually heals
 /// itself. A partition longer than the TTL is the real hazard: the lease expires,
 /// another owner can take the resource, and the lock stays `Lost`. If correctness
@@ -381,10 +381,10 @@ impl RwLock {
 ///
 /// You only ever get a `RwLockReadGuard` from a confirmed acquisition. It stays
 /// good while the background refresh keeps renewing the lease — see [`RwLock`] for
-/// the cases where that can fail and the lock turns up [`Lost`](RwLockState::Lost).
+/// the cases where that can fail and the lock turns up [`Lost`](LockGuardState::Lost).
 /// Dropping the guard releases the read on a best-effort, fire-and-forget basis;
 /// reach for [`release`](RwLockReadGuard::release) to await it and learn the final
-/// [`RwLockState`], and [`get_state`](RwLockReadGuard::get_state) to re-check while
+/// [`LockGuardState`], and [`get_state`](RwLockReadGuard::get_state) to re-check while
 /// still holding it. The guard carries no inner data.
 #[derive(Debug)]
 pub struct RwLockReadGuard {
@@ -398,28 +398,28 @@ pub struct RwLockReadGuard {
 impl RwLockReadGuard {
     /// Re-checks what we currently believe the lock's state to be, reading the
     /// latest result the background refresh recorded (no Redis round-trip). See
-    /// [`RwLock`] for when a held lock turns up [`Lost`](RwLockState::Lost).
-    pub async fn get_state(&self) -> RwLockState {
+    /// [`RwLock`] for when a held lock turns up [`Lost`](LockGuardState::Lost).
+    pub async fn get_state(&self) -> LockGuardState {
         state_from(&self.refresh_handle, &self.lost)
     }
 
-    /// Releases the read and reports its final [`RwLockState`]. Stops the refresh,
+    /// Releases the read and reports its final [`LockGuardState`]. Stops the refresh,
     /// then removes our reader slot if the lease is still ours; if the lease had
-    /// slipped away returns [`Lost`](RwLockState::Lost) without a round-trip. A
+    /// slipped away returns [`Lost`](LockGuardState::Lost) without a round-trip. A
     /// failed Redis round-trip surfaces as `Err`.
-    pub async fn release(mut self) -> Result<RwLockState, DistkitError> {
+    pub async fn release(mut self) -> Result<LockGuardState, DistkitError> {
         if let Some(handle) = self.refresh_handle.take() {
             handle.abort();
         }
 
         if self.lost.load(Ordering::Acquire) {
-            return Ok(RwLockState::Lost);
+            return Ok(LockGuardState::Lost);
         }
 
         let mut connection = self.connection_manager.clone();
         rwlock_backend::release_read(&mut connection, &self.readers_key, &self.owner).await?;
 
-        Ok(RwLockState::Released)
+        Ok(LockGuardState::Released)
     }
 }
 
@@ -449,10 +449,10 @@ impl Drop for RwLockReadGuard {
 ///
 /// You only ever get a `RwLockWriteGuard` from a confirmed acquisition. It stays
 /// good while the background refresh keeps renewing the lease — see [`RwLock`] for
-/// the cases where that can fail and the lock turns up [`Lost`](RwLockState::Lost).
+/// the cases where that can fail and the lock turns up [`Lost`](LockGuardState::Lost).
 /// Dropping the guard releases the write on a best-effort, fire-and-forget basis;
 /// reach for [`release`](RwLockWriteGuard::release) to await it and learn the
-/// final [`RwLockState`], and [`get_state`](RwLockWriteGuard::get_state) to
+/// final [`LockGuardState`], and [`get_state`](RwLockWriteGuard::get_state) to
 /// re-check while still holding it. The guard carries no inner data.
 #[derive(Debug)]
 pub struct RwLockWriteGuard {
@@ -468,23 +468,23 @@ pub struct RwLockWriteGuard {
 impl RwLockWriteGuard {
     /// Re-checks what we currently believe the lock's state to be, reading the
     /// latest result the background refresh recorded (no Redis round-trip). See
-    /// [`RwLock`] for when a held lock turns up [`Lost`](RwLockState::Lost).
-    pub async fn get_state(&self) -> RwLockState {
+    /// [`RwLock`] for when a held lock turns up [`Lost`](LockGuardState::Lost).
+    pub async fn get_state(&self) -> LockGuardState {
         state_from(&self.refresh_handle, &self.lost)
     }
 
-    /// Releases the write and reports its final [`RwLockState`]. Stops the
+    /// Releases the write and reports its final [`LockGuardState`]. Stops the
     /// refresh, then deletes the writer key if the lease is still ours (also
     /// clearing any pending slot); if the lease had slipped away returns
-    /// [`Lost`](RwLockState::Lost) without a delete. A failed Redis round-trip
+    /// [`Lost`](LockGuardState::Lost) without a delete. A failed Redis round-trip
     /// surfaces as `Err`.
-    pub async fn release(mut self) -> Result<RwLockState, DistkitError> {
+    pub async fn release(mut self) -> Result<LockGuardState, DistkitError> {
         if let Some(handle) = self.refresh_handle.take() {
             handle.abort();
         }
 
         if self.lost.load(Ordering::Acquire) {
-            return Ok(RwLockState::Lost);
+            return Ok(LockGuardState::Lost);
         }
 
         let mut connection = self.connection_manager.clone();
@@ -497,7 +497,7 @@ impl RwLockWriteGuard {
         )
         .await?;
 
-        Ok(RwLockState::Released)
+        Ok(LockGuardState::Released)
     }
 }
 
@@ -534,27 +534,14 @@ impl Drop for RwLockWriteGuard {
 
 /// Shared `get_state` body: `None` handle ⇒ released; `lost` set ⇒ lost; else
 /// acquired.
-fn state_from(refresh_handle: &Option<JoinHandle<()>>, lost: &AtomicBool) -> RwLockState {
+fn state_from(refresh_handle: &Option<JoinHandle<()>>, lost: &AtomicBool) -> LockGuardState {
     if refresh_handle.is_none() {
-        return RwLockState::Released;
+        return LockGuardState::Released;
     }
 
     if lost.load(Ordering::Acquire) {
-        return RwLockState::Lost;
+        return LockGuardState::Lost;
     }
 
-    RwLockState::Acquired
-}
-
-/// What we currently know about a held — or formerly held — [`RwLock`] guard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RwLockState {
-    /// The lock has been released and is no longer held.
-    Released,
-    /// A refresh couldn't confirm ownership, so the lease is presumed gone. This
-    /// can recover on a later confirmed refresh, but if Redis stays unreachable
-    /// past the TTL the lock is genuinely lost to another owner.
-    Lost,
-    /// The lock is held and its lease is being renewed in the background.
-    Acquired,
+    LockGuardState::Acquired
 }

@@ -1,13 +1,13 @@
 //! Live-Redis tests for the [`Mutex`](crate::lock::Mutex) and its
 //! [`MutexGuard`](crate::lock::MutexGuard): exclusion, bounded waiting,
 //! release-frees semantics, and Stage 3 auto-refresh (lease kept alive past
-//! `ttl`; a lost lease surfaces as [`MutexLockState::Lost`]).
+//! `ttl`; a lost lease surfaces as [`LockGuardState::Lost`]).
 
 use std::time::Duration;
 
 use crate::DistkitError;
 use crate::lock::tests::common::{make_options, make_options_with_key, raw_connection};
-use crate::lock::{LockError, Mutex, MutexLockState};
+use crate::lock::{LockError, Mutex, LockGuardState};
 
 /// Two mutexes (distinct owners) on the same key: the second `try_lock` is
 /// excluded while the first guard is held.
@@ -145,7 +145,7 @@ async fn auto_refresh_keeps_lease_alive() {
     }
 }
 
-/// A healthy held lock reports [`MutexLockState::Acquired`].
+/// A healthy held lock reports [`LockGuardState::Acquired`].
 #[tokio::test]
 async fn get_state_reports_acquired_while_held() {
     let mutex = Mutex::new(make_options("get_state_reports_acquired_while_held").await);
@@ -155,12 +155,12 @@ async fn get_state_reports_acquired_while_held() {
         .await
         .expect("try_lock should take the lock");
 
-    assert_eq!(guard.get_state().await, MutexLockState::Acquired);
+    assert_eq!(guard.get_state().await, LockGuardState::Acquired);
 }
 
 /// If the lease is lost while held (key deleted out from under us), the refresh
-/// task marks it [`MutexLockState::Lost`]: `get_state` reports it and `release`
-/// returns `Ok(MutexLockState::Lost)` without issuing a DEL we no longer own.
+/// task marks it [`LockGuardState::Lost`]: `get_state` reports it and `release`
+/// returns `Ok(LockGuardState::Lost)` without issuing a DEL we no longer own.
 #[tokio::test]
 async fn lost_lease_reports_lost_state() {
     let (mut options, full_key) = make_options_with_key("lost_lease_reports_lost_state").await;
@@ -186,14 +186,14 @@ async fn lost_lease_reports_lost_state() {
 
     assert_eq!(
         guard.get_state().await,
-        MutexLockState::Lost,
+        LockGuardState::Lost,
         "lease should be marked lost after the key was deleted"
     );
 
     match guard.release().await {
-        Ok(MutexLockState::Lost) => {}
+        Ok(LockGuardState::Lost) => {}
         other => {
-            panic!("expected Ok(MutexLockState::Lost) after the lease was deleted, got {other:?}")
+            panic!("expected Ok(LockGuardState::Lost) after the lease was deleted, got {other:?}")
         }
     }
 }

@@ -48,6 +48,22 @@ pub enum LockMode {
     Exclusive,
 }
 
+/// What we currently know about a held — or formerly held — lock guard.
+///
+/// Shared by every guard type ([`MutexGuard`], [`RwLockReadGuard`],
+/// [`RwLockWriteGuard`]); returned by each guard's `get_state` and `release`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockGuardState {
+    /// The lock has been released and is no longer held.
+    Released,
+    /// A refresh couldn't confirm ownership, so the lease is presumed gone. This
+    /// can recover on a later confirmed refresh, but if Redis stays unreachable
+    /// past the TTL the lock is genuinely lost to another owner.
+    Lost,
+    /// The lock is held and its lease is being renewed in the background.
+    Acquired,
+}
+
 /// Configuration for distributed-lock construction.
 ///
 /// One [`LockOptions`] describes exactly one resource: the `key` and `owner_id`
