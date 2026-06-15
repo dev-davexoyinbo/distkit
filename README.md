@@ -12,6 +12,8 @@ distkit provides building blocks for distributed applications. It ships
 distributed counters (strict and lax), instance-aware counters, distributed
 locks (`Mutex`, `RwLock`), and rate limiting, all backed by Redis.
 
+Documentation and guides: <https://distkit.davidoyinbo.com>
+
 ## Features
 
 - **StrictCounter** -- every operation executes a Redis Lua script atomically.
@@ -50,14 +52,14 @@ Or add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-distkit = "0.4"
+distkit = "0.5"
 ```
 
 To enable instance-aware counters or rate limiting:
 
 ```toml
 [dependencies]
-distkit = { version = "0.4", features = ["instance-aware-counter", "trypema"] }
+distkit = { version = "0.5", features = ["instance-aware-counter", "trypema"] }
 ```
 
 distkit requires a running Redis instance (5.0+ for Lua script support).
@@ -172,7 +174,7 @@ Enable the `instance-aware-counter` feature:
 
 ```toml
 [dependencies]
-distkit = { version = "0.4", features = ["instance-aware-counter"] }
+distkit = { version = "0.5", features = ["instance-aware-counter"] }
 ```
 
 Instance-aware counters track each running instance's contribution separately.
@@ -321,7 +323,7 @@ Enable the `lock` feature for Redis-backed `Mutex` and `RwLock`:
 
 ```toml
 [dependencies]
-distkit = { version = "0.4", features = ["lock"] }
+distkit = { version = "0.5", features = ["lock"] }
 ```
 
 Both mirror the surface of `tokio::sync::Mutex` / `tokio::sync::RwLock`. The
@@ -371,7 +373,7 @@ Trypema documentation website: <https://trypema.davidoyinbo.com>
 
 ```toml
 [dependencies]
-distkit = { version = "0.4", features = ["trypema"] }
+distkit = { version = "0.5", features = ["trypema"] }
 ```
 
 All public types from the [`trypema`](https://docs.rs/trypema) crate are
