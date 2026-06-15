@@ -16,6 +16,19 @@ local function reset_ttl_on_keys(keys, ttl_ms)
     end
 end
 
+
+local function purge_expired_x_in_zset(key, now_ms, ttl_ms)
+    local stale = redis.call('ZRANGE', key, '-inf', now_ms - ttl_ms, 'BYSCORE')
+
+    if #stale > 0 then 
+        redis.call('ZREM', key, unpack(stale))
+    end
+
+   reset_ttl_on_keys({key}, ttl_ms)
+
+    return stale
+end
+
 local function purge_expired_pending_writers(pending_writers_key, pending_writers_heartbeat_key, now, ttl_ms)
    local stale = purge_expired_x_in_zset(pending_writers_heartbeat_key, now, ttl_ms)
 
@@ -28,17 +41,6 @@ local function purge_expired_pending_writers(pending_writers_key, pending_writer
    return stale
 end
 
-local function purge_expired_x_in_zset(key, now_ms, ttl_ms)
-    local stale = redis.call('ZRANGE', key, '-inf', now - ttl_ms, 'BYSCORE')
-
-    if #stale > 0 then 
-        redis.call('ZREM', key, unpack(stale))
-    end
-
-   reset_ttl_on_keys({key}, ttl_ms)
-
-    return stale
-end
 "#;
 
 const ACQUIRE_READ_SCRIPT_BODY: &str = r#"
