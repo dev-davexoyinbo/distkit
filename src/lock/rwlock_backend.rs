@@ -116,6 +116,26 @@ const REFRESH_READ_SCRIPT_BODY: &str = r#"
     redis.call('ZADD', readers_key, 'XX', now, owner)
     return 1
 "#;
+
+/// ...
+const RELEASE_WRITE_LUA: &str = r#"
+    local now = now_ms()
+    local writer_key = KEYS[1]
+    local pending_writers_key = KEYS[2]
+    local pending_writers_heartbeat_key = KEYS[3]
+
+    local owner = ARGV[1]
+
+
+    redis.call('ZREM', pending_writers_key, owner)
+    redis.call('ZREM', pending_writers_heartbeat_key, owner)
+
+    if redis.call('GET', writer_key) == owner then
+        redis.call('DEL', writer_key)
+    else
+        return 0
+    end
+"#;
 fn rwlock_script(body: &str) -> Script {
     Script::new(&format!("{}{}", HELPERS, body))
 }
@@ -220,3 +240,24 @@ pub(crate) async fn release_read(
     Ok(n == 1)
 }
 
+/// ..
+pub(crate) async fn release_write(
+    conn: &mut ConnectionManager,
+    writer_key: &str,
+    pending_writers_key: &str,
+    pending_writers_heartbeat_key: &str,
+    owner: &str,
+) -> Result<bool, DistkitError> {
+    static SCRIPT: OnceLock<Script> = OnceLock::new();
+    let script = SCRIPT.get_or_init(|| Script::new(RELEASE_WRITE_LUA));
+
+    let n: i64 = script
+        .key(writer_key)
+        .key(pending_writers_key)
+        .key(pending_writers_heartbeat_key)
+        .arg(owner)
+        .invoke_async(conn)
+        .await?;
+
+    Ok(n == 1)
+}
