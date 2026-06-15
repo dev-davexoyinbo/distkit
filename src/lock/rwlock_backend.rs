@@ -90,7 +90,7 @@ const ACQUIRE_WRITE_SCRIPT_BODY: &str = r#"
     purge_expired_x_in_zset(readers_key, now, ttl_ms)
     local readers_count = redis.call('ZCARD', readers_key)
 
-    if readers_count > 0 or (oldest_pending_writer ~= nil and oldest_pending_writer ~= owner) then
+    if current_writer or readers_count > 0 or (oldest_pending_writer and oldest_pending_writer ~= owner) then
         if should_mark_pending == 1 then
             redis.call('ZADD', pending_writers_key, 'NX', now, owner)
             redis.call('ZADD', pending_writers_heartbeat_key, now, owner)
@@ -100,15 +100,11 @@ const ACQUIRE_WRITE_SCRIPT_BODY: &str = r#"
         return 0
     end
 
-    if not current_writer then
-        redis.call('SET', writer_key, owner, 'PX', ttl_ms)
-        redis.call('ZREM', pending_writers_key, owner)
-        redis.call('ZREM', pending_writers_heartbeat_key, owner)
+    redis.call('SET', writer_key, owner, 'PX', ttl_ms)
+    redis.call('ZREM', pending_writers_key, owner)
+    redis.call('ZREM', pending_writers_heartbeat_key, owner)
 
-        return 1
-    else
-        return 0
-    end
+    return 1
 "#;
 
 const REFRESH_READ_SCRIPT_BODY: &str = r#"

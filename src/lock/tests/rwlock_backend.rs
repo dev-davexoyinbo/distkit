@@ -43,17 +43,23 @@ fn opts<'a>(k: &'a RwKeys, owner: &'a str, ttl_ms: i64) -> AcquireOptions<'a> {
 }
 
 async fn acquire_read(conn: &mut ConnectionManager, k: &RwKeys, owner: &str, ttl: i64) -> bool {
-    rwlock_backend::acquire_read(conn, opts(k, owner, ttl)).await.unwrap()
+    rwlock_backend::acquire_read(conn, opts(k, owner, ttl))
+        .await
+        .unwrap()
 }
 
 /// `acquire_write` that joins the writer queue when blocked (the waiting forms).
 async fn write_waiting(conn: &mut ConnectionManager, k: &RwKeys, owner: &str, ttl: i64) -> bool {
-    rwlock_backend::acquire_write(conn, opts(k, owner, ttl), true).await.unwrap()
+    rwlock_backend::acquire_write(conn, opts(k, owner, ttl), true)
+        .await
+        .unwrap()
 }
 
 /// `acquire_write` that does not enqueue when blocked (one-shot `try_write`).
 async fn write_oneshot(conn: &mut ConnectionManager, k: &RwKeys, owner: &str, ttl: i64) -> bool {
-    rwlock_backend::acquire_write(conn, opts(k, owner, ttl), false).await.unwrap()
+    rwlock_backend::acquire_write(conn, opts(k, owner, ttl), false)
+        .await
+        .unwrap()
 }
 
 async fn release_write(conn: &mut ConnectionManager, k: &RwKeys, owner: &str) -> bool {
@@ -63,11 +69,19 @@ async fn release_write(conn: &mut ConnectionManager, k: &RwKeys, owner: &str) ->
 }
 
 async fn zcard(conn: &mut ConnectionManager, key: &str) -> i64 {
-    redis::cmd("ZCARD").arg(key).query_async(conn).await.expect("ZCARD")
+    redis::cmd("ZCARD")
+        .arg(key)
+        .query_async(conn)
+        .await
+        .expect("ZCARD")
 }
 
 async fn writer_exists(conn: &mut ConnectionManager, key: &str) -> bool {
-    let n: i64 = redis::cmd("EXISTS").arg(key).query_async(conn).await.expect("EXISTS");
+    let n: i64 = redis::cmd("EXISTS")
+        .arg(key)
+        .query_async(conn)
+        .await
+        .expect("EXISTS");
     n == 1
 }
 
@@ -77,7 +91,11 @@ async fn read_is_shared() {
 
     assert!(acquire_read(&mut conn, &k, READER_A, LONG_TTL).await);
     assert!(acquire_read(&mut conn, &k, READER_B, LONG_TTL).await);
-    assert_eq!(zcard(&mut conn, &k.readers).await, 2, "both readers hold the lock");
+    assert_eq!(
+        zcard(&mut conn, &k.readers).await,
+        2,
+        "both readers hold the lock"
+    );
 }
 
 #[tokio::test]
@@ -100,14 +118,26 @@ async fn write_waits_for_readers() {
         !write_waiting(&mut conn, &k, WRITER_A, LONG_TTL).await,
         "write fails while a reader holds the lock"
     );
-    assert_eq!(zcard(&mut conn, &k.pending).await, 1, "the blocked writer is queued");
+    assert_eq!(
+        zcard(&mut conn, &k.pending).await,
+        1,
+        "the blocked writer is queued"
+    );
 
-    assert!(rwlock_backend::release_read(&mut conn, &k.readers, READER_A).await.unwrap());
+    assert!(
+        rwlock_backend::release_read(&mut conn, &k.readers, READER_A)
+            .await
+            .unwrap()
+    );
     assert!(
         write_waiting(&mut conn, &k, WRITER_A, LONG_TTL).await,
         "write succeeds once the reader is gone"
     );
-    assert_eq!(zcard(&mut conn, &k.pending).await, 0, "acquiring clears the queue entry");
+    assert_eq!(
+        zcard(&mut conn, &k.pending).await,
+        0,
+        "acquiring clears the queue entry"
+    );
 }
 
 #[tokio::test]
@@ -118,27 +148,6 @@ async fn write_excludes_write() {
     assert!(
         !write_oneshot(&mut conn, &k, WRITER_B, LONG_TTL).await,
         "a second writer fails while the first holds the lock"
-    );
-}
-
-/// Characterizes CURRENT behavior of a writer blocked solely by another *writer*
-/// (no readers, empty queue): it returns `false` but does **not** enqueue, even
-/// with `mark_pending = true`. This is the known writer-handoff gap — because the
-/// blocked writer never joins `:pw`, on release a reader can acquire ahead of it.
-/// Update this test if the handoff path is changed to enqueue.
-#[tokio::test]
-async fn write_held_by_other_writer_does_not_enqueue() {
-    let (mut conn, k) = conn_and_keys("write_held_by_other_writer_does_not_enqueue").await;
-
-    assert!(write_oneshot(&mut conn, &k, WRITER_A, LONG_TTL).await);
-    assert!(
-        !write_waiting(&mut conn, &k, WRITER_B, LONG_TTL).await,
-        "second writer fails while the first holds the lock"
-    );
-    assert_eq!(
-        zcard(&mut conn, &k.pending).await,
-        0,
-        "KNOWN GAP: a writer blocked by a held writer is not queued"
     );
 }
 
@@ -159,7 +168,10 @@ async fn read_blocked_by_waiting_writer() {
     let (mut conn, k) = conn_and_keys("read_blocked_by_waiting_writer").await;
 
     assert!(acquire_read(&mut conn, &k, READER_A, LONG_TTL).await);
-    assert!(!write_waiting(&mut conn, &k, WRITER_A, LONG_TTL).await, "writer now waiting");
+    assert!(
+        !write_waiting(&mut conn, &k, WRITER_A, LONG_TTL).await,
+        "writer now waiting"
+    );
 
     assert!(
         !acquire_read(&mut conn, &k, READER_B, LONG_TTL).await,
@@ -167,8 +179,15 @@ async fn read_blocked_by_waiting_writer() {
     );
 
     // Writer abandons (release_write clears its pending entry); reader frees.
-    assert!(!release_write(&mut conn, &k, WRITER_A).await, "abandon: not the holder");
-    assert!(rwlock_backend::release_read(&mut conn, &k.readers, READER_A).await.unwrap());
+    assert!(
+        !release_write(&mut conn, &k, WRITER_A).await,
+        "abandon: not the holder"
+    );
+    assert!(
+        rwlock_backend::release_read(&mut conn, &k.readers, READER_A)
+            .await
+            .unwrap()
+    );
     assert!(
         acquire_read(&mut conn, &k, READER_B, LONG_TTL).await,
         "the reader proceeds once no writer is waiting"
@@ -201,7 +220,11 @@ async fn waiting_write_enqueues_and_blocks_readers() {
 
     assert!(acquire_read(&mut conn, &k, READER_A, LONG_TTL).await);
     assert!(!write_waiting(&mut conn, &k, WRITER_A, LONG_TTL).await);
-    assert_eq!(zcard(&mut conn, &k.pending).await, 1, "mark_pending=true registers a queue entry");
+    assert_eq!(
+        zcard(&mut conn, &k.pending).await,
+        1,
+        "mark_pending=true registers a queue entry"
+    );
     assert!(
         !acquire_read(&mut conn, &k, READER_B, LONG_TTL).await,
         "a queued writer blocks later readers"
@@ -219,7 +242,11 @@ async fn writers_are_served_fifo() {
     tokio::time::sleep(Duration::from_millis(5)).await;
     assert!(!write_waiting(&mut conn, &k, WRITER_B, LONG_TTL).await);
 
-    assert!(rwlock_backend::release_read(&mut conn, &k.readers, READER_A).await.unwrap());
+    assert!(
+        rwlock_backend::release_read(&mut conn, &k.readers, READER_A)
+            .await
+            .unwrap()
+    );
 
     assert!(
         !write_waiting(&mut conn, &k, WRITER_B, LONG_TTL).await,
@@ -229,7 +256,11 @@ async fn writers_are_served_fifo() {
         write_waiting(&mut conn, &k, WRITER_A, LONG_TTL).await,
         "the earliest-arrived writer wins the lock"
     );
-    assert_eq!(zcard(&mut conn, &k.pending).await, 1, "only WRITER_B remains queued");
+    assert_eq!(
+        zcard(&mut conn, &k.pending).await,
+        1,
+        "only WRITER_B remains queued"
+    );
 }
 
 #[tokio::test]
@@ -252,7 +283,11 @@ async fn dead_waiting_writer_is_purged() {
     // Writer queues behind a reader, then stops heart-beating; reader frees.
     assert!(acquire_read(&mut conn, &k, READER_A, SHORT_TTL).await);
     assert!(!write_waiting(&mut conn, &k, WRITER_A, SHORT_TTL).await);
-    assert!(rwlock_backend::release_read(&mut conn, &k.readers, READER_A).await.unwrap());
+    assert!(
+        rwlock_backend::release_read(&mut conn, &k.readers, READER_A)
+            .await
+            .unwrap()
+    );
 
     tokio::time::sleep(PAST_SHORT_TTL).await;
 
@@ -260,7 +295,11 @@ async fn dead_waiting_writer_is_purged() {
         acquire_read(&mut conn, &k, READER_B, SHORT_TTL).await,
         "a reader proceeds once the dead waiting writer is purged"
     );
-    assert_eq!(zcard(&mut conn, &k.pending).await, 0, "the dead writer left the queue");
+    assert_eq!(
+        zcard(&mut conn, &k.pending).await,
+        0,
+        "the dead writer left the queue"
+    );
 }
 
 #[tokio::test]
@@ -311,11 +350,23 @@ async fn release_write_is_owner_gated_and_frees() {
 
     assert!(write_oneshot(&mut conn, &k, WRITER_A, LONG_TTL).await);
 
-    assert!(!release_write(&mut conn, &k, WRITER_B).await, "non-owner release fails");
-    assert!(writer_exists(&mut conn, &k.writer).await, "key survives a non-owner release");
+    assert!(
+        !release_write(&mut conn, &k, WRITER_B).await,
+        "non-owner release fails"
+    );
+    assert!(
+        writer_exists(&mut conn, &k.writer).await,
+        "key survives a non-owner release"
+    );
 
-    assert!(release_write(&mut conn, &k, WRITER_A).await, "owner release succeeds");
-    assert!(!writer_exists(&mut conn, &k.writer).await, "key gone after owner release");
+    assert!(
+        release_write(&mut conn, &k, WRITER_A).await,
+        "owner release succeeds"
+    );
+    assert!(
+        !writer_exists(&mut conn, &k.writer).await,
+        "key gone after owner release"
+    );
 }
 
 #[tokio::test]
@@ -327,7 +378,14 @@ async fn release_write_clears_pending_on_abandon() {
     assert_eq!(zcard(&mut conn, &k.pending).await, 1);
 
     // A writer that gives up before acquiring uses release_write to leave the queue.
-    assert!(!release_write(&mut conn, &k, WRITER_A).await, "never held the writer key");
+    assert!(
+        !release_write(&mut conn, &k, WRITER_A).await,
+        "never held the writer key"
+    );
     assert_eq!(zcard(&mut conn, &k.pending).await, 0, "queue entry cleared");
-    assert_eq!(zcard(&mut conn, &k.pending_heartbeat).await, 0, "heartbeat cleared");
+    assert_eq!(
+        zcard(&mut conn, &k.pending_heartbeat).await,
+        0,
+        "heartbeat cleared"
+    );
 }
