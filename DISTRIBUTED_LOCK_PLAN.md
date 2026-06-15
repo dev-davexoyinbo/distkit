@@ -208,6 +208,26 @@ A writer-preference "pending writers" key is **future work**, not v1.
   and the value returned by `release`. Refresh is unconditional by contract; there is no opt-out.
   (`RwLock` guards in Stage 5 follow the same shape.)
 
+### Lock semantics & limitations (documented for users)
+
+The guard is a **strong signal**, not an ironclad guarantee — the lease lives in Redis, not in this
+process. Callers must understand:
+
+- A `MutexGuard` only ever comes from a **confirmed acquisition**: no guard means no lock.
+- Each `ttl/3` refresh re-confirms ownership with Redis. If a refresh **can't be confirmed** (Redis
+  unreachable, round-trip error, or the key no longer maps to us) the lock is marked `Lost`. The
+  refresh task keeps trying, and a later **confirmed** refresh flips it back to `Acquired` — so a
+  brief network blip self-heals.
+- A **network partition longer than the TTL** is the real hazard: the lease expires in Redis, another
+  owner can take the key, and once that happens our refresh has nothing to reclaim, so the lock stays
+  `Lost`. This is the classic lease-lock trade-off; we do not (and cannot, over a network) prevent it.
+- Because of this, code whose correctness depends on the lock should **re-check
+  `MutexGuard::get_state` before the critical section** rather than trusting the guard's existence
+  alone. `get_state` reads the latest refresh result (no extra Redis round-trip).
+
+This is surfaced to users in the rustdoc on `Mutex`, `MutexGuard`, `get_state`, `release`, and
+`MutexLockState`.
+
 ---
 
 ## Error type
