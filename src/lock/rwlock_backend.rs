@@ -54,7 +54,7 @@ const ACQUIRE_READ_SCRIPT_BODY: &str = r#"
     if redis.call('EXISTS', writer_key) == 1 then return 0 end
 
     purge_expired_x_in_zset(readers_key, now, ttl_ms)
-    purge_expired_pending_writers(pending_writers_key, now, ttl_ms)
+    purge_expired_pending_writers(pending_writers_key, pending_writers_heartbeat_key, now, ttl_ms)
 
     if redis.call('ZCARD', pending_writers_key) > 0 return 0 end
 
@@ -79,7 +79,7 @@ const ACQUIRE_WRITE_SCRIPT_BODY: &str = r#"
         return 1
     end
 
-    purge_expired_pending_writers(pending_writers_key, now, ttl_ms)
+    purge_expired_pending_writers(pending_writers_key, pending_writers_heartbeat_key, now, ttl_ms)
     local oldest_pending_writer = redis.call('ZRANGE', pending_writers_key, '-inf', '+inf', 'BYSCORE', 'LIMIT', 0, 1)[1]
 
     purge_expired_x_in_zset(readers_key, now, ttl_ms)
@@ -135,6 +135,19 @@ const RELEASE_WRITE_LUA: &str = r#"
 
     if redis.call('GET', writer_key) == owner then
         redis.call('DEL', writer_key)
+    else
+        return 0
+    end
+"#;
+
+const REFRESH_WRITE_SCRIPT_BODY: &str = r#"
+    local now = now_ms()
+    local writer_key = KEYS[1]
+    local owner = ARGV[1]
+    local ttl_ms = tonumber(ARGV[2])
+
+    if redis.call('GET', writer_key) == owner then
+        return redis.call('PEXPIRE', writer_key, ttl_ms)
     else
         return 0
     end
@@ -260,6 +273,26 @@ pub(crate) async fn release_write(
         .key(pending_writers_key)
         .key(pending_writers_heartbeat_key)
         .arg(owner)
+        .invoke_async(conn)
+        .await?;
+
+    Ok(n == 1)
+}
+
+/// ..
+pub(crate) async fn refresh_write(
+    conn: &mut ConnectionManager,
+    writer_key: &str,
+    owner: &str,
+    ttl_ms: i64,
+) -> Result<bool, DistkitError> {
+    static SCRIPT: OnceLock<Script> = OnceLock::new();
+    let script = SCRIPT.get_or_init(|| rwlock_script(REFRESH_WRITE_SCRIPT_BODY));
+
+    let n: i64 = script
+        .key(writer_key)
+        .arg(owner)
+        .arg(ttl_ms)
         .invoke_async(conn)
         .await?;
 
