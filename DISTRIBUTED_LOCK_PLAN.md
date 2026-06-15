@@ -3,7 +3,7 @@
 Library-friendly distributed locks for `distkit`: **`Mutex`** and **`RwLock`**, with a
 surface that mirrors `tokio::sync::Mutex` / `tokio::sync::RwLock` as closely as a network lock allows.
 
-> Status: **Stages 0–3 done (scaffolding + mutex backend + `Mutex`/guard + auto-refresh); Stages 4–6 unimplemented.**
+> Status: **Stages 0–4 done (scaffolding + mutex backend + `Mutex`/guard + auto-refresh + writer-preferring rwlock backend), plus Rust-layer input validation (`ttl_ms`/`owner`) on both backends; Stages 5–6 unimplemented.** `make test`: 238 unit + 79 doctest, green. Test suites follow the "Testing Philosophy" in `AGENTS.md` — they assert expected behavior, and a failure is a bug to fix in the backend.
 
 ---
 
@@ -55,13 +55,15 @@ Mirrors `src/counter/`:
 
 ```
 src/lock/
-  mod.rs        # LockOptions, LockMode, re-exports, module docs
-  error.rs      # LockError enum
-  backend.rs    # shared Lua consts + low-level Redis ops (acquire/refresh/release)
-  mutex.rs      # Mutex + MutexGuard
-  rwlock.rs     # RwLock + RwLockReadGuard + RwLockWriteGuard
+  mod.rs            # LockOptions, LockMode, re-exports, module docs
+  error.rs          # LockError enum
+  helpers_lua.rs    # shared Lua prelude (now_ms / purge_pending_writers)
+  mutex_backend.rs  # low-level mutex Redis ops (acquire/refresh/release)
+  rwlock_backend.rs # low-level writer-preferring rwlock Redis ops
+  mutex.rs          # Mutex + MutexGuard
+  rwlock.rs         # RwLock + RwLockReadGuard + RwLockWriteGuard
   tests/
-    common.rs   # make_mutex / make_rwlock + unique-prefix key helper
+    common.rs       # make_mutex / make_rwlock + unique-prefix key helper
     mutex.rs
     rwlock.rs
 ```
@@ -172,24 +174,42 @@ skew). Keys are namespaced as `{namespace}:{key}`, where `namespace` comes from
 - **refresh:** Lua — `GET == owner ? PEXPIRE : 0`.
 - **release:** Lua — `GET == owner ? DEL : 0`.
 
-### RwLock (read-preferring, v1)
+### RwLock (writer-preferring, v1)
+
+Upholds the invariant **once a writer is waiting, later readers may not jump ahead of it**, and
+serves waiting writers in **FIFO arrival order**. Four keys per resource:
 
 - Writer key `{namespace}:{key}:w` holds the writer `owner_id` (PX ttl).
-- Readers `{namespace}:{key}:r` = a ZSET of `reader_owner_id` scored by expiry (`now + ttl`).
+- Readers `{namespace}:{key}:r` = ZSET of `reader_owner_id` scored by **expiry** (`now + ttl`).
+- Pending `{namespace}:{key}:pw` = ZSET of waiting-`writer_owner_id` scored by **arrival**
+  (immutable via `ZADD NX`; gives FIFO order among writers).
+- Pending-heartbeat `{namespace}:{key}:pwh` = ZSET of the same waiting writers scored by an
+  **expiry** heartbeat (`now + ttl`), refreshed each acquire attempt so a crashed waiter is purged.
 
-| Operation     | Lua (atomic)                                                                                                               |
-| ------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| acquire read  | purge expired readers (`ZREMRANGEBYSCORE 0 now`); if writer key exists → fail; else `ZADD` self `now+ttl`, set key TTL, ok |
-| acquire write | purge expired readers; if any reader remains **or** writer key exists → fail; else `SET w owner PX ttl`, ok                |
-| refresh read  | re-`ZADD` own score                                                                                                        |
-| refresh write | `PEXPIRE w`                                                                                                                |
-| release read  | `ZREM` self                                                                                                                |
-| release write | `GET == owner ? DEL`                                                                                                       |
+All timestamps come from `redis.call('TIME')` inside Lua (server clock):
+`local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)`.
 
-Crashed holders self-heal: readers via score expiry + lazy purge; writer via PX.
+| Operation     | Lua (atomic)                                                                                                                                                                                  |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| acquire read  | purge expired readers + dead waiting-writers (`:pwh` heartbeat); if writer key exists **or** any writer is waiting (`ZCARD :pw > 0`) → fail; else `ZADD` self `now+ttl`, set `:r` TTL, ok       |
+| acquire write | purge as above; if `mark_pending` register/refresh self (`:pw` `ZADD NX` + `:pwh`); if another writer holds **or** any reader remains **or** this owner isn't the `:pw` front → fail; else clear self from pending, `SET w owner PX ttl`, ok |
+| refresh read  | purge expired readers; if own slot still present re-`ZADD` own score, else fail (lease lost)                                                                                                   |
+| refresh write | `GET == owner ? PEXPIRE` (reuses the mutex `refresh`)                                                                                                                                          |
+| release read  | `ZREM` self from `:r`                                                                                                                                                                          |
+| release write | `GET == owner ? DEL` (reuses the mutex `release`)                                                                                                                                              |
+| clear pending | `ZREM` self from `:pw` + `:pwh` — when a waiting writer gives up (timeout/drop) before acquiring                                                                                               |
 
-**Known limitation:** read-preferring → possible writer starvation under constant readers.
-A writer-preference "pending writers" key is **future work**, not v1.
+One-shot `try_write` passes `mark_pending = false`: it never registers (so a failed one-shot write
+does **not** block readers) but still yields to any writer already queued ahead.
+
+Crashed holders self-heal: readers via score expiry + lazy purge; waiting writers via the `:pwh`
+heartbeat + lazy purge; writer via PX.
+
+**Known limitation:** writer-preferring → possible **reader starvation** under constant writers
+(the inverse of the read-preferring trade-off). FIFO arrival order keeps waiting *writers* fair
+among themselves. **Caveat:** the waiting writer's queue slot is kept alive by its acquire-attempt
+cadence, so `retry_interval` must stay `< ttl`; otherwise the heartbeat lapses between attempts and
+the writer re-registers with a fresh arrival score (losing its place).
 
 ---
 
@@ -240,17 +260,42 @@ Extend `DistkitError` (`src/error.rs`) with a feature-gated variant mirroring `C
 LockError(#[from] LockError),
 ```
 
-New `src/lock/error.rs`:
+`src/lock/error.rs` (current):
 
 ```rust
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum LockError {
-    #[error("failed to acquire lock")]            AcquireFail,
-    #[error("timed out after {waited:?}")]        Timeout { waited: Duration },
-    #[error("lock lease lost (refresh failed)")]  LockLost,
-    #[error("not the lock owner")]                NotOwner,
+    #[error("failed to acquire lock (would block)")]  AcquireFail,
+    #[error("timed out after {waited:?}")]            Timeout { waited: Duration },
+    #[error("not the lock owner")]                    NotOwner,
+    #[error("ttl_ms must be positive, got {0}")]      InvalidTtl(i64),
+    #[error("owner id must not be empty")]            InvalidOwner,
 }
 ```
+
+`LockLost` (Stage 0 scaffold) was superseded by `MutexLockState::Lost` in Stage 3 and removed.
+
+`InvalidTtl` / `InvalidOwner` (added alongside the Stage 1/4 validation work below) are returned
+by two shared, crate-internal validators also in `error.rs`:
+
+```rust
+pub(crate) fn validate_ttl(ttl_ms: i64) -> Result<(), DistkitError> {
+    if ttl_ms <= 0 {
+        return Err(LockError::InvalidTtl(ttl_ms).into());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_owner(owner: &str) -> Result<(), DistkitError> {
+    if owner.is_empty() {
+        return Err(LockError::InvalidOwner.into());
+    }
+    Ok(())
+}
+```
+
+Both `mutex_backend` and `rwlock_backend` call these at the top of every op that takes a `ttl_ms`
+and/or `owner` argument, before issuing any Redis command — see Stage 1 and Stage 4 below.
 
 Redis failures continue to surface as `DistkitError::RedisError`.
 
@@ -283,6 +328,12 @@ Each stage compiles and is green via `make test` before the next begins.
   - `acquire(conn, key, owner, ttl_ms) -> bool` — plain `SET key owner NX PX ttl_ms` (no Lua).
   - `refresh(conn, key, owner, ttl_ms) -> bool` — owner-checked `GET == owner ? PEXPIRE : 0` Lua.
   - `release(conn, key, owner) -> bool` — owner-checked `GET == owner ? DEL : 0` Lua.
+  - **Input validation (added post-Stage-4, mirrored from rwlock_backend):** `acquire` calls
+    `validate_owner(owner)?; validate_ttl(ttl_ms)?;`; `refresh` calls `validate_ttl(ttl_ms)?;` —
+    both before touching Redis, returning `LockError::InvalidOwner` / `InvalidTtl(ttl_ms)`. Tests:
+    `acquire_rejects_nonpositive_ttl`, `refresh_rejects_nonpositive_ttl`,
+    `acquire_rejects_empty_owner` in `src/lock/tests/mutex_backend.rs`. `release` is unchanged
+    (no ttl/owner-emptiness contract).
   - Each Lua script is compiled once into a function-local `static OnceLock<Script>` (keeps the SHA
     so the connection's EVALSHA cache stays warm); `Script::invoke_async` handles `NOSCRIPT`
     fallback, so single-op locks need **no** `execute_pipeline_with_script_retry`. Redis failures
@@ -356,9 +407,49 @@ Each stage compiles and is green via `make test` before the next begins.
     `Timeout { waited }` path.
   - Verified: `make test` green (207 unit + 79 doctest, incl. the 8 mutex tests); `cargo clippy
     --features lock` clean for the lock module.
-- **Stage 4 — RwLock backend.** ZSET reader model + writer key Lua (read/write acquire/refresh/
-  release, server `TIME`, lazy purge). Direct-Redis tests for shared-read / exclusive-write /
-  expiry purge.
+- **Stage 4 — RwLock backend. ✅ Done.** Writer-preferring shared/exclusive ops in
+  `src/lock/rwlock_backend.rs` (mutex ops live alongside in `src/lock/mutex_backend.rs`; the rwlock
+  writer key reuses the mutex `refresh`/`release`), each an atomic Redis/Lua round-trip on
+  fully-namespaced keys (mirrors the
+  Stage 1 mutex ops: function-local `static OnceLock<Script>`, `Ok(n == 1)`, errors via `?`).
+  - **Keys:** `:w` (writer str), `:r` (reader ZSET, expiry score), `:pw` (waiting-writer ZSET,
+    arrival score → FIFO), `:pwh` (waiting-writer ZSET, expiry heartbeat → crash purge). Server
+    `redis.call('TIME')` for every clock.
+  - **New ops:** `acquire_read`, `acquire_write(.., mark_pending: bool)`, `refresh_read`,
+    `release_read` (plain `ZREM`), `clear_pending_write`. `refresh_write` / `release_write` **reuse**
+    the mutex `refresh` / `release` on the `:w` key — no new code.
+  - **Writer preference:** `acquire_read` fails while `ZCARD :pw > 0`, so later readers can't jump
+    ahead of a waiting writer. `acquire_write` registers in `:pw`/`:pwh` only when `mark_pending`
+    (the waiting forms), so a one-shot `try_write` never stalls readers, and only the `:pw` front
+    (earliest arrival) may take the lock → FIFO among writers.
+  - **Input validation (added post-implementation, per "Testing Philosophy" expected-behavior
+    pass):** `acquire_read` and `acquire_write` call `validate_owner(owner)?; validate_ttl(ttl_ms)?;`;
+    `refresh_read` and `refresh_write` call `validate_ttl(ttl_ms)?;` — all before touching Redis/the
+    Lua script, returning `LockError::InvalidOwner` / `InvalidTtl(ttl_ms)`. `release_read` /
+    `release_write` are unchanged. See "Error type" above for the shared `validate_ttl` /
+    `validate_owner` helpers.
+  - **Tests:** `src/lock/tests/rwlock_backend.rs` (registered in `tests/mod.rs`; harness gains
+    `make_options_with_rw_keys` + `RwKeys` in `tests/common.rs`) — 28 direct-against-Redis cases:
+    the original 15 happy-path tests (shared read, writer-excludes-readers/writers,
+    reentrant write, read-blocked-by-waiting-writer, one-shot write doesn't enqueue/block, FIFO
+    writers, reader/pending-writer expiry purge, `refresh_read`/`refresh_write`/`release_write`
+    owner-gating), plus a 13-test **expected-behavior** edge-case section added per `AGENTS.md`
+    "Testing Philosophy" (a failing case is a bug to fix in the backend, not to relax):
+    `write_held_until_all_readers_released` (write withheld until **all** readers release);
+    `writer_blocked_by_writer_enqueues_and_keeps_preference` (a writer blocked by another writer
+    enqueues into `:pw` and keeps FIFO preference on handoff);
+    `same_ms_writer_fifo_is_lexical` (same-millisecond arrival ties broken lexically);
+    `purge_uses_caller_ttl_not_per_member` (reader-expiry purge uses the caller's ttl, not a
+    per-member stored ttl); `idle_waiting_writer_loses_its_slot` (an idle waiting writer loses its
+    FIFO slot once its `:pwh` heartbeat lapses); `writer_key_expires_via_px_only` (`:w` self-heals
+    via Redis `PX` alone, no lazy purge); `release_read_nonmember_and_double_release_return_false`
+    (`release_read` on a non-member or double-release returns `Ok(false)`); and six input-validation
+    cases — `acquire_read_rejects_nonpositive_ttl`, `acquire_write_rejects_nonpositive_ttl`,
+    `refresh_read_rejects_nonpositive_ttl`, `refresh_write_rejects_nonpositive_ttl`,
+    `acquire_read_rejects_empty_owner`, `acquire_write_rejects_empty_owner`.
+  - Verified: `make test` green (238 unit + 79 doctest); `cargo clippy --features lock --tests`
+    clean for the lock module. (The ops show `dead_code` in a plain non-test build until Stage 5
+    consumes them — same interim as Stage 0's `allow(unused_imports)`.)
 - **Stage 5 — `RwLock` + guards.** `read`/`write` + `try_*` + `try_*_for` over the shared
   `acquire` core; three guard types with Drop + refresh. Tests: N concurrent readers, writer waits
   for readers, reader waits for writer.
@@ -367,7 +458,7 @@ Each stage compiles and is green via `make test` before the next begins.
   update `README.md`, `CLAUDE.md`, and the `docs/lib.md` feature table.
 
 **Out of scope (future):** celeris-realtime migration off `app/src/distributed_lock/` onto
-`distkit::lock`; RwLock writer-preference mode; lock-acquired metrics/tracing spans.
+`distkit::lock`; lock-acquired metrics/tracing spans.
 
 ---
 
@@ -375,8 +466,8 @@ Each stage compiles and is green via `make test` before the next begins.
 
 **New**
 
-- `src/lock/{mod,error,backend,mutex,rwlock}.rs`
-- `src/lock/tests/{common,backend,mutex,options,rwlock}.rs`
+- `src/lock/{mod,error,helpers_lua,mutex_backend,rwlock_backend,mutex,rwlock}.rs`
+- `src/lock/tests/{common,mutex_backend,mutex,options,rwlock_backend,rwlock}.rs`
 - `benches/lock.rs`
 
 **Edit**
