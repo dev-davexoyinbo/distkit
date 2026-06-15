@@ -1,4 +1,3 @@
-
 use std::sync::OnceLock;
 
 use redis::{Script, aio::ConnectionManager};
@@ -64,6 +63,7 @@ const ACQUIRE_READ_SCRIPT_BODY: &str = r#"
 
     return 1
 "#;
+
 const ACQUIRE_WRITE_SCRIPT_BODY: &str = r#"
     local now = now_ms()
     local readers_key = KEYS[1]
@@ -99,6 +99,22 @@ const ACQUIRE_WRITE_SCRIPT_BODY: &str = r#"
     end
 
     return 0
+"#;
+
+const REFRESH_READ_SCRIPT_BODY: &str = r#"
+    local now = now_ms()
+    local readers_key = KEYS[1]
+    local owner = ARGV[1]
+    local ttl_ms = tonumber(ARGV[2])
+
+    purge_expired_x_in_zset(readers_key, now, ttl_ms)
+
+    if redis.call('ZSCORE', readers_key, owner) == nil then
+        return 0
+    end
+
+    redis.call('ZADD', readers_key, 'XX', now, owner)
+    return 1
 "#;
 fn rwlock_script(body: &str) -> Script {
     Script::new(&format!("{}{}", HELPERS, body))
@@ -168,3 +184,24 @@ pub(crate) async fn acquire_write(
 
     Ok(n == 1)
 }
+
+/// ..
+pub(crate) async fn refresh_read(
+    conn: &mut ConnectionManager,
+    readers_key: &str,
+    owner: &str,
+    ttl_ms: i64,
+) -> Result<bool, DistkitError> {
+    static SCRIPT: OnceLock<Script> = OnceLock::new();
+    let script = SCRIPT.get_or_init(|| rwlock_script(REFRESH_READ_SCRIPT_BODY));
+
+    let n: i64 = script
+        .key(readers_key)
+        .arg(owner)
+        .arg(ttl_ms)
+        .invoke_async(conn)
+        .await?;
+
+    Ok(n == 1)
+}
+
