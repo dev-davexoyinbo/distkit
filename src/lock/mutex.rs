@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::DistkitError;
-use crate::lock::{LockError, LockOptions, backend};
+use crate::lock::{LockError, LockOptions, mutex_backend};
 
 /// A distributed mutual-exclusion lock backed by Redis.
 ///
@@ -166,7 +166,7 @@ impl Mutex {
             }
 
             let acquired =
-                backend::acquire(&mut connection, &self.full_key, &self.owner, self.ttl_ms).await?;
+                mutex_backend::acquire(&mut connection, &self.full_key, &self.owner, self.ttl_ms).await?;
 
             if acquired {
                 let lost = Arc::new(AtomicBool::new(false));
@@ -224,7 +224,7 @@ impl Mutex {
             loop {
                 ticker.tick().await;
 
-                match backend::refresh(&mut connection_manager, &full_key, &owner, ttl_ms).await {
+                match mutex_backend::refresh(&mut connection_manager, &full_key, &owner, ttl_ms).await {
                     Ok(true) => {
                         // Refresh succeeded; if the lease had been marked lost, we
                         // just regained ownership — clear the flag.
@@ -322,7 +322,7 @@ impl MutexGuard {
         }
 
         let mut connection = self.connection_manager.clone();
-        backend::release(&mut connection, &self.full_key, &self.owner).await?;
+        mutex_backend::release(&mut connection, &self.full_key, &self.owner).await?;
 
         Ok(MutexLockState::Released)
     }
@@ -342,7 +342,7 @@ impl Drop for MutexGuard {
         let owner = self.owner.clone();
 
         tokio::spawn(async move {
-            if let Err(error) = backend::release(&mut connection, &full_key, &owner).await {
+            if let Err(error) = mutex_backend::release(&mut connection, &full_key, &owner).await {
                 tracing::error!(?error, full_key, "Error releasing distributed lock on drop");
             }
         });

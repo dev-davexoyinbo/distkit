@@ -1,9 +1,9 @@
-//! Low-level Redis lock operations: shared Lua scripts and the atomic
-//! acquire / refresh / release round-trips backing `Mutex` and `RwLock`.
+//! Low-level Redis ops backing `Mutex`: owner-checked acquire / refresh /
+//! release, each a single atomic round-trip on one string key.
 //!
-//! Stage 1 populates the mutex backend; the rwlock backend lands in Stage 4.
-//! Every op is a single atomic Redis round-trip keyed on the caller's
-//! `owner_id`. Callers pass a fully-formed (already namespaced) Redis key.
+//! Every op is keyed on the caller's `owner_id`; callers pass a fully-formed
+//! (already namespaced) Redis key. These same `refresh` / `release` ops are
+//! reused by the rwlock backend for its writer key (`:w`).
 
 use std::sync::OnceLock;
 

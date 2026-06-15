@@ -14,7 +14,7 @@
 mod error;
 pub use error::*;
 
-mod backend;
+mod mutex_backend;
 
 mod mutex;
 pub use mutex::*;
