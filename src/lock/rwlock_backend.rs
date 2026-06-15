@@ -42,7 +42,7 @@ local function purge_expired_x_in_zset(key, now_ms, ttl_ms)
 end
 "#;
 
-const ACQUIRE_READ_BODY: &str = r#"
+const ACQUIRE_READ_SCRIPT_BODY: &str = r#"
     local now = now_ms()
     local readers_key = KEYS[1]
     local writer_key = KEYS[2]
@@ -64,11 +64,47 @@ const ACQUIRE_READ_BODY: &str = r#"
 
     return 1
 "#;
+const ACQUIRE_WRITE_SCRIPT_BODY: &str = r#"
+    local now = now_ms()
+    local readers_key = KEYS[1]
+    local writer_key = KEYS[2]
+    local pending_writers_key = KEYS[3]
+    local pending_writers_heartbeat_key = KEYS[4]
+
+    local owner = ARGV[1]
+    local ttl_ms = tonumber(ARGV[2])
+
+    if redis.call('GET', writer_key) == owner then
+        reset_ttl_on_keys({writer_key}, ttl_ms)
+        return 1
+    end
+
+    purge_expired_pending_writers(pending_writers_key, now, ttl_ms)
+    local pending_writers_count = redis.call('ZCARD', pending_writers_key)
+
+    purge_expired_x_in_zset(readers_key, now, ttl_ms)
+    local readers_count = redis.call('ZCARD', readers_key)
+
+    if pending_writers_count > 0 || readers_count > 0 then
+        redis.call('ZADD', pending_writers_key, 'NX', now, owner)
+        redis.call('ZADD', pending_writers_heartbeat_key, now, owner)
+        reset_ttl_on_keys({pending_writers_key, pending_writers_heartbeat_key}, ttl_ms)
+        return 0
+    end
+
+
+    local res = redis.call('SET', writer_key, owner, 'NX', 'PX', ttl_ms)
+    if res == 'OK' then
+        return 1
+    end
+
+    return 0
+"#;
 fn rwlock_script(body: &str) -> Script {
     Script::new(&format!("{}{}", HELPERS, body))
 }
 
-pub struct AcquireReadOptions<'a> {
+pub struct AcquireOptions<'a> {
     pub owner: &'a str,
     pub ttl_ms: i64,
     pub writer_key: &'a str,
@@ -80,17 +116,45 @@ pub struct AcquireReadOptions<'a> {
 /// ..
 pub(crate) async fn acquire_read(
     conn: &mut ConnectionManager,
-    AcquireReadOptions {
+    AcquireOptions {
         owner,
         ttl_ms,
         writer_key,
         readers_key,
         pending_writers_key,
         pending_writers_heartbeat_key,
-    }: AcquireReadOptions<'_>,
+    }: AcquireOptions<'_>,
 ) -> Result<bool, DistkitError> {
     static SCRIPT: OnceLock<Script> = OnceLock::new();
-    let script = SCRIPT.get_or_init(|| rwlock_script(ACQUIRE_READ_BODY));
+    let script = SCRIPT.get_or_init(|| rwlock_script(ACQUIRE_READ_SCRIPT_BODY));
+
+    let n: i64 = script
+        .key(readers_key)
+        .key(writer_key)
+        .key(pending_writers_key)
+        .key(pending_writers_heartbeat_key)
+        .arg(owner)
+        .arg(ttl_ms)
+        .invoke_async(conn)
+        .await?;
+
+    Ok(n == 1)
+}
+
+/// ...
+pub(crate) async fn acquire_write(
+    conn: &mut ConnectionManager,
+    AcquireOptions {
+        owner,
+        ttl_ms,
+        writer_key,
+        readers_key,
+        pending_writers_key,
+        pending_writers_heartbeat_key,
+    }: AcquireOptions<'_>,
+) -> Result<bool, DistkitError> {
+    static SCRIPT: OnceLock<Script> = OnceLock::new();
+    let script = SCRIPT.get_or_init(|| rwlock_script(ACQUIRE_WRITE_SCRIPT_BODY));
 
     let n: i64 = script
         .key(readers_key)
