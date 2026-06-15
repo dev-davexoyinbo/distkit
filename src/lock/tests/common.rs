@@ -50,3 +50,24 @@ pub async fn make_options_with_key(name: &str) -> (LockOptions, String) {
 pub fn key(name: &str) -> DistkitRedisKey {
     DistkitRedisKey::from(name.to_string())
 }
+
+/// The four derived Redis keys an `RwLock` uses for one resource.
+pub struct RwKeys {
+    pub writer: String,
+    pub readers: String,
+    pub pending: String,
+    pub pending_heartbeat: String,
+}
+
+/// Like [`make_options_with_key`], but returns the four `:w`/`:r`/`:pw`/`:pwh`
+/// keys the rwlock backend operates on, derived from the same base full key.
+pub async fn make_options_with_rw_keys(name: &str) -> (LockOptions, RwKeys) {
+    let (options, base) = make_options_with_key(name).await;
+    let keys = RwKeys {
+        writer: format!("{base}:w"),
+        readers: format!("{base}:r"),
+        pending: format!("{base}:pw"),
+        pending_heartbeat: format!("{base}:pwh"),
+    };
+    (options, keys)
+}
