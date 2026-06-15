@@ -17,13 +17,13 @@ local function reset_ttl_on_keys(keys, ttl_ms)
 end
 
 local function purge_expired_pending_writers(pending_writers_key, pending_writers_heartbeat_key, now, ttl_ms)
-   let stale = purge_expired_x_in_zset(pending_writers_heartbeat_key, now, ttl_ms)
+   local stale = purge_expired_x_in_zset(pending_writers_heartbeat_key, now, ttl_ms)
 
    if #stale > 0 then
         redis.call('ZREM', pending_writers_key, unpack(stale))
    end
 
-   reset_ttl_on_keys({pending_writers_key}, now)
+   reset_ttl_on_keys({pending_writers_key}, ttl_ms)
 
    return stale
 end
@@ -35,7 +35,7 @@ local function purge_expired_x_in_zset(key, now_ms, ttl_ms)
         redis.call('ZREM', key, unpack(stale))
     end
 
-   reset_ttl_on_keys({key}, now)
+   reset_ttl_on_keys({key}, ttl_ms)
 
     return stale
 end
@@ -56,10 +56,10 @@ const ACQUIRE_READ_SCRIPT_BODY: &str = r#"
     purge_expired_x_in_zset(readers_key, now, ttl_ms)
     purge_expired_pending_writers(pending_writers_key, pending_writers_heartbeat_key, now, ttl_ms)
 
-    if redis.call('ZCARD', pending_writers_key) > 0 return 0 end
+    if redis.call('ZCARD', pending_writers_key) > 0 then return 0 end
 
     redis.call('ZADD', readers_key, now, owner)
-    reset_ttl_on_keys({reders_key}, ttl_ms)
+    reset_ttl_on_keys({readers_key}, ttl_ms)
 
     return 1
 "#;
@@ -73,8 +73,11 @@ const ACQUIRE_WRITE_SCRIPT_BODY: &str = r#"
 
     local owner = ARGV[1]
     local ttl_ms = tonumber(ARGV[2])
+    local should_mark_pending = tonumber(ARGV[3])
 
-    if redis.call('GET', writer_key) == owner then
+    local current_writer = redis.call('GET', writer_key)
+
+    if current_writer == owner then
         reset_ttl_on_keys({writer_key}, ttl_ms)
         return 1
     end
@@ -86,22 +89,24 @@ const ACQUIRE_WRITE_SCRIPT_BODY: &str = r#"
     local readers_count = redis.call('ZCARD', readers_key)
 
     if readers_count > 0 or (oldest_pending_writer ~= nil and oldest_pending_writer ~= owner) then
-        redis.call('ZADD', pending_writers_key, 'NX', now, owner)
-        redis.call('ZADD', pending_writers_heartbeat_key, now, owner)
-        reset_ttl_on_keys({pending_writers_key, pending_writers_heartbeat_key}, ttl_ms)
+        if should_mark_pending == 1 then
+            redis.call('ZADD', pending_writers_key, 'NX', now, owner)
+            redis.call('ZADD', pending_writers_heartbeat_key, now, owner)
+            reset_ttl_on_keys({pending_writers_key, pending_writers_heartbeat_key}, ttl_ms)
+        end
+
         return 0
     end
 
+    if not current_writer then
+        redis.call('SET', writer_key, owner, 'PX', ttl_ms)
+        redis.call('ZREM', pending_writers_key, owner)
+        redis.call('ZREM', pending_writers_heartbeat_key, owner)
 
-    local res = redis.call('SET', writer_key, owner, 'NX', 'PX', ttl_ms)
-    if res ~= 'OK' then
-        return 0 
+        return 1
+    else
+        return 0
     end
-
-    redis.call('ZREM', pending_writers_key, owner)
-    redis.call('ZREM', pending_writers_heartbeat_key, owner)
-
-    return 1
 "#;
 
 const REFRESH_READ_SCRIPT_BODY: &str = r#"
@@ -112,7 +117,7 @@ const REFRESH_READ_SCRIPT_BODY: &str = r#"
 
     purge_expired_x_in_zset(readers_key, now, ttl_ms)
 
-    if redis.call('ZSCORE', readers_key, owner) == nil then
+    if not redis.call('ZSCORE', readers_key, owner) then
         return 0
     end
 
@@ -122,7 +127,6 @@ const REFRESH_READ_SCRIPT_BODY: &str = r#"
 
 /// ...
 const RELEASE_WRITE_LUA: &str = r#"
-    local now = now_ms()
     local writer_key = KEYS[1]
     local pending_writers_key = KEYS[2]
     local pending_writers_heartbeat_key = KEYS[3]
@@ -135,6 +139,7 @@ const RELEASE_WRITE_LUA: &str = r#"
 
     if redis.call('GET', writer_key) == owner then
         redis.call('DEL', writer_key)
+        return 1
     else
         return 0
     end
@@ -205,6 +210,7 @@ pub(crate) async fn acquire_write(
         pending_writers_key,
         pending_writers_heartbeat_key,
     }: AcquireOptions<'_>,
+    should_mark_pending: bool,
 ) -> Result<bool, DistkitError> {
     static SCRIPT: OnceLock<Script> = OnceLock::new();
     let script = SCRIPT.get_or_init(|| rwlock_script(ACQUIRE_WRITE_SCRIPT_BODY));
@@ -216,6 +222,7 @@ pub(crate) async fn acquire_write(
         .key(pending_writers_heartbeat_key)
         .arg(owner)
         .arg(ttl_ms)
+        .arg(if should_mark_pending { 1 } else { 0 })
         .invoke_async(conn)
         .await?;
 
