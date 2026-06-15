@@ -73,3 +73,7 @@ harness = false
 [[bench]]
 name = "lax_instance_aware_counter"
 harness = false
+
+[[bench]]
+name = "lock"
+harness = false

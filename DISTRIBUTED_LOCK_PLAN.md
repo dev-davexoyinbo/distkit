@@ -3,7 +3,7 @@
 Library-friendly distributed locks for `distkit`: **`Mutex`** and **`RwLock`**, with a
 surface that mirrors `tokio::sync::Mutex` / `tokio::sync::RwLock` as closely as a network lock allows.
 
-> Status: **Stages 0–5 done (scaffolding + mutex backend + `Mutex`/guard + auto-refresh + writer-preferring rwlock backend + `RwLock`/guards), plus Rust-layer input validation (`ttl_ms`/`owner`) on both backends; Stage 6 unimplemented.** `make test`: 249 unit + 80 doctest, green. Test suites follow the "Testing Philosophy" in `AGENTS.md` — they assert expected behavior, and a failure is a bug to fix in the backend.
+> Status: **Stages 0–6 done (scaffolding + mutex backend + `Mutex`/guard + auto-refresh + writer-preferring rwlock backend + `RwLock`/guards + docs/doctests/benches), plus Rust-layer input validation (`ttl_ms`/`owner`) on both backends.** `make test`: 249 unit + 82 doctest, green. Only the out-of-scope celeris-realtime migration remains. Test suites follow the "Testing Philosophy" in `AGENTS.md` — they assert expected behavior, and a failure is a bug to fix in the backend.
 
 ---
 
@@ -481,9 +481,24 @@ Each stage compiles and is green via `make test` before the next begins.
     `try_write_does_not_block_readers`.
   - Verified: `make test` green (249 unit + 80 doctest, incl. the new `RwLock::new` doctest);
     `cargo clippy --features lock --tests` clean for the lock module; `cargo build --features lock` ok.
-- **Stage 6 — Docs, doctests, benches.** Module + type rustdoc (satisfy `#![deny(missing_docs)]`);
-  doctests in `docs/lib.md`; criterion bench `benches/lock.rs` mirroring `benches/strict_counter.rs`;
-  update `README.md`, `CLAUDE.md`, and the `docs/lib.md` feature table.
+- **Stage 6 — Docs, doctests, benches. ✅ Done.** Per-item module/type rustdoc was already in place
+  from Stages 2–5 (crate-wide `#![deny(missing_docs)]`), so this stage added the discoverability +
+  benchmark surface:
+  - `docs/lib.md`: intro "four modules", `lock` feature-table row, a new **Distributed locks**
+    section with two runnable `Mutex` / `RwLock` doctests (REDIS_URL fallback), a `LockError`
+    bullet in the error section, and intra-doc link refs (`Mutex`/`RwLock`/`LockOptions`/etc.).
+  - `benches/lock.rs` (new) + `make_mutex`/`make_rwlock`/`make_contended_mutexes` in
+    `benches/common.rs` + `[[bench]] name = "lock"` in `Cargo.toml`. Groups `lock_mutex`
+    (`acquire_release`, `try_lock_contended`) and `lock_rwlock` (`read_acquire_release`,
+    `write_acquire_release`). The contended holder is released via `rt.block_on(release)` because a
+    bare `Drop` outside the Tokio context would panic in the guard's spawn-on-drop.
+  - `README.md`: intro sentence, **Mutex / RwLock** feature bullet, `lock` feature-flag row, and a
+    **Distributed locks** usage section.
+  - `AGENTS.md`: corrected the stale "RwLock is still a stub" note — both locks now ship as live
+    behavior.
+  - Verified: `make test` green (249 unit + 82 doctest, +2 new lock doctests); `cargo doc
+    --all-features --no-deps` clean; `cargo bench --bench lock` runs all four groups (no `CLAUDE.md`
+    exists — `AGENTS.md` is the equivalent and was updated instead).
 
 **Out of scope (future):** celeris-realtime migration off `app/src/distributed_lock/` onto
 `distkit::lock`; lock-acquired metrics/tracing spans.

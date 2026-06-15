@@ -9,8 +9,8 @@ A toolkit of distributed systems primitives for Rust, backed by Redis.
 ## What is distkit?
 
 distkit provides building blocks for distributed applications. It ships
-distributed counters (strict and lax), instance-aware counters, and rate
-limiting, all backed by Redis.
+distributed counters (strict and lax), instance-aware counters, distributed
+locks (`Mutex`, `RwLock`), and rate limiting, all backed by Redis.
 
 ## Features
 
@@ -23,6 +23,9 @@ limiting, all backed by Redis.
 - **Instance-aware counters** -- each running instance owns a named slice of the
   total, with automatic cleanup of contributions from instances that stop
   heartbeating.
+- **Mutex / RwLock** (opt-in `lock` feature) -- Redis-backed distributed locks
+  mirroring `tokio::sync::Mutex` / `tokio::sync::RwLock`. RAII guards, background
+  lease refresh, writer-preferring reader-writer locking.
 - **Rate limiting** (opt-in `trypema` feature) -- sliding-window rate limiting
   with local, Redis-backed, and hybrid providers. Supports absolute and
   probabilistic suppression strategies.
@@ -34,6 +37,7 @@ limiting, all backed by Redis.
 | ------------------------ | ------- | ------------------------------------------------------------------------ |
 | `counter`                | **yes** | Distributed counters (`StrictCounter`, `LaxCounter`)                     |
 | `instance-aware-counter` | no      | Per-instance counters (`StrictInstanceAwareCounter`, `LaxInstanceAwareCounter`) |
+| `lock`                   | no      | Distributed locks (`Mutex`, `RwLock`)                                    |
 | `trypema`                | no      | Rate limiting via the [trypema](https://docs.rs/trypema) crate           |
 
 ## Installation
@@ -310,6 +314,54 @@ let (local_total, mine) = counter.dec(&key, 1).await?;
 // get() also returns the local estimate (cumulative + pending delta).
 let (total, mine) = counter.get(&key).await?;
 ```
+
+## Distributed locks
+
+Enable the `lock` feature for Redis-backed `Mutex` and `RwLock`:
+
+```toml
+[dependencies]
+distkit = { version = "0.4", features = ["lock"] }
+```
+
+Both mirror the surface of `tokio::sync::Mutex` / `tokio::sync::RwLock`. The
+guards hold no inner data — they are pure access tokens. A held lock renews its
+lease in the background (every `ttl/3`) and releases on drop, with an explicit
+awaitable `release()` for callers who want to observe the final state. `RwLock`
+is writer-preferring (a waiting writer blocks new readers).
+
+```rust,no_run
+use distkit::{DistkitRedisKey, lock::{Mutex, RwLock, LockOptions}};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = redis::Client::open("redis://127.0.0.1/")?;
+    let conn = client.get_connection_manager().await?;
+
+    // Mutex (mutual exclusion).
+    let key = DistkitRedisKey::try_from("invoice_42".to_string())?;
+    let mutex = Mutex::new(LockOptions::new(key, conn.clone()));
+    let guard = mutex.lock().await?;            // waits until acquired
+    // ... critical section ...
+    guard.release().await?;
+
+    // RwLock (reader-writer): many readers OR one writer.
+    let key = DistkitRedisKey::try_from("config_blob".to_string())?;
+    let rw = RwLock::new(LockOptions::new(key, conn));
+    let r = rw.read().await?;                   // shared
+    r.release().await?;
+    let w = rw.write().await?;                  // exclusive
+    w.release().await?;
+
+    Ok(())
+}
+```
+
+Acquire forms per lock: waiting (`lock` / `read` / `write`), non-blocking
+(`try_lock` / `try_read` / `try_write`), and bounded
+(`try_lock_for` / `try_read_for` / `try_write_for`). Tune `ttl`, `max_wait`,
+`retry_interval`, `owner_id`, and `namespace` via `LockOptions` or
+`LockOptions::builder`.
 
 ## Rate limiting (trypema)
 
