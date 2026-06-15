@@ -1,7 +1,7 @@
 A toolkit of distributed systems primitives for Rust, backed by Redis.
 
 `distkit` (DISTributed system KIT) provides building blocks for distributed applications. The crate
-currently offers three modules and they all run on the tokio runtime:
+currently offers four modules and they all run on the tokio runtime:
 
 - **Counters** (`counter` feature, enabled by default) -- two counter (strict and lax)
   implementations that share a common async trait, letting you choose between
@@ -12,6 +12,10 @@ currently offers three modules and they all run on the tokio runtime:
   a cluster of servers where each server reports its active connection count, the cumulative
   is the cluster-wide total, when a server dies, the contribution is automatically subtracted.
   If the server was temporarily offline, the contribution is automatically added back when it comes back online.
+- **Distributed locks** (`lock` feature, opt-in) -- Redis-backed [`Mutex`] and
+  [`RwLock`] whose surfaces mirror `tokio::sync::Mutex` / `tokio::sync::RwLock`.
+  Acquire returns an RAII guard; the lease is renewed in the background and
+  released on drop.
 - **Rate limiting** (`trypema` feature, opt-in) -- re-exports the
   [`trypema`](https://docs.rs/trypema) crate, providing sliding-window rate
   limiting with local, Redis-backed, and hybrid providers.
@@ -22,6 +26,7 @@ currently offers three modules and they all run on the tokio runtime:
 | ------------------------ | ------- | ------------------------------------------------------------------------------------------------- |
 | `counter`                | **yes** | Distributed counters ([`StrictCounter`], [`LaxCounter`])                                          |
 | `instance-aware-counter` | no      | Instance aware distributed counters ([`StrictInstanceAwareCounter`], [`LaxInstanceAwareCounter`]) |
+| `lock`                   | no      | Distributed [`Mutex`] and [`RwLock`]                                                              |
 | `trypema`                | no      | Rate limiting via the [`trypema`](https://docs.rs/trypema) crate                                  |
 
 # Quick start
@@ -150,6 +155,10 @@ All fallible operations return [`DistkitError`]:
 - **`MutexPoisoned`** -- An internal lock was poisoned. This indicates a
   previous panic inside a critical section.
 - **`CustomError`** -- Catch-all for internal errors.
+- **`LockError`** -- A lock operation failed (only present with the `lock`
+  feature): `AcquireFail` (a non-blocking acquire would block), `Timeout` (a
+  bounded acquire ran out the clock), `NotOwner`, or the `InvalidTtl` /
+  `InvalidOwner` validation errors.
 - **`TrypemaError`** -- A rate-limiting operation failed (only present with the
   `trypema` feature).
 
@@ -314,6 +323,99 @@ let (total, mine) = counter.get(&key).await?;
 # Ok(())
 # }
 ```
+
+# Distributed locks
+
+Enable the `lock` feature to access Redis-backed distributed locks.
+
+```toml
+[dependencies]
+distkit = { version = "0.4", features = ["lock"] }
+```
+
+[`Mutex`] (mutual exclusion) and [`RwLock`] (reader-writer) mirror the surface of
+`tokio::sync::Mutex` / `tokio::sync::RwLock` as closely as a network lock allows.
+Both are built from [`LockOptions`] (defaults: `ttl` 30 s, a fresh UUID v4 owner,
+`max_wait` `None` = wait until acquired, `retry_interval` 50 ms); use
+[`LockOptionsBuilder`] (via [`LockOptions::builder`]) to override fields. One lock
+object owns exactly one resource — the key and owner are bound at construction.
+
+Unlike `tokio`'s locks, the guards **hold no inner data** — they are pure
+access tokens, like `tokio::Mutex<()>`. A held lock renews its lease in the
+background every `ttl/3`; releasing happens on `Drop` (best-effort,
+fire-and-forget) or via an explicit awaitable `release()` that returns the final
+[`LockGuardState`]. Because the lease lives in Redis, not in this process, code
+whose correctness depends on the lock should re-check `get_state` (no Redis
+round-trip) before its critical section rather than trusting the guard's
+existence alone.
+
+## Mutex
+
+```rust
+# use distkit::{DistkitRedisKey, lock::{Mutex, LockOptions, LockGuardState}};
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+let redis_url = std::env::var("REDIS_URL")
+    .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+let client = redis::Client::open(redis_url)?;
+let conn = client.get_connection_manager().await?;
+
+let key = DistkitRedisKey::try_from("invoice_42".to_string())?;
+let mutex = Mutex::new(LockOptions::new(key, conn));
+
+// One non-blocking attempt; Err(LockError::AcquireFail) if already held.
+let guard = mutex.try_lock().await?;
+
+// The lease is renewed in the background. Re-check before relying on it.
+if guard.get_state().await == LockGuardState::Acquired {
+    // ... critical section ...
+}
+
+// Release and observe the final state (or just drop the guard).
+let state = guard.release().await?;
+assert_eq!(state, LockGuardState::Released);
+# Ok(())
+# }
+```
+
+`mutex.lock().await?` waits up to `max_wait` (forever when `None`), and
+`mutex.try_lock_for(timeout, retry_interval).await?` waits a bounded time,
+returning `LockError::Timeout` if the deadline passes first.
+
+## RwLock
+
+Many readers may hold the lock at once; a writer holds it alone. The lock is
+**writer-preferring**: while a writer is waiting, new readers are turned away so
+the writer is not starved (the flip side is possible reader starvation under
+constant writers).
+
+```rust
+# use distkit::{DistkitRedisKey, lock::{RwLock, LockOptions}};
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+let redis_url = std::env::var("REDIS_URL")
+    .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+let client = redis::Client::open(redis_url)?;
+let conn = client.get_connection_manager().await?;
+
+let key = DistkitRedisKey::try_from("config_blob".to_string())?;
+let rw = RwLock::new(LockOptions::new(key, conn));
+
+// Shared read access — multiple readers coexist.
+let r1 = rw.try_read().await?;
+let r2 = rw.try_read().await?;
+r1.release().await?;
+r2.release().await?;
+
+// Exclusive write access — waits for all readers/the writer to clear.
+let w = rw.write().await?;
+w.release().await?;
+# Ok(())
+# }
+```
+
+Each side has the same three forms: waiting (`read` / `write`), non-blocking
+(`try_read` / `try_write`), and bounded (`try_read_for` / `try_write_for`).
 
 # Rate limiting (trypema)
 
@@ -504,3 +606,9 @@ details and advanced configuration.
 [`StrictInstanceAwareCounter`]: icounter::StrictInstanceAwareCounter
 [`LaxInstanceAwareCounter`]: icounter::LaxInstanceAwareCounter
 [`InstanceAwareCounterTrait`]: icounter::InstanceAwareCounterTrait
+[`Mutex`]: lock::Mutex
+[`RwLock`]: lock::RwLock
+[`LockOptions`]: lock::LockOptions
+[`LockOptionsBuilder`]: lock::LockOptionsBuilder
+[`LockOptions::builder`]: lock::LockOptions::builder
+[`LockGuardState`]: lock::LockGuardState

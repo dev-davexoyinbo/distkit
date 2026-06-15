@@ -1,4 +1,4 @@
-.PHONY: help redis-up redis-down logs test bench
+.PHONY: help redis-up redis-down logs test bench doc
 
 REDIS_PORT ?= 16379
 REDIS_URL ?= redis://127.0.0.1:$(REDIS_PORT)/
@@ -43,3 +43,6 @@ bench: ## Run criterion benchmarks
 	trap "$(MAKE) -s redis-down" EXIT; \
 	$(MAKE) -s redis-up; \
 	REDIS_URL="$(REDIS_URL)" cargo bench --all-features
+
+doc: ## Build and open the docs for all features
+	cargo doc --all-features --no-deps --open

@@ -1,0 +1,89 @@
+//! Low-level Redis ops backing `Mutex`: owner-checked acquire / refresh /
+//! release, each a single atomic round-trip on one string key.
+//!
+//! Every op is keyed on the caller's `owner_id`; callers pass a fully-formed
+//! (already namespaced) Redis key. These same `refresh` / `release` ops are
+//! reused by the rwlock backend for its writer key (`:w`).
+
+use std::sync::OnceLock;
+
+use redis::{Script, aio::ConnectionManager};
+
+use crate::DistkitError;
+use crate::lock::error::{validate_owner, validate_ttl};
+
+/// Owner-checked PEXPIRE: extend the lease only if we still own it.
+const REFRESH_LUA: &str = r#"
+    if redis.call('GET', KEYS[1]) == ARGV[1] then
+        return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+    else
+        return 0
+    end
+"#;
+
+/// Owner-checked DEL: release the lock only if we still own it.
+const RELEASE_LUA: &str = r#"
+    if redis.call('GET', KEYS[1]) == ARGV[1] then
+        return redis.call('DEL', KEYS[1])
+    else
+        return 0
+    end
+"#;
+
+/// `SET key owner NX PX ttl_ms`. `Ok(true)` if the lock was taken.
+pub(crate) async fn acquire(
+    conn: &mut ConnectionManager,
+    key: &str,
+    owner: &str,
+    ttl_ms: i64,
+) -> Result<bool, DistkitError> {
+    validate_owner(owner)?;
+    validate_ttl(ttl_ms)?;
+
+    let res: Option<String> = redis::cmd("SET")
+        .arg(key)
+        .arg(owner)
+        .arg("NX")
+        .arg("PX")
+        .arg(ttl_ms)
+        .query_async(conn)
+        .await?;
+
+    Ok(res.is_some())
+}
+
+/// Owner-checked PEXPIRE. `Ok(true)` if we still own the lease and extended it.
+pub(crate) async fn refresh(
+    conn: &mut ConnectionManager,
+    key: &str,
+    owner: &str,
+    ttl_ms: i64,
+) -> Result<bool, DistkitError> {
+    validate_ttl(ttl_ms)?;
+
+    static REFRESH_SCRIPT: OnceLock<Script> = OnceLock::new();
+    let script = REFRESH_SCRIPT.get_or_init(|| Script::new(REFRESH_LUA));
+
+    let n: i64 = script
+        .key(key)
+        .arg(owner)
+        .arg(ttl_ms)
+        .invoke_async(conn)
+        .await?;
+
+    Ok(n == 1)
+}
+
+/// Owner-checked DEL. `Ok(true)` if we held the lock and released it.
+pub(crate) async fn release(
+    conn: &mut ConnectionManager,
+    key: &str,
+    owner: &str,
+) -> Result<bool, DistkitError> {
+    static RELEASE_SCRIPT: OnceLock<Script> = OnceLock::new();
+    let script = RELEASE_SCRIPT.get_or_init(|| Script::new(RELEASE_LUA));
+
+    let n: i64 = script.key(key).arg(owner).invoke_async(conn).await?;
+
+    Ok(n == 1)
+}

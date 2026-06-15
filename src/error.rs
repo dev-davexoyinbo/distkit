@@ -4,6 +4,9 @@ use trypema_crate::TrypemaError;
 #[cfg(feature = "counter")]
 use crate::counter::CounterError;
 
+#[cfg(feature = "lock")]
+use crate::lock::LockError;
+
 /// Top-level error type for all distkit operations.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum DistkitError {
@@ -15,6 +18,10 @@ pub enum DistkitError {
     #[cfg(feature = "counter")]
     #[error("Counter Error: {0}")]
     CounterError(#[from] CounterError),
+    /// A lock-specific error. See [`LockError`].
+    #[cfg(feature = "lock")]
+    #[error("Lock Error: {0}")]
+    LockError(#[from] LockError),
     /// A Redis operation failed (connection lost, script error, etc.).
     #[error("Redis Error: {0}")]
     RedisError(#[from] redis::RedisError),

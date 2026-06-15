@@ -31,9 +31,10 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["counter", "instance-aware-counter"]
-full = ["counter", "instance-aware-counter", "trypema"]
+full = ["counter", "instance-aware-counter", "trypema", "lock"]
 instance-aware-counter = []
 counter = []
+lock = []
 trypema = ["trypema-crate", "trypema-crate/redis-tokio"]
 
 
@@ -71,4 +72,8 @@ harness = false
 
 [[bench]]
 name = "lax_instance_aware_counter"
+harness = false
+
+[[bench]]
+name = "lock"
 harness = false
