@@ -15,6 +15,7 @@ mod error;
 pub use error::*;
 
 mod mutex_backend;
+mod rwlock_backend;
 
 mod mutex;
 pub use mutex::*;
