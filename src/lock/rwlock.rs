@@ -183,7 +183,8 @@ impl RwLock {
         timeout: Option<Duration>,
         retry_interval: Duration,
     ) -> Result<RwLockReadGuard, DistkitError> {
-        self.acquire_loop(LockMode::Shared, timeout, retry_interval)
+        let on_attempt = self
+            .acquire_loop(LockMode::Shared, timeout, retry_interval)
             .await?;
 
         let lost = Arc::new(AtomicBool::new(false));
@@ -195,6 +196,7 @@ impl RwLock {
             owner: self.owner.clone(),
             refresh_handle: Some(refresh_handle),
             lost,
+            on_attempt,
         })
     }
 
@@ -204,7 +206,8 @@ impl RwLock {
         timeout: Option<Duration>,
         retry_interval: Duration,
     ) -> Result<RwLockWriteGuard, DistkitError> {
-        self.acquire_loop(LockMode::Exclusive, timeout, retry_interval)
+        let on_attempt = self
+            .acquire_loop(LockMode::Exclusive, timeout, retry_interval)
             .await?;
 
         let lost = Arc::new(AtomicBool::new(false));
@@ -218,6 +221,7 @@ impl RwLock {
             owner: self.owner.clone(),
             refresh_handle: Some(refresh_handle),
             lost,
+            on_attempt,
         })
     }
 
@@ -235,7 +239,7 @@ impl RwLock {
         mode: LockMode,
         timeout: Option<Duration>,
         retry_interval: Duration,
-    ) -> Result<(), DistkitError> {
+    ) -> Result<usize, DistkitError> {
         let start = Instant::now();
         let mut connection = self.connection_manager.clone();
         let mark_pending = !retry_interval.is_zero();
@@ -248,6 +252,7 @@ impl RwLock {
             Some(retry_interval)
         };
 
+        let mut attempt = 0usize;
         loop {
             if let Some(retry_interval) = &mut retry_interval {
                 // First tick is immediate, subsequent ticks are delayed.
@@ -271,7 +276,7 @@ impl RwLock {
             };
 
             if acquired {
-                return Ok(());
+                return Ok(attempt);
             }
 
             if retry_interval.is_none() {
@@ -294,6 +299,8 @@ impl RwLock {
                     return Err(LockError::Timeout { waited }.into());
                 }
             }
+
+            attempt += 1;
         }
     }
 
@@ -393,6 +400,8 @@ pub struct RwLockReadGuard {
     owner: String,
     refresh_handle: Option<JoinHandle<()>>,
     lost: Arc<AtomicBool>,
+    /// Zero-based index of the acquire attempt that obtained this lock.
+    on_attempt: usize,
 }
 
 impl RwLockReadGuard {
@@ -401,6 +410,13 @@ impl RwLockReadGuard {
     /// [`RwLock`] for when a held lock turns up [`Lost`](LockGuardState::Lost).
     pub async fn get_state(&self) -> LockGuardState {
         state_from(&self.refresh_handle, &self.lost)
+    }
+
+    /// The zero-based acquire attempt that obtained this lock: `0` if the very
+    /// first poll succeeded, `n` after `n` retries. A one-shot `try_read` is
+    /// always `0`. Useful for contention metrics.
+    pub async fn get_on_attempt(&self) -> usize {
+        self.on_attempt
     }
 
     /// Releases the read and reports its final [`LockGuardState`]. Stops the refresh,
@@ -463,6 +479,8 @@ pub struct RwLockWriteGuard {
     owner: String,
     refresh_handle: Option<JoinHandle<()>>,
     lost: Arc<AtomicBool>,
+    /// Zero-based index of the acquire attempt that obtained this lock.
+    on_attempt: usize,
 }
 
 impl RwLockWriteGuard {
@@ -471,6 +489,13 @@ impl RwLockWriteGuard {
     /// [`RwLock`] for when a held lock turns up [`Lost`](LockGuardState::Lost).
     pub async fn get_state(&self) -> LockGuardState {
         state_from(&self.refresh_handle, &self.lost)
+    }
+
+    /// The zero-based acquire attempt that obtained this lock: `0` if the very
+    /// first poll succeeded, `n` after `n` retries. A one-shot `try_write` is
+    /// always `0`. Useful for contention metrics.
+    pub async fn get_on_attempt(&self) -> usize {
+        self.on_attempt
     }
 
     /// Releases the write and reports its final [`LockGuardState`]. Stops the
