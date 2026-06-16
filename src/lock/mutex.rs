@@ -159,6 +159,7 @@ impl Mutex {
             Some(retry_interval)
         };
 
+        let mut attempt = 0usize;
         loop {
             if let Some(retry_interval) = &mut retry_interval {
                 // First tick is immediately, subsequent ticks are delayed.
@@ -166,7 +167,8 @@ impl Mutex {
             }
 
             let acquired =
-                mutex_backend::acquire(&mut connection, &self.full_key, &self.owner, self.ttl_ms).await?;
+                mutex_backend::acquire(&mut connection, &self.full_key, &self.owner, self.ttl_ms)
+                    .await?;
 
             if acquired {
                 let lost = Arc::new(AtomicBool::new(false));
@@ -178,6 +180,7 @@ impl Mutex {
                     owner: self.owner.clone(),
                     refresh_handle: Some(refresh_handle),
                     lost,
+                    on_attempt: attempt,
                 });
             }
 
@@ -195,6 +198,8 @@ impl Mutex {
                     return Err(LockError::Timeout { waited }.into());
                 }
             }
+
+            attempt += 1;
         }
     }
 
@@ -224,7 +229,9 @@ impl Mutex {
             loop {
                 ticker.tick().await;
 
-                match mutex_backend::refresh(&mut connection_manager, &full_key, &owner, ttl_ms).await {
+                match mutex_backend::refresh(&mut connection_manager, &full_key, &owner, ttl_ms)
+                    .await
+                {
                     Ok(true) => {
                         // Refresh succeeded; if the lease had been marked lost, we
                         // just regained ownership — clear the flag.
@@ -278,6 +285,8 @@ pub struct MutexGuard {
     owner: String,
     refresh_handle: Option<JoinHandle<()>>,
     lost: Arc<AtomicBool>,
+    /// Zero-based index of the acquire attempt that obtained this lock.
+    on_attempt: usize,
 }
 
 impl MutexGuard {
@@ -302,6 +311,13 @@ impl MutexGuard {
         }
 
         LockGuardState::Acquired
+    }
+
+    /// The zero-based acquire attempt that obtained this lock: `0` if the very
+    /// first poll succeeded, `n` after `n` retries. A one-shot `try_lock` is
+    /// always `0`. Useful for contention metrics.
+    pub async fn get_on_attempt(&self) -> usize {
+        self.on_attempt
     }
 
     /// Releases the lock and reports its final [`LockGuardState`].

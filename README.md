@@ -329,8 +329,10 @@ distkit = { version = "0.5", features = ["lock"] }
 Both mirror the surface of `tokio::sync::Mutex` / `tokio::sync::RwLock`. The
 guards hold no inner data — they are pure access tokens. A held lock renews its
 lease in the background (every `ttl/3`) and releases on drop, with an explicit
-awaitable `release()` for callers who want to observe the final state. `RwLock`
-is writer-preferring (a waiting writer blocks new readers).
+awaitable `release()` for callers who want to observe the final state. Each guard
+also reports `get_on_attempt` — the zero-based acquire poll that won the lock
+(`0` on the first try, higher under contention). `RwLock` is writer-preferring (a
+waiting writer blocks new readers).
 
 ```rust,no_run
 use distkit::{DistkitRedisKey, lock::{Mutex, RwLock, LockOptions}};
@@ -344,6 +346,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = DistkitRedisKey::try_from("invoice_42".to_string())?;
     let mutex = Mutex::new(LockOptions::new(key, conn.clone()));
     let guard = mutex.lock().await?;            // waits until acquired
+    let _attempts = guard.get_on_attempt().await; // 0 on first poll, higher under contention
     // ... critical section ...
     guard.release().await?;
 

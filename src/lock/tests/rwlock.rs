@@ -176,6 +176,51 @@ async fn get_state_reports_acquired() {
     assert_eq!(guard.get_state().await, LockGuardState::Acquired);
 }
 
+/// An uncontended read/write wins on the first poll: `get_on_attempt` is `0`.
+#[tokio::test]
+async fn get_on_attempt_zero_when_uncontended() {
+    let reader = RwLock::new(make_options("rw_get_on_attempt_zero").await);
+    let writer = RwLock::new(make_options("rw_get_on_attempt_zero_w").await);
+
+    let read_guard = reader.try_read().await.expect("reader should acquire");
+    assert_eq!(read_guard.get_on_attempt().await, 0);
+
+    let write_guard = writer.try_write().await.expect("writer should acquire");
+    assert_eq!(write_guard.get_on_attempt().await, 0);
+}
+
+/// A reader that blocks behind a held writer only wins after retries:
+/// `get_on_attempt` is non-zero.
+#[tokio::test]
+async fn get_on_attempt_counts_retries_under_contention() {
+    let writer = RwLock::new(make_options("rw_get_on_attempt_retries").await);
+    let reader = RwLock::new(make_options("rw_get_on_attempt_retries").await);
+
+    let write_guard = writer.try_write().await.expect("writer should acquire");
+
+    let waiter = tokio::spawn(async move {
+        reader
+            .try_read_for(Duration::from_secs(2), Duration::from_millis(20))
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    write_guard
+        .release()
+        .await
+        .expect("write release should succeed");
+
+    let guard = waiter
+        .await
+        .expect("waiter task should not panic")
+        .expect("reader should acquire after writer releases");
+
+    assert!(
+        guard.get_on_attempt().await >= 1,
+        "a contended acquire should take more than one attempt"
+    );
+}
+
 /// If the write lease is lost (writer key deleted out from under us), the refresh
 /// task marks it [`LockGuardState::Lost`]: `get_state` reports it and `release`
 /// returns `Ok(Lost)` without issuing a delete we no longer own.

@@ -158,6 +158,54 @@ async fn get_state_reports_acquired_while_held() {
     assert_eq!(guard.get_state().await, LockGuardState::Acquired);
 }
 
+/// An uncontended acquire wins on the first poll: `get_on_attempt` is `0`.
+#[tokio::test]
+async fn get_on_attempt_zero_when_uncontended() {
+    let mutex = Mutex::new(make_options("get_on_attempt_zero_when_uncontended").await);
+
+    let guard = mutex
+        .try_lock()
+        .await
+        .expect("try_lock should take the lock");
+
+    assert_eq!(guard.get_on_attempt().await, 0);
+}
+
+/// A waiter that blocks while the key is held only wins after retries:
+/// `get_on_attempt` is non-zero.
+#[tokio::test]
+async fn get_on_attempt_counts_retries_under_contention() {
+    let mutex_a = Mutex::new(make_options("get_on_attempt_counts_retries").await);
+    let mutex_b = Mutex::new(make_options("get_on_attempt_counts_retries").await);
+
+    let first_guard = mutex_a
+        .try_lock()
+        .await
+        .expect("first try_lock should take the lock");
+
+    let waiter = tokio::spawn(async move {
+        mutex_b
+            .try_lock_for(Duration::from_secs(2), Duration::from_millis(20))
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    first_guard
+        .release()
+        .await
+        .expect("explicit release should succeed");
+
+    let guard = waiter
+        .await
+        .expect("waiter task should not panic")
+        .expect("waiter should acquire the lock after release");
+
+    assert!(
+        guard.get_on_attempt().await >= 1,
+        "a contended acquire should take more than one attempt"
+    );
+}
+
 /// If the lease is lost while held (key deleted out from under us), the refresh
 /// task marks it [`LockGuardState::Lost`]: `get_state` reports it and `release`
 /// returns `Ok(LockGuardState::Lost)` without issuing a DEL we no longer own.
