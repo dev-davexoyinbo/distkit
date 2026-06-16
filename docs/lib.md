@@ -347,7 +347,9 @@ fire-and-forget) or via an explicit awaitable `release()` that returns the final
 [`LockGuardState`]. Because the lease lives in Redis, not in this process, code
 whose correctness depends on the lock should re-check `get_state` (no Redis
 round-trip) before its critical section rather than trusting the guard's
-existence alone.
+existence alone. Each guard also exposes `get_on_attempt` — the zero-based acquire
+poll that won the lock (`0` on the first try, higher when it waited through
+contention) — handy for metrics and backoff tuning.
 
 ## Mutex
 
@@ -370,6 +372,9 @@ let guard = mutex.try_lock().await?;
 if guard.get_state().await == LockGuardState::Acquired {
     // ... critical section ...
 }
+
+// Which acquire attempt won the lock: 0 on the first poll, higher under contention.
+let _attempts = guard.get_on_attempt().await;
 
 // Release and observe the final state (or just drop the guard).
 let state = guard.release().await?;
