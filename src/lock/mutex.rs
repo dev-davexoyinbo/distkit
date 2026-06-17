@@ -118,13 +118,14 @@ impl Mutex {
     /// Acquires the lock, waiting up to `max_wait` (or forever if `max_wait` is
     /// `None`), polling every `retry_interval`.
     pub async fn lock(&self) -> Result<MutexGuard, DistkitError> {
-        self.acquire_core(self.max_wait, self.retry_interval).await
+        self.acquire_core(self.max_wait, None, self.retry_interval)
+            .await
     }
 
     /// Tries to acquire the lock in a single attempt without waiting. Returns
     /// [`LockError::AcquireFail`] if the lock is already held.
     pub async fn try_lock(&self) -> Result<MutexGuard, DistkitError> {
-        self.acquire_core(Some(Duration::ZERO), Duration::ZERO)
+        self.acquire_core(Some(Duration::ZERO), None, Duration::ZERO)
             .await
     }
 
@@ -132,7 +133,23 @@ impl Mutex {
     /// lock's configured `retry_interval` (see [`LockOptions::retry_interval`]).
     /// Returns [`LockError::Timeout`] if the deadline passes first.
     pub async fn try_lock_with_timeout(&self, timeout: Duration) -> Result<MutexGuard, DistkitError> {
-        self.acquire_core(Some(timeout), self.retry_interval).await
+        self.acquire_core(Some(timeout), None, self.retry_interval)
+            .await
+    }
+
+    /// Tries to acquire the lock, making up to `max_retries` retries after the
+    /// initial attempt (`max_retries + 1` attempts total), polling at the lock's
+    /// configured `retry_interval` (see [`LockOptions::retry_interval`]). Returns
+    /// [`LockError::RetriesExhausted`] if every attempt fails.
+    ///
+    /// Relies on a non-zero configured `retry_interval` (the default); a lock
+    /// configured with a zero `retry_interval` collapses to a single attempt.
+    pub async fn try_lock_with_retries(
+        &self,
+        max_retries: usize,
+    ) -> Result<MutexGuard, DistkitError> {
+        self.acquire_core(None, Some(max_retries), self.retry_interval)
+            .await
     }
 
     /// Tries to acquire the lock, waiting up to `timeout` and polling every
@@ -147,16 +164,19 @@ impl Mutex {
         timeout: Duration,
         retry_interval: Duration,
     ) -> Result<MutexGuard, DistkitError> {
-        self.acquire_core(Some(timeout), retry_interval).await
+        self.acquire_core(Some(timeout), None, retry_interval).await
     }
 
     /// Shared acquire retry-loop backing every public form.
     ///
     /// `timeout == None` waits forever; `Some(ZERO)` is a single shot;
-    /// `Some(duration)` is a bounded wait.
+    /// `Some(duration)` is a bounded wait. `max_retries == Some(n)` gives up with
+    /// [`LockError::RetriesExhausted`] after `n` retries; `None` is unbounded by
+    /// retry count.
     async fn acquire_core(
         &self,
         timeout: Option<Duration>,
+        max_retries: Option<usize>,
         retry_interval: Duration,
     ) -> Result<MutexGuard, DistkitError> {
         let start = Instant::now();
@@ -208,6 +228,12 @@ impl Mutex {
                 if waited >= ttl {
                     return Err(LockError::Timeout { waited }.into());
                 }
+            }
+
+            if let Some(max_retries) = max_retries
+                && attempt >= max_retries
+            {
+                return Err(LockError::RetriesExhausted { retries: attempt }.into());
             }
 
             attempt += 1;

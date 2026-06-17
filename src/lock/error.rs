@@ -18,6 +18,13 @@ pub enum LockError {
         /// How long the acquire waited before giving up.
         waited: Duration,
     },
+    /// A retry-bounded acquire exhausted its retries without acquiring the lock.
+    #[error("exhausted retries after {retries} retries")]
+    RetriesExhausted {
+        /// Number of retries performed before giving up (the initial attempt is
+        /// not counted as a retry).
+        retries: usize,
+    },
     /// The caller is not the recorded owner of the lock.
     #[error("not the lock owner")]
     NotOwner,

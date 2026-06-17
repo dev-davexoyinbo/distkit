@@ -386,8 +386,10 @@ assert_eq!(state, LockGuardState::Released);
 `mutex.lock().await?` waits up to `max_wait` (forever when `None`), and
 `mutex.try_lock_with_timeout(timeout).await?` waits a bounded time — polling at the
 lock's configured `retry_interval` — and returns `LockError::Timeout` if the
-deadline passes first. (`try_lock_for(timeout, retry_interval)` is deprecated in
-favor of `try_lock_with_timeout`.)
+deadline passes first. `mutex.try_lock_with_retries(max_retries).await?` instead
+bounds by attempt count, polling at the same `retry_interval` and returning
+`LockError::RetriesExhausted` after `max_retries` retries. (`try_lock_for(timeout,
+retry_interval)` is deprecated in favor of `try_lock_with_timeout`.)
 
 ## RwLock
 
@@ -421,10 +423,13 @@ w.release().await?;
 # }
 ```
 
-Each side has the same three forms: waiting (`read` / `write`), non-blocking
-(`try_read` / `try_write`), and bounded (`try_read_with_timeout` / `try_write_with_timeout`),
-which take only a `timeout` and poll at the lock's configured `retry_interval`.
-(The older `try_read_for` / `try_write_for` forms are deprecated.)
+Each side has the same forms: waiting (`read` / `write`), non-blocking
+(`try_read` / `try_write`), time-bounded (`try_read_with_timeout` /
+`try_write_with_timeout`), and retry-bounded (`try_read_with_retries` /
+`try_write_with_retries`). The bounded forms poll at the lock's configured
+`retry_interval`; the retry-bounded forms return `LockError::RetriesExhausted`
+after `max_retries` retries. (The older `try_read_for` / `try_write_for` forms are
+deprecated.)
 
 # Rate limiting (trypema)
 

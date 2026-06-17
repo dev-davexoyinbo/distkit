@@ -74,6 +74,55 @@ async fn try_lock_with_timeout_times_out() {
     }
 }
 
+/// A retry-bounded `try_lock_with_retries` on a held key exhausts its retries
+/// and fails with `RetriesExhausted`, reporting the retries performed.
+#[tokio::test]
+async fn try_lock_with_retries_exhausts() {
+    let mutex_a = Mutex::new(make_options("try_lock_with_retries_exhausts").await);
+    let mutex_b = Mutex::new(make_fast_options("try_lock_with_retries_exhausts").await);
+
+    let _first_guard = mutex_a
+        .try_lock()
+        .await
+        .expect("first try_lock should take the lock");
+
+    match mutex_b.try_lock_with_retries(3).await {
+        Err(DistkitError::LockError(LockError::RetriesExhausted { retries: 3 })) => {}
+        other => panic!("expected RetriesExhausted {{ retries: 3 }}, got {other:?}"),
+    }
+}
+
+/// `try_lock_with_retries` blocks while the key is held, then acquires once the
+/// holder releases (within the retry budget).
+#[tokio::test]
+async fn try_lock_with_retries_succeeds() {
+    let mutex_a = Mutex::new(make_options("try_lock_with_retries_succeeds").await);
+    let mutex_b = Mutex::new(make_fast_options("try_lock_with_retries_succeeds").await);
+
+    let first_guard = mutex_a
+        .try_lock()
+        .await
+        .expect("first try_lock should take the lock");
+
+    let waiter = tokio::spawn(async move { mutex_b.try_lock_with_retries(50).await });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    first_guard
+        .release()
+        .await
+        .expect("explicit release should succeed");
+
+    let guard = waiter
+        .await
+        .expect("waiter task should not panic")
+        .expect("waiter should acquire the lock within the retry budget");
+
+    assert!(
+        guard.get_on_attempt().await >= 1,
+        "a contended acquire should take more than one attempt"
+    );
+}
+
 /// The deprecated `try_lock_for` still works: a bounded attempt on a held key
 /// fails with `Timeout`. Retained for coverage of the legacy API.
 #[allow(deprecated)]

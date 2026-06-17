@@ -129,13 +129,14 @@ impl RwLock {
     /// Acquires shared (read) access, waiting up to `max_wait` (or forever if
     /// `max_wait` is `None`), polling every `retry_interval`.
     pub async fn read(&self) -> Result<RwLockReadGuard, DistkitError> {
-        self.acquire_shared(self.max_wait, self.retry_interval).await
+        self.acquire_shared(self.max_wait, None, self.retry_interval)
+            .await
     }
 
     /// Tries to acquire shared (read) access in a single attempt without waiting.
     /// Returns [`LockError::AcquireFail`] if a writer holds or is waiting.
     pub async fn try_read(&self) -> Result<RwLockReadGuard, DistkitError> {
-        self.acquire_shared(Some(Duration::ZERO), Duration::ZERO)
+        self.acquire_shared(Some(Duration::ZERO), None, Duration::ZERO)
             .await
     }
 
@@ -144,7 +145,23 @@ impl RwLock {
     /// [`LockOptions::retry_interval`]). Returns [`LockError::Timeout`] if the
     /// deadline passes first.
     pub async fn try_read_with_timeout(&self, timeout: Duration) -> Result<RwLockReadGuard, DistkitError> {
-        self.acquire_shared(Some(timeout), self.retry_interval).await
+        self.acquire_shared(Some(timeout), None, self.retry_interval)
+            .await
+    }
+
+    /// Tries to acquire shared (read) access, making up to `max_retries` retries
+    /// after the initial attempt (`max_retries + 1` attempts total), polling at
+    /// the lock's configured `retry_interval` (see [`LockOptions::retry_interval`]).
+    /// Returns [`LockError::RetriesExhausted`] if every attempt fails.
+    ///
+    /// Relies on a non-zero configured `retry_interval` (the default); a lock
+    /// configured with a zero `retry_interval` collapses to a single attempt.
+    pub async fn try_read_with_retries(
+        &self,
+        max_retries: usize,
+    ) -> Result<RwLockReadGuard, DistkitError> {
+        self.acquire_shared(None, Some(max_retries), self.retry_interval)
+            .await
     }
 
     /// Tries to acquire shared (read) access, waiting up to `timeout` and polling
@@ -159,13 +176,13 @@ impl RwLock {
         timeout: Duration,
         retry_interval: Duration,
     ) -> Result<RwLockReadGuard, DistkitError> {
-        self.acquire_shared(Some(timeout), retry_interval).await
+        self.acquire_shared(Some(timeout), None, retry_interval).await
     }
 
     /// Acquires exclusive (write) access, waiting up to `max_wait` (or forever if
     /// `max_wait` is `None`), polling every `retry_interval`.
     pub async fn write(&self) -> Result<RwLockWriteGuard, DistkitError> {
-        self.acquire_exclusive(self.max_wait, self.retry_interval)
+        self.acquire_exclusive(self.max_wait, None, self.retry_interval)
             .await
     }
 
@@ -174,7 +191,7 @@ impl RwLock {
     /// or a writer is already waiting ahead. A one-shot `try_write` never enqueues
     /// itself, so a failed attempt does not block readers.
     pub async fn try_write(&self) -> Result<RwLockWriteGuard, DistkitError> {
-        self.acquire_exclusive(Some(Duration::ZERO), Duration::ZERO)
+        self.acquire_exclusive(Some(Duration::ZERO), None, Duration::ZERO)
             .await
     }
 
@@ -186,7 +203,23 @@ impl RwLock {
         &self,
         timeout: Duration,
     ) -> Result<RwLockWriteGuard, DistkitError> {
-        self.acquire_exclusive(Some(timeout), self.retry_interval)
+        self.acquire_exclusive(Some(timeout), None, self.retry_interval)
+            .await
+    }
+
+    /// Tries to acquire exclusive (write) access, making up to `max_retries`
+    /// retries after the initial attempt (`max_retries + 1` attempts total),
+    /// polling at the lock's configured `retry_interval` (see
+    /// [`LockOptions::retry_interval`]). Returns [`LockError::RetriesExhausted`]
+    /// if every attempt fails.
+    ///
+    /// Relies on a non-zero configured `retry_interval` (the default); a lock
+    /// configured with a zero `retry_interval` collapses to a single attempt.
+    pub async fn try_write_with_retries(
+        &self,
+        max_retries: usize,
+    ) -> Result<RwLockWriteGuard, DistkitError> {
+        self.acquire_exclusive(None, Some(max_retries), self.retry_interval)
             .await
     }
 
@@ -202,17 +235,19 @@ impl RwLock {
         timeout: Duration,
         retry_interval: Duration,
     ) -> Result<RwLockWriteGuard, DistkitError> {
-        self.acquire_exclusive(Some(timeout), retry_interval).await
+        self.acquire_exclusive(Some(timeout), None, retry_interval)
+            .await
     }
 
     /// Acquires shared access via the shared retry loop, then builds the guard.
     async fn acquire_shared(
         &self,
         timeout: Option<Duration>,
+        max_retries: Option<usize>,
         retry_interval: Duration,
     ) -> Result<RwLockReadGuard, DistkitError> {
         let on_attempt = self
-            .acquire_loop(LockMode::Shared, timeout, retry_interval)
+            .acquire_loop(LockMode::Shared, timeout, max_retries, retry_interval)
             .await?;
 
         let lost = Arc::new(AtomicBool::new(false));
@@ -232,10 +267,11 @@ impl RwLock {
     async fn acquire_exclusive(
         &self,
         timeout: Option<Duration>,
+        max_retries: Option<usize>,
         retry_interval: Duration,
     ) -> Result<RwLockWriteGuard, DistkitError> {
         let on_attempt = self
-            .acquire_loop(LockMode::Exclusive, timeout, retry_interval)
+            .acquire_loop(LockMode::Exclusive, timeout, max_retries, retry_interval)
             .await?;
 
         let lost = Arc::new(AtomicBool::new(false));
@@ -260,12 +296,14 @@ impl RwLock {
     /// For [`Exclusive`](LockMode::Exclusive), `mark_pending` is true for the
     /// waiting forms (non-zero `retry_interval`) so the writer enqueues and keeps
     /// FIFO preference, and false for a one-shot `try_write`. When a waiting
-    /// writer gives up (timeout / `AcquireFail`) the pending slot is cleared so it
-    /// stops blocking readers.
+    /// writer gives up (timeout / retries exhausted / `AcquireFail`) the pending
+    /// slot is cleared so it stops blocking readers. `max_retries == Some(n)`
+    /// gives up with [`LockError::RetriesExhausted`] after `n` retries.
     async fn acquire_loop(
         &self,
         mode: LockMode,
         timeout: Option<Duration>,
+        max_retries: Option<usize>,
         retry_interval: Duration,
     ) -> Result<usize, DistkitError> {
         let start = Instant::now();
@@ -326,6 +364,14 @@ impl RwLock {
                         .await;
                     return Err(LockError::Timeout { waited }.into());
                 }
+            }
+
+            if let Some(max_retries) = max_retries
+                && attempt >= max_retries
+            {
+                self.clear_pending_on_giveup(mode, mark_pending, &mut connection)
+                    .await;
+                return Err(LockError::RetriesExhausted { retries: attempt }.into());
             }
 
             attempt += 1;
