@@ -48,7 +48,7 @@ pub async fn make_options_with_key(name: &str) -> (LockOptions, String) {
 }
 
 /// Like [`make_options`], but with a short 20 ms retry interval for snappy
-/// contention tests using the `try_*_until` / `lock`/`read`/`write` forms that
+/// contention tests using the `try_*_with_timeout` / `lock`/`read`/`write` forms that
 /// source their poll interval from the lock's configuration.
 pub async fn make_fast_options(name: &str) -> LockOptions {
     let mut options = make_options(name).await;

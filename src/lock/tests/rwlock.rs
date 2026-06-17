@@ -45,7 +45,7 @@ async fn writer_waits_for_readers() {
 
     let read_guard = reader.try_read().await.expect("reader should acquire");
 
-    let waiter = tokio::spawn(async move { writer.try_write_until(Duration::from_secs(2)).await });
+    let waiter = tokio::spawn(async move { writer.try_write_with_timeout(Duration::from_secs(2)).await });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     read_guard.release().await.expect("read release should succeed");
@@ -64,7 +64,7 @@ async fn reader_waits_for_writer() {
 
     let write_guard = writer.try_write().await.expect("writer should acquire");
 
-    let waiter = tokio::spawn(async move { reader.try_read_until(Duration::from_secs(2)).await });
+    let waiter = tokio::spawn(async move { reader.try_read_with_timeout(Duration::from_secs(2)).await });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     write_guard
@@ -89,7 +89,7 @@ async fn waiting_writer_blocks_new_readers() {
     let _read_guard = reader.try_read().await.expect("first reader should acquire");
 
     // A waiting (enqueuing) writer blocked by the held reader.
-    let waiter = tokio::spawn(async move { writer.try_write_until(Duration::from_secs(2)).await });
+    let waiter = tokio::spawn(async move { writer.try_write_with_timeout(Duration::from_secs(2)).await });
 
     // Let the writer register itself as pending at least once.
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -188,7 +188,7 @@ async fn get_on_attempt_counts_retries_under_contention() {
 
     let write_guard = writer.try_write().await.expect("writer should acquire");
 
-    let waiter = tokio::spawn(async move { reader.try_read_until(Duration::from_secs(2)).await });
+    let waiter = tokio::spawn(async move { reader.try_read_with_timeout(Duration::from_secs(2)).await });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     write_guard

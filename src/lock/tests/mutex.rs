@@ -31,7 +31,7 @@ async fn try_lock_excludes_second_owner() {
     drop(first_guard);
 }
 
-/// `lock`/`try_lock_until` blocks while the key is held, then acquires once the
+/// `lock`/`try_lock_with_timeout` blocks while the key is held, then acquires once the
 /// holder releases.
 #[tokio::test]
 async fn lock_waits_then_succeeds() {
@@ -43,7 +43,7 @@ async fn lock_waits_then_succeeds() {
         .await
         .expect("first try_lock should take the lock");
 
-    let waiter = tokio::spawn(async move { mutex_b.try_lock_until(Duration::from_secs(2)).await });
+    let waiter = tokio::spawn(async move { mutex_b.try_lock_with_timeout(Duration::from_secs(2)).await });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     first_guard
@@ -57,18 +57,18 @@ async fn lock_waits_then_succeeds() {
         .expect("waiter should acquire the lock after release");
 }
 
-/// A bounded `try_lock_until` on a held key fails with `Timeout`.
+/// A bounded `try_lock_with_timeout` on a held key fails with `Timeout`.
 #[tokio::test]
-async fn try_lock_until_times_out() {
-    let mutex_a = Mutex::new(make_options("try_lock_until_times_out").await);
-    let mutex_b = Mutex::new(make_fast_options("try_lock_until_times_out").await);
+async fn try_lock_with_timeout_times_out() {
+    let mutex_a = Mutex::new(make_options("try_lock_with_timeout_times_out").await);
+    let mutex_b = Mutex::new(make_fast_options("try_lock_with_timeout_times_out").await);
 
     let _first_guard = mutex_a
         .try_lock()
         .await
         .expect("first try_lock should take the lock");
 
-    match mutex_b.try_lock_until(Duration::from_millis(100)).await {
+    match mutex_b.try_lock_with_timeout(Duration::from_millis(100)).await {
         Err(DistkitError::LockError(LockError::Timeout { .. })) => {}
         other => panic!("expected Timeout, got {other:?}"),
     }
@@ -200,7 +200,7 @@ async fn get_on_attempt_counts_retries_under_contention() {
         .await
         .expect("first try_lock should take the lock");
 
-    let waiter = tokio::spawn(async move { mutex_b.try_lock_until(Duration::from_secs(2)).await });
+    let waiter = tokio::spawn(async move { mutex_b.try_lock_with_timeout(Duration::from_secs(2)).await });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     first_guard

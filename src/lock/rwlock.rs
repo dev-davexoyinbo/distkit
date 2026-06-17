@@ -143,7 +143,7 @@ impl RwLock {
     /// at the lock's configured `retry_interval` (see
     /// [`LockOptions::retry_interval`]). Returns [`LockError::Timeout`] if the
     /// deadline passes first.
-    pub async fn try_read_until(&self, timeout: Duration) -> Result<RwLockReadGuard, DistkitError> {
+    pub async fn try_read_with_timeout(&self, timeout: Duration) -> Result<RwLockReadGuard, DistkitError> {
         self.acquire_shared(Some(timeout), self.retry_interval).await
     }
 
@@ -152,7 +152,7 @@ impl RwLock {
     /// passes first. A `retry_interval` of zero is a tight spin.
     #[deprecated(
         since = "0.5.3",
-        note = "use `try_read_until`, which sources the retry interval from the lock's configuration"
+        note = "use `try_read_with_timeout`, which sources the retry interval from the lock's configuration"
     )]
     pub async fn try_read_for(
         &self,
@@ -182,7 +182,7 @@ impl RwLock {
     /// polling at the lock's configured `retry_interval` (see
     /// [`LockOptions::retry_interval`]). Returns [`LockError::Timeout`] if the
     /// deadline passes first.
-    pub async fn try_write_until(
+    pub async fn try_write_with_timeout(
         &self,
         timeout: Duration,
     ) -> Result<RwLockWriteGuard, DistkitError> {
@@ -195,7 +195,7 @@ impl RwLock {
     /// deadline passes first. A `retry_interval` of zero is a tight spin.
     #[deprecated(
         since = "0.5.3",
-        note = "use `try_write_until`, which sources the retry interval from the lock's configuration"
+        note = "use `try_write_with_timeout`, which sources the retry interval from the lock's configuration"
     )]
     pub async fn try_write_for(
         &self,
