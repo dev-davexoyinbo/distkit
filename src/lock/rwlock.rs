@@ -140,8 +140,20 @@ impl RwLock {
     }
 
     /// Tries to acquire shared (read) access, waiting up to `timeout` and polling
+    /// at the lock's configured `retry_interval` (see
+    /// [`LockOptions::retry_interval`]). Returns [`LockError::Timeout`] if the
+    /// deadline passes first.
+    pub async fn try_read_until(&self, timeout: Duration) -> Result<RwLockReadGuard, DistkitError> {
+        self.acquire_shared(Some(timeout), self.retry_interval).await
+    }
+
+    /// Tries to acquire shared (read) access, waiting up to `timeout` and polling
     /// every `retry_interval`. Returns [`LockError::Timeout`] if the deadline
     /// passes first. A `retry_interval` of zero is a tight spin.
+    #[deprecated(
+        since = "0.5.3",
+        note = "use `try_read_until`, which sources the retry interval from the lock's configuration"
+    )]
     pub async fn try_read_for(
         &self,
         timeout: Duration,
@@ -167,8 +179,24 @@ impl RwLock {
     }
 
     /// Tries to acquire exclusive (write) access, waiting up to `timeout` and
+    /// polling at the lock's configured `retry_interval` (see
+    /// [`LockOptions::retry_interval`]). Returns [`LockError::Timeout`] if the
+    /// deadline passes first.
+    pub async fn try_write_until(
+        &self,
+        timeout: Duration,
+    ) -> Result<RwLockWriteGuard, DistkitError> {
+        self.acquire_exclusive(Some(timeout), self.retry_interval)
+            .await
+    }
+
+    /// Tries to acquire exclusive (write) access, waiting up to `timeout` and
     /// polling every `retry_interval`. Returns [`LockError::Timeout`] if the
     /// deadline passes first. A `retry_interval` of zero is a tight spin.
+    #[deprecated(
+        since = "0.5.3",
+        note = "use `try_write_until`, which sources the retry interval from the lock's configuration"
+    )]
     pub async fn try_write_for(
         &self,
         timeout: Duration,

@@ -384,8 +384,10 @@ assert_eq!(state, LockGuardState::Released);
 ```
 
 `mutex.lock().await?` waits up to `max_wait` (forever when `None`), and
-`mutex.try_lock_for(timeout, retry_interval).await?` waits a bounded time,
-returning `LockError::Timeout` if the deadline passes first.
+`mutex.try_lock_until(timeout).await?` waits a bounded time — polling at the
+lock's configured `retry_interval` — and returns `LockError::Timeout` if the
+deadline passes first. (`try_lock_for(timeout, retry_interval)` is deprecated in
+favor of `try_lock_until`.)
 
 ## RwLock
 
@@ -420,7 +422,9 @@ w.release().await?;
 ```
 
 Each side has the same three forms: waiting (`read` / `write`), non-blocking
-(`try_read` / `try_write`), and bounded (`try_read_for` / `try_write_for`).
+(`try_read` / `try_write`), and bounded (`try_read_until` / `try_write_until`),
+which take only a `timeout` and poll at the lock's configured `retry_interval`.
+(The older `try_read_for` / `try_write_for` forms are deprecated.)
 
 # Rate limiting (trypema)
 

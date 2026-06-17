@@ -364,8 +364,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Acquire forms per lock: waiting (`lock` / `read` / `write`), non-blocking
 (`try_lock` / `try_read` / `try_write`), and bounded
-(`try_lock_for` / `try_read_for` / `try_write_for`). Tune `ttl`, `max_wait`,
-`retry_interval`, `owner_id`, and `namespace` via `LockOptions` or
+(`try_lock_until` / `try_read_until` / `try_write_until`), which take only a
+`timeout` and poll at the lock's configured `retry_interval`. (The older
+`try_*_for(timeout, retry_interval)` forms are deprecated.) Tune `ttl`,
+`max_wait`, `retry_interval`, `owner_id`, and `namespace` via `LockOptions` or
 `LockOptions::builder`.
 
 ## Rate limiting (trypema)

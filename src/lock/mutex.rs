@@ -128,9 +128,20 @@ impl Mutex {
             .await
     }
 
+    /// Tries to acquire the lock, waiting up to `timeout` and polling at the
+    /// lock's configured `retry_interval` (see [`LockOptions::retry_interval`]).
+    /// Returns [`LockError::Timeout`] if the deadline passes first.
+    pub async fn try_lock_until(&self, timeout: Duration) -> Result<MutexGuard, DistkitError> {
+        self.acquire_core(Some(timeout), self.retry_interval).await
+    }
+
     /// Tries to acquire the lock, waiting up to `timeout` and polling every
     /// `retry_interval`. Returns [`LockError::Timeout`] if the deadline passes
     /// first. A `retry_interval` of zero is a tight spin.
+    #[deprecated(
+        since = "0.5.3",
+        note = "use `try_lock_until`, which sources the retry interval from the lock's configuration"
+    )]
     pub async fn try_lock_for(
         &self,
         timeout: Duration,
