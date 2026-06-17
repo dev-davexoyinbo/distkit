@@ -3,6 +3,19 @@
 Notable changes to distkit, newest first. For the full commit log, see the
 [GitHub releases](https://github.com/dev-davexoyinbo/distkit/releases).
 
+## 0.5.3 — 2026-06-17
+
+- New bounded lock-acquisition methods that source the poll interval from the
+  lock's configured `retry_interval` instead of taking it per call:
+  - `try_lock_with_timeout` / `try_read_with_timeout` / `try_write_with_timeout`
+    take only a `timeout` and return `LockError::Timeout` if the deadline passes.
+  - `try_lock_with_retries` / `try_read_with_retries` / `try_write_with_retries`
+    bound by attempt count instead of time: `max_retries` retries after the
+    initial attempt, returning the new `LockError::RetriesExhausted { retries }`
+    when every attempt fails.
+- Deprecated `try_lock_for` / `try_read_for` / `try_write_for` (the
+  `(timeout, retry_interval)` forms) in favor of the `*_with_timeout` methods.
+
 ## 0.5.2 — 2026-06-17
 
 - Lock guards now expose `get_on_attempt`: the zero-based acquire poll that
