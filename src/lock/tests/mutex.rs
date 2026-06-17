@@ -6,7 +6,9 @@
 use std::time::Duration;
 
 use crate::DistkitError;
-use crate::lock::tests::common::{make_options, make_options_with_key, raw_connection};
+use crate::lock::tests::common::{
+    make_fast_options, make_options, make_options_with_key, raw_connection,
+};
 use crate::lock::{LockError, Mutex, LockGuardState};
 
 /// Two mutexes (distinct owners) on the same key: the second `try_lock` is
@@ -29,23 +31,19 @@ async fn try_lock_excludes_second_owner() {
     drop(first_guard);
 }
 
-/// `lock`/`try_lock_for` blocks while the key is held, then acquires once the
+/// `lock`/`try_lock_with_timeout` blocks while the key is held, then acquires once the
 /// holder releases.
 #[tokio::test]
 async fn lock_waits_then_succeeds() {
     let mutex_a = Mutex::new(make_options("lock_waits_then_succeeds").await);
-    let mutex_b = Mutex::new(make_options("lock_waits_then_succeeds").await);
+    let mutex_b = Mutex::new(make_fast_options("lock_waits_then_succeeds").await);
 
     let first_guard = mutex_a
         .try_lock()
         .await
         .expect("first try_lock should take the lock");
 
-    let waiter = tokio::spawn(async move {
-        mutex_b
-            .try_lock_for(Duration::from_secs(2), Duration::from_millis(20))
-            .await
-    });
+    let waiter = tokio::spawn(async move { mutex_b.try_lock_with_timeout(Duration::from_secs(2)).await });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     first_guard
@@ -59,11 +57,79 @@ async fn lock_waits_then_succeeds() {
         .expect("waiter should acquire the lock after release");
 }
 
-/// A bounded `try_lock_for` on a held key fails with `Timeout`.
+/// A bounded `try_lock_with_timeout` on a held key fails with `Timeout`.
 #[tokio::test]
-async fn try_lock_for_times_out() {
-    let mutex_a = Mutex::new(make_options("try_lock_for_times_out").await);
-    let mutex_b = Mutex::new(make_options("try_lock_for_times_out").await);
+async fn try_lock_with_timeout_times_out() {
+    let mutex_a = Mutex::new(make_options("try_lock_with_timeout_times_out").await);
+    let mutex_b = Mutex::new(make_fast_options("try_lock_with_timeout_times_out").await);
+
+    let _first_guard = mutex_a
+        .try_lock()
+        .await
+        .expect("first try_lock should take the lock");
+
+    match mutex_b.try_lock_with_timeout(Duration::from_millis(100)).await {
+        Err(DistkitError::LockError(LockError::Timeout { .. })) => {}
+        other => panic!("expected Timeout, got {other:?}"),
+    }
+}
+
+/// A retry-bounded `try_lock_with_retries` on a held key exhausts its retries
+/// and fails with `RetriesExhausted`, reporting the retries performed.
+#[tokio::test]
+async fn try_lock_with_retries_exhausts() {
+    let mutex_a = Mutex::new(make_options("try_lock_with_retries_exhausts").await);
+    let mutex_b = Mutex::new(make_fast_options("try_lock_with_retries_exhausts").await);
+
+    let _first_guard = mutex_a
+        .try_lock()
+        .await
+        .expect("first try_lock should take the lock");
+
+    match mutex_b.try_lock_with_retries(3).await {
+        Err(DistkitError::LockError(LockError::RetriesExhausted { retries: 3 })) => {}
+        other => panic!("expected RetriesExhausted {{ retries: 3 }}, got {other:?}"),
+    }
+}
+
+/// `try_lock_with_retries` blocks while the key is held, then acquires once the
+/// holder releases (within the retry budget).
+#[tokio::test]
+async fn try_lock_with_retries_succeeds() {
+    let mutex_a = Mutex::new(make_options("try_lock_with_retries_succeeds").await);
+    let mutex_b = Mutex::new(make_fast_options("try_lock_with_retries_succeeds").await);
+
+    let first_guard = mutex_a
+        .try_lock()
+        .await
+        .expect("first try_lock should take the lock");
+
+    let waiter = tokio::spawn(async move { mutex_b.try_lock_with_retries(50).await });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    first_guard
+        .release()
+        .await
+        .expect("explicit release should succeed");
+
+    let guard = waiter
+        .await
+        .expect("waiter task should not panic")
+        .expect("waiter should acquire the lock within the retry budget");
+
+    assert!(
+        guard.get_on_attempt().await >= 1,
+        "a contended acquire should take more than one attempt"
+    );
+}
+
+/// The deprecated `try_lock_for` still works: a bounded attempt on a held key
+/// fails with `Timeout`. Retained for coverage of the legacy API.
+#[allow(deprecated)]
+#[tokio::test]
+async fn try_lock_for_still_works() {
+    let mutex_a = Mutex::new(make_options("try_lock_for_still_works").await);
+    let mutex_b = Mutex::new(make_options("try_lock_for_still_works").await);
 
     let _first_guard = mutex_a
         .try_lock()
@@ -176,18 +242,14 @@ async fn get_on_attempt_zero_when_uncontended() {
 #[tokio::test]
 async fn get_on_attempt_counts_retries_under_contention() {
     let mutex_a = Mutex::new(make_options("get_on_attempt_counts_retries").await);
-    let mutex_b = Mutex::new(make_options("get_on_attempt_counts_retries").await);
+    let mutex_b = Mutex::new(make_fast_options("get_on_attempt_counts_retries").await);
 
     let first_guard = mutex_a
         .try_lock()
         .await
         .expect("first try_lock should take the lock");
 
-    let waiter = tokio::spawn(async move {
-        mutex_b
-            .try_lock_for(Duration::from_secs(2), Duration::from_millis(20))
-            .await
-    });
+    let waiter = tokio::spawn(async move { mutex_b.try_lock_with_timeout(Duration::from_secs(2)).await });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     first_guard

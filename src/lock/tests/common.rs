@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use redis::aio::ConnectionManager;
 
@@ -45,6 +45,15 @@ pub async fn make_options_with_key(name: &str) -> (LockOptions, String) {
     let full_key = format!("{DEFAULT_LOCK_NAMESPACE}:{unique_key}");
     let options = LockOptions::new(DistkitRedisKey::from(unique_key), conn);
     (options, full_key)
+}
+
+/// Like [`make_options`], but with a short 20 ms retry interval for snappy
+/// contention tests using the `try_*_with_timeout` / `lock`/`read`/`write` forms that
+/// source their poll interval from the lock's configuration.
+pub async fn make_fast_options(name: &str) -> LockOptions {
+    let mut options = make_options(name).await;
+    options.retry_interval = Duration::from_millis(20);
+    options
 }
 
 pub fn key(name: &str) -> DistkitRedisKey {

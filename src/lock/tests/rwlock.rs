@@ -5,7 +5,9 @@
 use std::time::Duration;
 
 use crate::DistkitError;
-use crate::lock::tests::common::{make_options, make_options_with_rw_keys, raw_connection};
+use crate::lock::tests::common::{
+    make_fast_options, make_options, make_options_with_rw_keys, raw_connection,
+};
 use crate::lock::{LockError, RwLock, LockGuardState};
 
 /// Multiple readers share the lock: two `try_read` guards are held at once.
@@ -39,15 +41,11 @@ async fn writer_excludes_readers() {
 #[tokio::test]
 async fn writer_waits_for_readers() {
     let reader = RwLock::new(make_options("writer_waits_for_readers").await);
-    let writer = RwLock::new(make_options("writer_waits_for_readers").await);
+    let writer = RwLock::new(make_fast_options("writer_waits_for_readers").await);
 
     let read_guard = reader.try_read().await.expect("reader should acquire");
 
-    let waiter = tokio::spawn(async move {
-        writer
-            .try_write_for(Duration::from_secs(2), Duration::from_millis(20))
-            .await
-    });
+    let waiter = tokio::spawn(async move { writer.try_write_with_timeout(Duration::from_secs(2)).await });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     read_guard.release().await.expect("read release should succeed");
@@ -62,15 +60,11 @@ async fn writer_waits_for_readers() {
 #[tokio::test]
 async fn reader_waits_for_writer() {
     let writer = RwLock::new(make_options("reader_waits_for_writer").await);
-    let reader = RwLock::new(make_options("reader_waits_for_writer").await);
+    let reader = RwLock::new(make_fast_options("reader_waits_for_writer").await);
 
     let write_guard = writer.try_write().await.expect("writer should acquire");
 
-    let waiter = tokio::spawn(async move {
-        reader
-            .try_read_for(Duration::from_secs(2), Duration::from_millis(20))
-            .await
-    });
+    let waiter = tokio::spawn(async move { reader.try_read_with_timeout(Duration::from_secs(2)).await });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     write_guard
@@ -89,17 +83,13 @@ async fn reader_waits_for_writer() {
 #[tokio::test]
 async fn waiting_writer_blocks_new_readers() {
     let reader = RwLock::new(make_options("waiting_writer_blocks_new_readers").await);
-    let writer = RwLock::new(make_options("waiting_writer_blocks_new_readers").await);
+    let writer = RwLock::new(make_fast_options("waiting_writer_blocks_new_readers").await);
     let late_reader = RwLock::new(make_options("waiting_writer_blocks_new_readers").await);
 
     let _read_guard = reader.try_read().await.expect("first reader should acquire");
 
     // A waiting (enqueuing) writer blocked by the held reader.
-    let waiter = tokio::spawn(async move {
-        writer
-            .try_write_for(Duration::from_secs(2), Duration::from_millis(20))
-            .await
-    });
+    let waiter = tokio::spawn(async move { writer.try_write_with_timeout(Duration::from_secs(2)).await });
 
     // Let the writer register itself as pending at least once.
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -194,15 +184,11 @@ async fn get_on_attempt_zero_when_uncontended() {
 #[tokio::test]
 async fn get_on_attempt_counts_retries_under_contention() {
     let writer = RwLock::new(make_options("rw_get_on_attempt_retries").await);
-    let reader = RwLock::new(make_options("rw_get_on_attempt_retries").await);
+    let reader = RwLock::new(make_fast_options("rw_get_on_attempt_retries").await);
 
     let write_guard = writer.try_write().await.expect("writer should acquire");
 
-    let waiter = tokio::spawn(async move {
-        reader
-            .try_read_for(Duration::from_secs(2), Duration::from_millis(20))
-            .await
-    });
+    let waiter = tokio::spawn(async move { reader.try_read_with_timeout(Duration::from_secs(2)).await });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     write_guard
@@ -274,4 +260,74 @@ async fn try_write_does_not_block_readers() {
         .try_read()
         .await
         .expect("reader should still acquire — one-shot try_write must not enqueue");
+}
+
+/// Retry-bounded reads and writes against a held writer exhaust their retries
+/// and fail with `RetriesExhausted`.
+#[tokio::test]
+async fn try_with_retries_exhausts() {
+    let writer = RwLock::new(make_options("rw_try_with_retries_exhausts").await);
+    let reader = RwLock::new(make_fast_options("rw_try_with_retries_exhausts").await);
+    let other_writer = RwLock::new(make_fast_options("rw_try_with_retries_exhausts").await);
+
+    let _write_guard = writer.try_write().await.expect("writer should acquire");
+
+    match reader.try_read_with_retries(3).await {
+        Err(DistkitError::LockError(LockError::RetriesExhausted { retries: 3 })) => {}
+        other => panic!("expected RetriesExhausted {{ retries: 3 }} from try_read_with_retries, got {other:?}"),
+    }
+
+    match other_writer.try_write_with_retries(3).await {
+        Err(DistkitError::LockError(LockError::RetriesExhausted { retries: 3 })) => {}
+        other => panic!("expected RetriesExhausted {{ retries: 3 }} from try_write_with_retries, got {other:?}"),
+    }
+}
+
+/// A retry-bounded writer waits while readers hold, then acquires once they
+/// release (within the retry budget).
+#[tokio::test]
+async fn try_write_with_retries_succeeds() {
+    let reader = RwLock::new(make_options("rw_try_write_with_retries_succeeds").await);
+    let writer = RwLock::new(make_fast_options("rw_try_write_with_retries_succeeds").await);
+
+    let read_guard = reader.try_read().await.expect("reader should acquire");
+
+    let waiter = tokio::spawn(async move { writer.try_write_with_retries(50).await });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    read_guard.release().await.expect("read release should succeed");
+
+    waiter
+        .await
+        .expect("waiter task should not panic")
+        .expect("writer should acquire after readers release");
+}
+
+/// The deprecated `try_read_for` / `try_write_for` still work: bounded attempts
+/// against a held writer fail with `Timeout`. Retained for coverage of the
+/// legacy API.
+#[allow(deprecated)]
+#[tokio::test]
+async fn try_for_methods_still_work() {
+    let writer = RwLock::new(make_options("rw_try_for_still_works").await);
+    let reader = RwLock::new(make_options("rw_try_for_still_works").await);
+    let other_writer = RwLock::new(make_options("rw_try_for_still_works").await);
+
+    let _write_guard = writer.try_write().await.expect("writer should acquire");
+
+    match reader
+        .try_read_for(Duration::from_millis(100), Duration::from_millis(20))
+        .await
+    {
+        Err(DistkitError::LockError(LockError::Timeout { .. })) => {}
+        other => panic!("expected Timeout from try_read_for, got {other:?}"),
+    }
+
+    match other_writer
+        .try_write_for(Duration::from_millis(100), Duration::from_millis(20))
+        .await
+    {
+        Err(DistkitError::LockError(LockError::Timeout { .. })) => {}
+        other => panic!("expected Timeout from try_write_for, got {other:?}"),
+    }
 }
