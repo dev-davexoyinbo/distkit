@@ -3,6 +3,14 @@
 Notable changes to distkit, newest first. For the full commit log, see the
 [GitHub releases](https://github.com/dev-davexoyinbo/distkit/releases).
 
+## 0.6.0 — 2026-06-26
+
+- **Breaking:** the guard inspectors `get_state` and `get_on_attempt` are no
+  longer `async`. Both only read locally cached state (an `AtomicBool` and a
+  stored `usize`) and never touched Redis, so the `async` was unnecessary. Drop
+  the `.await` at call sites: `guard.get_state()` and `guard.get_on_attempt()`.
+  Affects `MutexGuard`, `RwLockReadGuard`, and `RwLockWriteGuard`.
+
 ## 0.5.3 — 2026-06-17
 
 - New bounded lock-acquisition methods that source the poll interval from the
