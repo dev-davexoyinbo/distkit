@@ -369,12 +369,12 @@ let mutex = Mutex::new(LockOptions::new(key, conn));
 let guard = mutex.try_lock().await?;
 
 // The lease is renewed in the background. Re-check before relying on it.
-if guard.get_state().await == LockGuardState::Acquired {
+if guard.get_state() == LockGuardState::Acquired {
     // ... critical section ...
 }
 
 // Which acquire attempt won the lock: 0 on the first poll, higher under contention.
-let _attempts = guard.get_on_attempt().await;
+let _attempts = guard.get_on_attempt();
 
 // Release and observe the final state (or just drop the guard).
 let state = guard.release().await?;

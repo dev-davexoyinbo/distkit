@@ -118,7 +118,7 @@ async fn try_lock_with_retries_succeeds() {
         .expect("waiter should acquire the lock within the retry budget");
 
     assert!(
-        guard.get_on_attempt().await >= 1,
+        guard.get_on_attempt() >= 1,
         "a contended acquire should take more than one attempt"
     );
 }
@@ -221,7 +221,7 @@ async fn get_state_reports_acquired_while_held() {
         .await
         .expect("try_lock should take the lock");
 
-    assert_eq!(guard.get_state().await, LockGuardState::Acquired);
+    assert_eq!(guard.get_state(), LockGuardState::Acquired);
 }
 
 /// An uncontended acquire wins on the first poll: `get_on_attempt` is `0`.
@@ -234,7 +234,7 @@ async fn get_on_attempt_zero_when_uncontended() {
         .await
         .expect("try_lock should take the lock");
 
-    assert_eq!(guard.get_on_attempt().await, 0);
+    assert_eq!(guard.get_on_attempt(), 0);
 }
 
 /// A waiter that blocks while the key is held only wins after retries:
@@ -263,7 +263,7 @@ async fn get_on_attempt_counts_retries_under_contention() {
         .expect("waiter should acquire the lock after release");
 
     assert!(
-        guard.get_on_attempt().await >= 1,
+        guard.get_on_attempt() >= 1,
         "a contended acquire should take more than one attempt"
     );
 }
@@ -295,7 +295,7 @@ async fn lost_lease_reports_lost_state() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     assert_eq!(
-        guard.get_state().await,
+        guard.get_state(),
         LockGuardState::Lost,
         "lease should be marked lost after the key was deleted"
     );

@@ -270,7 +270,7 @@ impl LaxCounter {
     } // end method batch_commit_state
 
     async fn ensure_valid_state(&self, key: &DistkitRedisKey) -> Result<(), DistkitError> {
-        let lock = self.get_or_create_lock(key).await;
+        let lock = self.get_or_create_lock(key);
         let _guard = lock.lock().await;
 
         {
@@ -316,7 +316,7 @@ impl LaxCounter {
         Ok(())
     } // end function get_remote_total
 
-    async fn get_or_create_lock(&self, key: &DistkitRedisKey) -> Arc<tokio::sync::Mutex<()>> {
+    fn get_or_create_lock(&self, key: &DistkitRedisKey) -> Arc<tokio::sync::Mutex<()>> {
         if let Some(lock) = self.locks.get(key) {
             return lock.clone();
         }
@@ -632,7 +632,7 @@ impl CounterTrait for LaxCounter {
     async fn del(&self, key: &DistkitRedisKey) -> Result<i64, DistkitError> {
         self.activity.signal();
 
-        let lock = self.get_or_create_lock(key).await;
+        let lock = self.get_or_create_lock(key);
         let _guard = lock.lock().await;
 
         {

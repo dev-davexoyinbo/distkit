@@ -163,7 +163,7 @@ async fn get_state_reports_acquired() {
 
     let guard = reader.try_read().await.expect("reader should acquire");
 
-    assert_eq!(guard.get_state().await, LockGuardState::Acquired);
+    assert_eq!(guard.get_state(), LockGuardState::Acquired);
 }
 
 /// An uncontended read/write wins on the first poll: `get_on_attempt` is `0`.
@@ -173,10 +173,10 @@ async fn get_on_attempt_zero_when_uncontended() {
     let writer = RwLock::new(make_options("rw_get_on_attempt_zero_w").await);
 
     let read_guard = reader.try_read().await.expect("reader should acquire");
-    assert_eq!(read_guard.get_on_attempt().await, 0);
+    assert_eq!(read_guard.get_on_attempt(), 0);
 
     let write_guard = writer.try_write().await.expect("writer should acquire");
-    assert_eq!(write_guard.get_on_attempt().await, 0);
+    assert_eq!(write_guard.get_on_attempt(), 0);
 }
 
 /// A reader that blocks behind a held writer only wins after retries:
@@ -202,7 +202,7 @@ async fn get_on_attempt_counts_retries_under_contention() {
         .expect("reader should acquire after writer releases");
 
     assert!(
-        guard.get_on_attempt().await >= 1,
+        guard.get_on_attempt() >= 1,
         "a contended acquire should take more than one attempt"
     );
 }
@@ -230,7 +230,7 @@ async fn lost_lease_reports_lost() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     assert_eq!(
-        guard.get_state().await,
+        guard.get_state(),
         LockGuardState::Lost,
         "lease should be marked lost after the writer key was deleted"
     );

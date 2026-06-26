@@ -482,14 +482,14 @@ impl RwLockReadGuard {
     /// Re-checks what we currently believe the lock's state to be, reading the
     /// latest result the background refresh recorded (no Redis round-trip). See
     /// [`RwLock`] for when a held lock turns up [`Lost`](LockGuardState::Lost).
-    pub async fn get_state(&self) -> LockGuardState {
+    pub fn get_state(&self) -> LockGuardState {
         state_from(&self.refresh_handle, &self.lost)
     }
 
     /// The zero-based acquire attempt that obtained this lock: `0` if the very
     /// first poll succeeded, `n` after `n` retries. A one-shot `try_read` is
     /// always `0`. Useful for contention metrics.
-    pub async fn get_on_attempt(&self) -> usize {
+    pub fn get_on_attempt(&self) -> usize {
         self.on_attempt
     }
 
@@ -561,14 +561,14 @@ impl RwLockWriteGuard {
     /// Re-checks what we currently believe the lock's state to be, reading the
     /// latest result the background refresh recorded (no Redis round-trip). See
     /// [`RwLock`] for when a held lock turns up [`Lost`](LockGuardState::Lost).
-    pub async fn get_state(&self) -> LockGuardState {
+    pub fn get_state(&self) -> LockGuardState {
         state_from(&self.refresh_handle, &self.lost)
     }
 
     /// The zero-based acquire attempt that obtained this lock: `0` if the very
     /// first poll succeeded, `n` after `n` retries. A one-shot `try_write` is
     /// always `0`. Useful for contention metrics.
-    pub async fn get_on_attempt(&self) -> usize {
+    pub fn get_on_attempt(&self) -> usize {
         self.on_attempt
     }
 

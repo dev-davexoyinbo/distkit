@@ -338,7 +338,7 @@ impl MutexGuard {
     /// This reads the latest result the background refresh recorded — it does not
     /// make its own Redis round-trip. Reach for it before a critical section when
     /// you need more confidence than "I'm still holding the guard."
-    pub async fn get_state(&self) -> LockGuardState {
+    pub fn get_state(&self) -> LockGuardState {
         if self.refresh_handle.is_none() {
             return LockGuardState::Released;
         }
@@ -353,7 +353,7 @@ impl MutexGuard {
     /// The zero-based acquire attempt that obtained this lock: `0` if the very
     /// first poll succeeded, `n` after `n` retries. A one-shot `try_lock` is
     /// always `0`. Useful for contention metrics.
-    pub async fn get_on_attempt(&self) -> usize {
+    pub fn get_on_attempt(&self) -> usize {
         self.on_attempt
     }
 
