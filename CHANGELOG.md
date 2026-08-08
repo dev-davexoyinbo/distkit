@@ -3,6 +3,23 @@
 Notable changes to distkit, newest first. For the full commit log, see the
 [GitHub releases](https://github.com/dev-davexoyinbo/distkit/releases).
 
+## 0.7.0 — 2026-08-08
+
+- **Breaking:** upgraded the optional `trypema` re-export from v1 to v2. The
+  monolithic `RateLimiter` and its option structs are replaced by independently
+  constructed `LocalRateLimiterProvider`, `RedisRateLimiterProvider`, and
+  `HybridRateLimiterProvider` values using the shared `RateLimiterBuilder`
+  trait.
+- Trypema configuration now uses semantic, unit-aware types:
+  `WindowSizeSeconds` is now `WindowSize`, `RateGroupSizeMs` is now
+  `BucketSize`, `SuppressionFactorCacheMs` is now
+  `SuppressionFactorCachePeriod`, and `SyncIntervalMs` is now `SyncInterval`.
+- `RateLimit` now uses unit-explicit constructors such as `per_second`, and
+  rejected decisions expose `retry_after: Duration` instead of
+  `retry_after_ms`.
+- The `trypema` feature name and the `distkit::trypema` module path are
+  unchanged.
+
 ## 0.6.0 — 2026-06-26
 
 - **Breaking:** the guard inspectors `get_state` and `get_on_attempt` are no

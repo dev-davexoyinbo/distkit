@@ -169,7 +169,7 @@ counters.
 
 ```toml
 [dependencies]
-distkit = { version = "0.4", features = ["instance-aware-counter"] }
+distkit = { version = "0.7", features = ["instance-aware-counter"] }
 ```
 
 Instance-aware counters track each running instance's contribution separately.
@@ -330,7 +330,7 @@ Enable the `lock` feature to access Redis-backed distributed locks.
 
 ```toml
 [dependencies]
-distkit = { version = "0.4", features = ["lock"] }
+distkit = { version = "0.7", features = ["lock"] }
 ```
 
 [`Mutex`] (mutual exclusion) and [`RwLock`] (reader-writer) mirror the surface of
@@ -433,117 +433,89 @@ deprecated.)
 
 # Rate limiting (trypema)
 
-Enable the `trypema` feature to access distributed rate limiting.
+Enable the `trypema` feature to access local and distributed rate limiting.
 
 Trypema documentation website: <https://trypema.davidoyinbo.com>
 
 ```toml
 [dependencies]
-distkit = { version = "0.4", features = ["trypema"] }
+distkit = { version = "0.7", features = ["trypema"] }
 ```
 
-All public types from the [`trypema`](https://docs.rs/trypema) crate are
-re-exported under `distkit::trypema`. The module provides:
+All public types from [`trypema` 2](https://docs.rs/trypema) are re-exported
+under `distkit::trypema`. Trypema 2 constructs each provider independently:
 
 - **Sliding-window rate limiting** with configurable window size and rate.
-- **Three providers** -- local (in-process via `DashMap`), Redis-backed
-  (distributed enforcement via Lua scripts), and hybrid (local fast-path
-  with periodic Redis sync).
+- **Three providers** -- local (in-process), Redis-backed (one atomic Redis
+  operation per call), and hybrid (local fast-path with periodic Redis sync).
 - **Two strategies** -- absolute (binary allow/reject) and suppressed
   (probabilistic degradation that smoothly ramps rejection probability).
+- **Live reads and conditional updates** across every provider and strategy.
 
 ## Local rate limiting (absolute)
 
-Use the local provider for in-process rate limiting with sub-microsecond
-latency. The absolute strategy gives a deterministic allow/reject decision.
+Use [`LocalRateLimiterProvider`](trypema::local::LocalRateLimiterProvider) for
+in-process rate limiting without Redis I/O. The absolute strategy gives an
+allow/reject decision.
 
-```rust,no_run
-# use std::sync::Arc;
-# use distkit::trypema::{
-#     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision,
-#     RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
-#     local::LocalRateLimiterOptions,
-#     redis::RedisRateLimiterOptions,
-#     hybrid::SyncIntervalMs,
-# };
-# fn example() {
-# let connection_manager: redis::aio::ConnectionManager = todo!();
-let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
-    local: LocalRateLimiterOptions {
-        window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
-        rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
-        hard_limit_factor: HardLimitFactor::default(),
-        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-    },
-#        redis: RedisRateLimiterOptions {
-#        connection_manager,
-#        prefix: None,
-#        window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
-#        rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
-#        hard_limit_factor: HardLimitFactor::default(),
-#        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-#        sync_interval_ms: SyncIntervalMs::default(),
-#    },
-}));
+```rust
+use distkit::trypema::{
+    BucketSize, RateLimit, RateLimitDecision, RateLimiterBuilder, WindowSize,
+    local::LocalRateLimiterProvider,
+};
 
-// Optional: start background cleanup for stale keys
-rl.run_cleanup_loop();
+let provider = LocalRateLimiterProvider::builder()
+    .window_size(WindowSize::minutes_or_panic(1))
+    .bucket_size(BucketSize::milliseconds_or_panic(100))
+    .build()
+    .unwrap();
+let rate = RateLimit::per_second_or_panic(10.0);
 
-let rate = RateLimit::try_from(10.0).unwrap(); // 10 requests per second
-
-match rl.local().absolute().inc("user_123", &rate, 1) {
+match provider.absolute().inc("user_123", &rate, 1) {
     RateLimitDecision::Allowed => {
         // Process the request
     }
-    RateLimitDecision::Rejected { retry_after_ms, .. } => {
+    RateLimitDecision::Rejected { retry_after, .. } => {
         // Back off and retry later
-        eprintln!("Rate limited, retry in {retry_after_ms} ms");
+        eprintln!("Rate limited, retry in {retry_after:?}");
     }
-    _ => {}
+    RateLimitDecision::Suppressed { .. } => unreachable!(),
 }
-# }
 ```
+
+Every provider builder implements
+[`RateLimiterBuilder`](trypema::RateLimiterBuilder). `build()` returns an `Arc`
+and starts stale-state cleanup by default. Use `.disable_cleanup()` while
+building to opt out, or the provider's idempotent `start_cleanup_loop()` and
+`stop_cleanup_loop()` methods after construction.
 
 ## Local rate limiting (suppressed)
 
 The suppressed strategy smoothly ramps rejection probability as load
 approaches the limit, instead of a hard cutoff.
 
-```rust,no_run
-# use std::sync::Arc;
-# use distkit::trypema::{
-#     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision,
-#     RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
-#     local::LocalRateLimiterOptions,
-#     redis::RedisRateLimiterOptions,
-#     hybrid::SyncIntervalMs,
-# };
-# fn example() {
-# let connection_manager: redis::aio::ConnectionManager = todo!();
-# let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
-#     local: LocalRateLimiterOptions {
-#         window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
-#         rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
-#         hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(),
-#         suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-#     },
-#     redis: RedisRateLimiterOptions {
-#         connection_manager,
-#         prefix: None,
-#         window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
-#         rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
-#         hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(),
-#         suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-#         sync_interval_ms: SyncIntervalMs::default(),
-#     },
-# }));
-let rate = RateLimit::try_from(100.0).unwrap();
+```rust
+use distkit::trypema::{
+    HardLimitFactor, RateLimit, RateLimitDecision, RateLimiterBuilder,
+    local::LocalRateLimiterProvider,
+};
 
-match rl.local().suppressed().inc("api_endpoint", &rate, 1) {
+let provider = LocalRateLimiterProvider::builder()
+    .hard_limit_factor(HardLimitFactor::new_or_panic(1.5))
+    .disable_cleanup()
+    .build()
+    .unwrap();
+let rate = RateLimit::per_second_or_panic(100.0);
+
+match provider.suppressed().inc("api_endpoint", &rate, 1) {
     RateLimitDecision::Allowed => {
         // Well under the limit
     }
-    RateLimitDecision::Suppressed { is_allowed, suppression_factor } => {
+    RateLimitDecision::Suppressed {
+        is_allowed,
+        suppression_factor,
+        ..
+    } => {
         if is_allowed {
             // Approaching the limit but still admitted
             tracing::info!("Suppression factor: {suppression_factor:.2}");
@@ -555,60 +527,73 @@ match rl.local().suppressed().inc("api_endpoint", &rate, 1) {
         // Over the hard limit (rate * hard_limit_factor)
     }
 }
-# }
 ```
 
 ## Redis-backed rate limiting
 
-For distributed enforcement across multiple processes or servers, use the
-Redis provider. Each call executes an atomic Lua script.
+For distributed enforcement across multiple processes or servers, construct a
+Redis provider with a connection manager. Each operation is atomic, although
+admission remains best-effort under concurrency.
 
 ```rust,no_run
-# use std::sync::Arc;
 # use distkit::trypema::{
-#     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision,
-#     RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
-#     local::LocalRateLimiterOptions,
-#     redis::{RedisKey, RedisRateLimiterOptions},
-#     hybrid::SyncIntervalMs,
+#     BucketSize, RateLimit, RateLimiterBuilder, WindowSize,
+#     redis::{RedisKey, RedisRateLimiterProvider},
 # };
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 # let client = redis::Client::open("redis://127.0.0.1/")?;
 # let conn = client.get_connection_manager().await?;
-let window = WindowSizeSeconds::try_from(60)?;
-let bucket = RateGroupSizeMs::try_from(100)?;
-
-let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
-    local: LocalRateLimiterOptions {
-        window_size_seconds: window,
-        rate_group_size_ms: bucket,
-        hard_limit_factor: HardLimitFactor::default(),
-        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-    },
-    redis: RedisRateLimiterOptions {
-        connection_manager: conn,
-        prefix: None,
-        window_size_seconds: window,
-        rate_group_size_ms: bucket,
-        hard_limit_factor: HardLimitFactor::default(),
-        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-        sync_interval_ms: SyncIntervalMs::default(),
-    },
-}));
-
-rl.run_cleanup_loop();
-
-let key = RedisKey::try_from("user_123".to_string())?;
-let rate = RateLimit::try_from(50.0)?;
-
-// Distributed absolute enforcement
-let decision = rl.redis().absolute().inc(&key, &rate, 1).await?;
-
-// Or use the hybrid provider for local fast-path with Redis sync
-let decision = rl.hybrid().absolute().inc(&key, &rate, 1).await?;
+let provider = RedisRateLimiterProvider::builder(conn)
+    .window_size(WindowSize::minutes(1)?)
+    .bucket_size(BucketSize::milliseconds(100)?)
+    .build()?;
+let key = RedisKey::try_from("user_123")?;
+let rate = RateLimit::per_second(50.0)?;
+let decision = provider.absolute().inc(&key, &rate, 1).await?;
+# let _ = decision;
 # Ok(())
 # }
 ```
+
+## Hybrid rate limiting
+
+The hybrid provider uses a local fast path and periodically synchronizes with
+Redis. Its synchronization worker always runs independently of optional
+stale-state cleanup.
+
+```rust,no_run
+# use distkit::trypema::{
+#     RateLimit, RateLimiterBuilder,
+#     hybrid::{HybridRateLimiterProvider, SyncInterval},
+#     redis::RedisKey,
+# };
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+# let client = redis::Client::open("redis://127.0.0.1/")?;
+# let conn = client.get_connection_manager().await?;
+let provider = HybridRateLimiterProvider::builder(conn)
+    .sync_interval(SyncInterval::milliseconds(10)?)
+    .build()?;
+let key = RedisKey::try_from("user_123")?;
+let rate = RateLimit::per_second(50.0)?;
+let decision = provider.absolute().inc(&key, &rate, 1).await?;
+# let _ = decision;
+# Ok(())
+# }
+```
+
+Redis and hybrid providers require Redis 7.2 or newer. The Distkit `trypema`
+feature enables Trypema's `redis-tokio` runtime integration.
+
+## Migrating from Trypema 1
+
+Trypema 2 removed `RateLimiter`, `RateLimiterOptions`, and the provider option
+structs. Construct `LocalRateLimiterProvider`, `RedisRateLimiterProvider`, or
+`HybridRateLimiterProvider` directly and import the `RateLimiterBuilder` trait.
+The primary configuration renames are `WindowSizeSeconds` to `WindowSize`,
+`RateGroupSizeMs` to `BucketSize`, `SuppressionFactorCacheMs` to
+`SuppressionFactorCachePeriod`, and `SyncIntervalMs` to `SyncInterval`.
+`RateLimit` now uses unit-explicit constructors such as `per_second`, while
+rejected decisions expose `retry_after: std::time::Duration`.
 
 See the [`trypema` documentation](https://docs.rs/trypema) for full API
 details and advanced configuration.

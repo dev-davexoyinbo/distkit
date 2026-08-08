@@ -18,9 +18,9 @@ pub mod icounter;
 
 /// Rate limiting via the [`trypema`](https://docs.rs/trypema) crate.
 ///
-/// This module re-exports all public types from `trypema`, providing
-/// sliding-window rate limiting with local, Redis-backed, and hybrid
-/// providers. Enable the `trypema` feature to use this module.
+/// This module re-exports all public types from `trypema`. Trypema 2 provides
+/// independently constructed local, Redis-backed, and hybrid sliding-window
+/// rate-limiter providers. Enable the `trypema` feature to use this module.
 #[cfg(feature = "trypema")]
 #[cfg_attr(docsrs, doc(cfg(feature = "trypema")))]
 pub mod trypema;
