@@ -248,6 +248,10 @@ Each instance sends a heartbeat on every operation. If a process silently dies,
 surviving instances automatically remove its contribution the next time any of
 them touches the same key.
 
+One call removes dead instances until it has read approximately 10,000 of their
+counts. The next calls remove the dead instances that stay. Thus, a large
+backlog does not block Redis in one call.
+
 ```rust
 use distkit::icounter::{
     InstanceAwareCounterTrait,

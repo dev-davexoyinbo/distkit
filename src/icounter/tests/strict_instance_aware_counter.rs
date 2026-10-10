@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use crate::CounterComparator;
-use crate::icounter::InstanceAwareCounterTrait;
+use crate::icounter::{InstanceAwareCounterTrait, StrictInstanceAwareCounter};
+use crate::{CounterComparator, DistkitRedisKey};
 
 use super::common::{
     key, make_counter, make_n_counters, make_n_counters_with_opts, make_pair, make_pair_with_opts,
@@ -1141,4 +1141,136 @@ async fn set_all_on_instance_if_supports_partial_success() {
     assert_eq!(c2.get(&k2).await.unwrap(), (3, 3));
 
     c1.clear().await.unwrap();
+}
+
+// ===========================================================================
+// S — Scale: more keys than one Redis script call can take as arguments
+// ===========================================================================
+
+/// More keys than Redis Lua can pass to one command.
+const MANY_KEYS: usize = 9_000;
+
+/// Long enough that a large batch does not make an idle instance look dead.
+const SCALE_THRESHOLD_MS: u64 = 3_000;
+
+/// Keys in one call, so that one pipeline stays small.
+const KEYS_PER_CALL: usize = 500;
+
+fn many_keys(count: usize) -> Vec<DistkitRedisKey> {
+    (0..count).map(|index| key(&format!("k{index}"))).collect()
+}
+
+async fn inc_each(counter: &StrictInstanceAwareCounter, keys: &[DistkitRedisKey], count: i64) {
+    for batch in keys.chunks(KEYS_PER_CALL) {
+        let updates: Vec<(&DistkitRedisKey, i64)> = batch.iter().map(|key| (key, count)).collect();
+        counter.inc_all(&updates).await.unwrap();
+    }
+}
+
+/// Asserts that each key has `expected` as `(cumulative, instance_count)`.
+async fn assert_each(
+    counter: &StrictInstanceAwareCounter,
+    keys: &[DistkitRedisKey],
+    expected: (i64, i64),
+) {
+    for batch in keys.chunks(KEYS_PER_CALL) {
+        let refs: Vec<&DistkitRedisKey> = batch.iter().collect();
+
+        for (key, cumulative, instance_count) in counter.get_all(&refs).await.unwrap() {
+            assert_eq!((cumulative, instance_count), expected, "{key:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn survivor_works_after_an_instance_with_many_keys_dies() {
+    let (c1, c2) = make_pair_with_opts("scale_dead_instance", SCALE_THRESHOLD_MS).await;
+    let keys = many_keys(MANY_KEYS);
+
+    inc_each(&c1, &keys, 1).await;
+    inc_each(&c2, &keys, 2).await;
+
+    drop(c1);
+    tokio::time::sleep(Duration::from_millis(SCALE_THRESHOLD_MS + 500)).await;
+
+    // Every kind of call succeeds, and the dead instance's share is gone.
+    assert_eq!(c2.get(&keys[0]).await.unwrap(), (2, 2));
+    assert_eq!(c2.inc(&keys[1], 5).await.unwrap(), (7, 7));
+    assert_eq!(c2.set(&keys[2], 9).await.unwrap().0, 9);
+    c2.del(&keys[3]).await.unwrap();
+    assert_eq!(c2.get(&keys[3]).await.unwrap(), (0, 0));
+    assert_each(&c2, &keys[4..], (2, 2)).await;
+
+    c2.clear().await.unwrap();
+}
+
+#[tokio::test]
+async fn several_dead_instances_with_many_keys_are_all_removed() {
+    const KEYS_EACH: usize = 6_000;
+
+    let mut counters =
+        make_n_counters_with_opts("scale_many_dead", 4, SCALE_THRESHOLD_MS * 2).await;
+    let keys = many_keys(KEYS_EACH);
+
+    for counter in &counters {
+        inc_each(counter, &keys, 1).await;
+    }
+
+    let survivor = counters.pop().unwrap();
+    drop(counters);
+    tokio::time::sleep(Duration::from_millis(SCALE_THRESHOLD_MS * 2 + 500)).await;
+
+    // One call does not remove all of them. Each call succeeds, and the
+    // dead instances are gone after a few calls.
+    assert!(survivor.get(&keys[0]).await.unwrap().0 > 1);
+
+    let mut cumulative = i64::MAX;
+    for _ in 0..8 {
+        cumulative = survivor.get(&keys[0]).await.unwrap().0;
+
+        if cumulative == 1 {
+            break;
+        }
+    }
+    assert_eq!(cumulative, 1, "the dead instances were not removed");
+    assert_each(&survivor, &keys, (1, 1)).await;
+
+    survivor.clear().await.unwrap();
+}
+
+#[tokio::test]
+async fn clear_on_instance_works_with_many_keys() {
+    let (c1, c2) = make_pair("scale_clear_on_instance").await;
+    let keys = many_keys(MANY_KEYS);
+
+    inc_each(&c1, &keys, 1).await;
+    inc_each(&c2, &keys, 2).await;
+
+    c1.clear_on_instance().await.unwrap();
+
+    assert_each(&c2, &keys, (2, 2)).await;
+    assert_each(&c1, &keys, (2, 0)).await;
+
+    c2.clear().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_deleted_key_is_not_subtracted_when_another_instance_dies() {
+    let (c1, c2) = make_pair_with_opts("deleted_key_dead_instance", 100).await;
+    let (deleted, kept) = (key("deleted"), key("kept"));
+
+    c1.inc(&deleted, 10).await.unwrap();
+    c1.inc(&kept, 3).await.unwrap();
+    c2.inc(&kept, 4).await.unwrap();
+
+    // The delete resets the key for all instances.
+    c2.del(&deleted).await.unwrap();
+
+    drop(c1);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(c2.get(&deleted).await.unwrap().0, 0);
+    assert_eq!(c2.get(&kept).await.unwrap().0, 4);
+
+    c2.clear().await.unwrap();
 }

@@ -60,21 +60,26 @@ local function now_ms()
     return tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
 end
 
+-- Removes dead instances and subtracts their counts from the cumulative hash.
+-- One call stops after it reads about 10000 counts. The dead instances that
+-- stay are removed by the next calls.
 local function delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold_ms, timestamp_ms)
     local cutoff = timestamp_ms - dead_threshold_ms
-    local to_remove = redis.call("ZRANGE", instances_key, "-inf", cutoff, "BYSCORE")
+    local to_remove = redis.call("ZRANGE", instances_key, "-inf", cutoff, "BYSCORE", "LIMIT", 0, 64)
+    local counts_left = 10000
 
     for _, inst_id in ipairs(to_remove) do
-        local inst_count_key = prefix .. ':count:' .. inst_id
-        local all_keys = redis.call('SMEMBERS', keys_key)
+        if counts_left <= 0 then break end
 
-        if #all_keys > 0 then
-            local values = redis.call('HMGET', inst_count_key, unpack(all_keys))
-            for i = 1, #values do
-                local c = tonumber(values[i] or 0) or 0
-                if c ~= 0 then
-                    redis.call('HINCRBY', cumulative_key, all_keys[i], -c)
-                end
+        local inst_count_key = prefix .. ':count:' .. inst_id
+        local counts = redis.call('HGETALL', inst_count_key)
+        counts_left = counts_left - #counts / 2
+
+        -- A key that is not in the keys set was deleted for all instances.
+        for i = 1, #counts, 2 do
+            local c = tonumber(counts[i + 1]) or 0
+            if c ~= 0 and redis.call('SISMEMBER', keys_key, counts[i]) == 1 then
+                redis.call('HINCRBY', cumulative_key, counts[i], -c)
             end
         end
 
@@ -389,14 +394,11 @@ local ts = now_ms()
 check_and_zadd(instances_key, instance_id, ts)
 delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts)
 
-local all_keys = redis.call('HKEYS', inst_count_key)
-if #all_keys > 0 then
-    local values = redis.call('HMGET', inst_count_key, unpack(all_keys))
-    for i = 1, #values do
-        local c = tonumber(values[i] or 0) or 0
-        if c ~= 0 then
-            redis.call('HINCRBY', cumulative_key, all_keys[i], -c)
-        end
+local counts = redis.call('HGETALL', inst_count_key)
+for i = 1, #counts, 2 do
+    local c = tonumber(counts[i + 1]) or 0
+    if c ~= 0 then
+        redis.call('HINCRBY', cumulative_key, counts[i], -c)
     end
 end
 redis.call('DEL', inst_count_key)
@@ -509,6 +511,9 @@ impl StrictInstanceAwareCounterOptions {
 /// is the sum of all live instances. When an instance stops heartbeating for
 /// longer than `dead_instance_threshold_ms`, its contribution is automatically
 /// removed by the next surviving instance that touches the same key.
+///
+/// One call removes dead instances until it has read approximately 10,000 of
+/// their counts. The next calls remove the dead instances that stay.
 ///
 /// Construct via [`StrictInstanceAwareCounter::new`], which returns an `Arc<Self>`.
 #[derive(Debug)]
@@ -720,14 +725,18 @@ impl StrictInstanceAwareCounter {
                     changed = activity_watch.changed() => {
                         if changed.is_err() { break; }
                         let Some(c) = weak.upgrade() else { break; };
-                        if !c.activity.get_is_active() {
-                            let _ = c.mark_alive().await;
+                        if !c.activity.get_is_active()
+                            && let Err(error) = c.mark_alive().await
+                        {
+                            tracing::error!(?error, "Error sending instance-aware counter heartbeat");
                         }
                     }
                     _ = tick.tick() => {
                         let Some(c) = weak.upgrade() else { break; };
-                        if !c.activity.get_is_active() {
-                            let _ = c.mark_alive().await;
+                        if !c.activity.get_is_active()
+                            && let Err(error) = c.mark_alive().await
+                        {
+                            tracing::error!(?error, "Error sending instance-aware counter heartbeat");
                         }
                     }
                 }

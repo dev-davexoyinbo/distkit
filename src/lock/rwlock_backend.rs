@@ -18,12 +18,17 @@ local function reset_ttl_on_keys(keys, ttl_ms)
 end
 
 
+-- Redis Lua cannot unpack a long list, so the members go in slices.
+local function zrem_in_slices(key, members)
+    for first = 1, #members, 1000 do
+        redis.call('ZREM', key, unpack(members, first, math.min(first + 999, #members)))
+    end
+end
+
 local function purge_expired_x_in_zset(key, now_ms, ttl_ms)
     local stale = redis.call('ZRANGE', key, '-inf', now_ms - ttl_ms, 'BYSCORE')
 
-    if #stale > 0 then 
-        redis.call('ZREM', key, unpack(stale))
-    end
+    zrem_in_slices(key, stale)
 
    reset_ttl_on_keys({key}, ttl_ms)
 
@@ -33,9 +38,7 @@ end
 local function purge_expired_pending_writers(pending_writers_key, pending_writers_heartbeat_key, now, ttl_ms)
    local stale = purge_expired_x_in_zset(pending_writers_heartbeat_key, now, ttl_ms)
 
-   if #stale > 0 then
-        redis.call('ZREM', pending_writers_key, unpack(stale))
-   end
+   zrem_in_slices(pending_writers_key, stale)
 
    reset_ttl_on_keys({pending_writers_key}, ttl_ms)
 

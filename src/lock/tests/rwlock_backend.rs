@@ -685,3 +685,58 @@ async fn write_held_until_all_readers_released() {
         "write acquires only once the last reader is gone"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scale: more expired members than one Redis script call can take as arguments
+// ---------------------------------------------------------------------------
+
+/// More members than Redis Lua can pass to one command.
+const MANY_MEMBERS: usize = 9_000;
+
+/// Seeds `MANY_MEMBERS` members at score 1, long expired for all ttls.
+async fn seed_expired_members(conn: &mut ConnectionManager, key: &str, name: &str) {
+    let mut command = redis::cmd("ZADD");
+    command.arg(key);
+
+    for index in 0..MANY_MEMBERS {
+        command.arg(1).arg(format!("{name}_{index}"));
+    }
+
+    let _: i64 = command.query_async(conn).await.expect("ZADD");
+}
+
+#[tokio::test]
+async fn many_expired_readers_do_not_block_the_lock() {
+    let (mut conn, k) = conn_and_keys("many_expired_readers").await;
+    seed_expired_members(&mut conn, &k.readers, "reader").await;
+
+    assert!(acquire_read(&mut conn, &k, READER_A, LONG_TTL).await);
+    assert_eq!(
+        zcard(&mut conn, &k.readers).await,
+        1,
+        "only the live reader stays"
+    );
+
+    assert!(
+        rwlock_backend::release_read(&mut conn, &k.readers, READER_A)
+            .await
+            .unwrap()
+    );
+    seed_expired_members(&mut conn, &k.readers, "reader").await;
+
+    assert!(write_oneshot(&mut conn, &k, WRITER_A, LONG_TTL).await);
+}
+
+#[tokio::test]
+async fn many_expired_pending_writers_do_not_block_the_lock() {
+    let (mut conn, k) = conn_and_keys("many_expired_pending_writers").await;
+    seed_expired_members(&mut conn, &k.pending, "writer").await;
+    seed_expired_members(&mut conn, &k.pending_heartbeat, "writer").await;
+
+    assert!(acquire_read(&mut conn, &k, READER_A, LONG_TTL).await);
+    assert_eq!(
+        zcard(&mut conn, &k.pending).await,
+        0,
+        "no dead writer stays in the queue"
+    );
+}
