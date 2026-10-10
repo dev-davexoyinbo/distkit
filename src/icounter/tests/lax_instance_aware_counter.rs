@@ -822,3 +822,100 @@ async fn set_all_on_instance_if_refreshes_stale_state_before_comparing() {
     assert_eq!(results, vec![(&k, (8, 3), (5, 0))]);
     assert_eq!(c1.get(&k).await.unwrap(), (8, 3));
 }
+
+// ---------------------------------------------------------------------------
+// Scale: more keys than one Redis script call can take as arguments
+// ---------------------------------------------------------------------------
+
+/// More keys than Redis Lua can pass to one command.
+const MANY_KEYS: usize = 9_000;
+
+/// Long enough that a large flush does not make an idle instance look dead.
+const SCALE_THRESHOLD_MS: u64 = 2_000;
+
+async fn make_lax_for_scale(prefix: &str) -> Arc<LaxInstanceAwareCounter> {
+    let conn = make_connection().await;
+    LaxInstanceAwareCounter::new(LaxInstanceAwareCounterOptions {
+        prefix: DistkitRedisKey::from(prefix.to_string()),
+        connection_manager: conn,
+        dead_instance_threshold_ms: SCALE_THRESHOLD_MS,
+        flush_interval: Duration::from_millis(FLUSH_MS),
+        allowed_lag: Duration::from_millis(FLUSH_MS),
+    })
+}
+
+fn many_keys() -> Vec<DistkitRedisKey> {
+    (0..MANY_KEYS)
+        .map(|index| key(&format!("k{index}")))
+        .collect()
+}
+
+/// Waits until a new instance reads `expected` for each key, so that the
+/// writer's flush is in Redis.
+async fn wait_for_each(prefix: &str, keys: &[DistkitRedisKey], expected: i64) {
+    let reader = make_lax_for_scale(prefix).await;
+
+    for _ in 0..200 {
+        let mut flushed = true;
+
+        for batch in keys.chunks(500) {
+            let refs: Vec<&DistkitRedisKey> = batch.iter().collect();
+            let states = reader.get_all(&refs).await.unwrap();
+            flushed &= states
+                .iter()
+                .all(|(_, cumulative, _)| *cumulative == expected);
+        }
+
+        if flushed {
+            return;
+        }
+
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!("the keys did not reach {expected}");
+}
+
+#[tokio::test]
+async fn lax_survivor_works_after_an_instance_with_many_keys_dies() {
+    let prefix = unique_prefix("lax_scale_dead_instance");
+    let writer = make_lax_for_scale(&prefix).await;
+    let keys = many_keys();
+    let updates: Vec<(&DistkitRedisKey, i64)> = keys.iter().map(|key| (key, 1)).collect();
+
+    writer.inc_all(&updates).await.unwrap();
+    wait_for_each(&prefix, &keys, 1).await;
+
+    drop(writer);
+    sleep(Duration::from_millis(SCALE_THRESHOLD_MS + 500)).await;
+
+    let survivor = make_lax_for_scale(&prefix).await;
+    assert_eq!(survivor.get(&keys[0]).await.unwrap().0, 0);
+    assert_eq!(survivor.inc(&keys[1], 5).await.unwrap().0, 5);
+    sleep(Duration::from_millis(FLUSH_MS * 10)).await;
+
+    let reader = make_lax_for_scale(&prefix).await;
+    assert_eq!(reader.get(&keys[1]).await.unwrap().0, 5);
+    assert_eq!(reader.get(&keys[2]).await.unwrap().0, 0);
+
+    reader.clear().await.unwrap();
+}
+
+#[tokio::test]
+async fn lax_clear_on_instance_works_with_many_keys() {
+    let prefix = unique_prefix("lax_scale_clear_on_instance");
+    let writer = make_lax_for_scale(&prefix).await;
+    let keys = many_keys();
+    let updates: Vec<(&DistkitRedisKey, i64)> = keys.iter().map(|key| (key, 1)).collect();
+
+    writer.inc_all(&updates).await.unwrap();
+    wait_for_each(&prefix, &keys, 1).await;
+
+    writer.clear_on_instance().await.unwrap();
+
+    let reader = make_lax_for_scale(&prefix).await;
+    assert_eq!(reader.get(&keys[0]).await.unwrap().0, 0);
+    assert_eq!(reader.get(keys.last().unwrap()).await.unwrap().0, 0);
+
+    reader.clear().await.unwrap();
+}

@@ -3,6 +3,25 @@
 Notable changes to distkit, newest first. For the full commit log, see the
 [GitHub releases](https://github.com/dev-davexoyinbo/distkit/releases).
 
+## 0.7.1 - 2026-10-10
+
+- **Fixed:** `StrictInstanceAwareCounter` and `LaxInstanceAwareCounter` no
+  longer fail with `too many results to unpack` after an instance dies. In
+  0.7.0 and earlier versions, all calls except `clear` failed for a counter
+  with more than approximately 8,000 keys, and the counter did not recover. The
+  cleanup now reads the counts of the dead instance, not all keys of the
+  counter. A deployment that fails today recovers on its first call after the
+  upgrade. No manual Redis step is necessary.
+- Dead-instance cleanup now has a limit for each call. One call removes dead
+  instances until it has read approximately 10,000 of their counts. The next
+  calls remove the dead instances that stay.
+- **Fixed:** `clear_on_instance` no longer fails when the instance holds more
+  than approximately 8,000 keys.
+- **Fixed:** `RwLock` no longer fails to acquire when more than approximately
+  8,000 reader entries or pending-writer entries expire together.
+- The heartbeat of the instance-aware counters now logs an error when it
+  fails. Before, it ignored the error.
+
 ## 0.7.0 — 2026-08-08
 
 - **Breaking:** upgraded the optional `trypema` re-export from v1 to v2. The
