@@ -896,10 +896,7 @@ impl StrictInstanceAwareCounter {
                     _,
                     matched_raw,
                 ),
-            ) in chunk
-                .iter()
-                .zip(local_epochs.iter())
-                .zip(chunk_results.into_iter())
+            ) in chunk.iter().zip(local_epochs.iter()).zip(chunk_results)
             {
                 if matched_raw != 0 || *local_epoch == redis_epoch {
                     self.update_local_store(key, redis_epoch, cumulative, inst_count);
