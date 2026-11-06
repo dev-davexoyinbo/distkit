@@ -17,11 +17,12 @@ use dashmap::DashMap;
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
-    ActivityTracker, CounterComparator, DistkitRedisKey, EPOCH_CHANGE_INTERVAL, RedisKeyGenerator,
-    RedisKeyGeneratorTypeKey,
+    ActivityTracker, CLEANUP_SCAN_BUDGET, CounterComparator, DELETE_FIELD_IF_ZERO_LUA,
+    DistkitRedisKey, EPOCH_CHANGE_INTERVAL, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
     error::DistkitError,
     execute_pipeline_with_script_retry,
     icounter::{InstanceAwareCounterTrait, generate_instance_id},
+    sweep_zero_fields,
 };
 
 // ---------------------------------------------------------------------------
@@ -60,6 +61,23 @@ local function now_ms()
     return tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
 end
 
+-- Deletes the key's cumulative field and keys-set member when no registered
+-- instance (live or dead-but-unreaped) holds a field for it. The instance
+-- fields are the record of truth: when none exists, the key's true value is
+-- 0, whatever the cumulative field drifted to.
+local function delete_record_if_unheld(prefix, instances_key, cumulative_key, keys_key, counter_key)
+    local all_instances = redis.call('ZRANGE', instances_key, 0, -1)
+
+    for _, inst_id in ipairs(all_instances) do
+        if redis.call('HEXISTS', prefix .. ':count:' .. inst_id, counter_key) == 1 then
+            return
+        end
+    end
+
+    redis.call('HDEL', cumulative_key, counter_key)
+    redis.call('SREM', keys_key, counter_key)
+end
+
 -- Removes dead instances and subtracts their counts from the cumulative hash.
 -- One call stops after it reads about 10000 counts. The dead instances that
 -- stay are removed by the next calls.
@@ -85,6 +103,11 @@ local function delete_dead_instances(prefix, instances_key, cumulative_key, keys
 
         redis.call('DEL', inst_count_key)
         redis.call('ZREM', instances_key, inst_id)
+
+        -- With this hash gone, a key it held may be unheld everywhere.
+        for i = 1, #counts, 2 do
+            delete_record_if_unheld(prefix, instances_key, cumulative_key, keys_key, counts[i])
+        end
     end
 end
 
@@ -160,14 +183,25 @@ end
 
 local new_inst_count
 if is_stale then
-    redis.call('HSET', inst_count_key, counter_key, delta)
+    if delta == 0 then
+        redis.call('HDEL', inst_count_key, counter_key)
+    else
+        redis.call('HSET', inst_count_key, counter_key, delta)
+    end
     new_inst_count = delta
 else
     new_inst_count = tonumber(redis.call('HINCRBY', inst_count_key, counter_key, delta))
+    if new_inst_count == 0 then
+        redis.call('HDEL', inst_count_key, counter_key)
+    end
 end
 
 local new_cumulative = tonumber(redis.call('HINCRBY', cumulative_key, counter_key, delta))
 redis.call('SADD', keys_key, counter_key)
+
+if new_inst_count == 0 then
+    delete_record_if_unheld(prefix, instances_key, cumulative_key, keys_key, counter_key)
+end
 
 return {counter_key, new_cumulative, new_inst_count, old_cumulative, old_inst_count, redis_epoch, instance_created, 1}
 "#;
@@ -218,10 +252,20 @@ if new_epoch > max_epoch then
     new_epoch = 0
 end
 
-redis.call('HSET', epoch_key,      counter_key, new_epoch)
-redis.call('HSET', cumulative_key, counter_key, count)
-redis.call('HSET', inst_count_key, counter_key, count)
-redis.call('SADD', keys_key,       counter_key)
+redis.call('HSET', epoch_key, counter_key, new_epoch)
+
+-- Setting to 0 deletes the storage, as del does: a missing record reads 0.
+-- Other instances' fields stay orphaned exactly as after del; the epoch
+-- bump and the keys-set removal make them inert.
+if count == 0 then
+    redis.call('HDEL', cumulative_key, counter_key)
+    redis.call('HDEL', inst_count_key, counter_key)
+    redis.call('SREM', keys_key,       counter_key)
+else
+    redis.call('HSET', cumulative_key, counter_key, count)
+    redis.call('HSET', inst_count_key, counter_key, count)
+    redis.call('SADD', keys_key,       counter_key)
+end
 
 return {counter_key, count, count, old_cumulative, old_inst_count, new_epoch, instance_created, 1}
 "#;
@@ -267,9 +311,17 @@ if not compare_values(current_inst_count, comparator, compare_against) then
 end
 
 local delta = count - current_inst_count
-redis.call('HSET', inst_count_key, counter_key, count)
+if count == 0 then
+    redis.call('HDEL', inst_count_key, counter_key)
+else
+    redis.call('HSET', inst_count_key, counter_key, count)
+end
 local new_cumulative = tonumber(redis.call('HINCRBY', cumulative_key, counter_key, delta))
 redis.call('SADD', keys_key, counter_key)
+
+if count == 0 then
+    delete_record_if_unheld(prefix, instances_key, cumulative_key, keys_key, counter_key)
+end
 
 return {counter_key, new_cumulative, count, old_cumulative, old_inst_count, redis_epoch, instance_created, 1}
 "#;
@@ -361,6 +413,8 @@ else
     new_cumulative = tonumber(redis.call('HINCRBY', cumulative_key, counter_key, -inst_count))
 end
 
+delete_record_if_unheld(prefix, instances_key, cumulative_key, keys_key, counter_key)
+
 return {new_cumulative, inst_count, redis_epoch, instance_created}
 "#;
 
@@ -402,6 +456,12 @@ for i = 1, #counts, 2 do
     end
 end
 redis.call('DEL', inst_count_key)
+
+-- The cost is keys-in-this-hash times registered instances;
+-- clear_on_instance is a rare administrative call.
+for i = 1, #counts, 2 do
+    delete_record_if_unheld(prefix, instances_key, cumulative_key, keys_key, counts[i])
+end
 "#;
 
 const MARK_ALIVE_LUA: &str = r#"
@@ -419,6 +479,18 @@ local instance_created = check_and_zadd(instances_key, instance_id, ts)
 delete_dead_instances(prefix, instances_key, cumulative_key, keys_key, dead_threshold, ts)
 
 return tostring(instance_created)
+"#;
+
+/// Used by the cleanup task's cumulative-hash sweep.
+const DELETE_UNHELD_RECORD_LUA: &str = r#"
+local instances_key  = KEYS[1]
+local cumulative_key = KEYS[2]
+local keys_key       = KEYS[3]
+
+local counter_key = ARGV[1]
+local prefix      = ARGV[2]
+
+delete_record_if_unheld(prefix, instances_key, cumulative_key, keys_key, counter_key)
 "#;
 
 const INC_IF_EPOCH_MATCHES_LUA: &str = r#"
@@ -470,6 +542,10 @@ pub struct StrictInstanceAwareCounterOptions {
     /// Milliseconds without a heartbeat before an instance is considered dead.
     /// Default: 30 000.
     pub dead_instance_threshold_ms: u64,
+    /// How often a background task reaps dead instances and deletes counter
+    /// records that no instance holds anymore, such as records written by
+    /// versions before 0.7.2. `None` (the default) spawns no task.
+    pub cleanup_interval: Option<std::time::Duration>,
 }
 
 impl StrictInstanceAwareCounterOptions {
@@ -497,6 +573,7 @@ impl StrictInstanceAwareCounterOptions {
             prefix,
             connection_manager,
             dead_instance_threshold_ms: 30_000,
+            cleanup_interval: None,
         }
     }
 }
@@ -547,6 +624,7 @@ impl StrictInstanceAwareCounter {
         key_generator: RedisKeyGenerator,
         connection_manager: ConnectionManager,
         dead_instance_threshold_ms: u64,
+        cleanup_interval: Option<std::time::Duration>,
     ) -> Arc<Self> {
         let instance_id = generate_instance_id();
         let counter = Arc::new(Self {
@@ -573,6 +651,11 @@ impl StrictInstanceAwareCounter {
             activity: ActivityTracker::new(EPOCH_CHANGE_INTERVAL),
         });
         counter.run_heartbeat_task();
+
+        if let Some(cleanup_interval) = cleanup_interval {
+            counter.run_cleanup_task(cleanup_interval);
+        }
+
         counter
     }
 
@@ -604,12 +687,14 @@ impl StrictInstanceAwareCounter {
             prefix,
             connection_manager,
             dead_instance_threshold_ms,
+            cleanup_interval,
         } = options;
         let key_generator = RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::InstanceAware);
         Self::build(
             key_generator,
             connection_manager,
             dead_instance_threshold_ms,
+            cleanup_interval,
         )
     }
 
@@ -622,6 +707,7 @@ impl StrictInstanceAwareCounter {
             prefix,
             connection_manager,
             dead_instance_threshold_ms,
+            cleanup_interval,
         } = options;
         let key_generator =
             RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::LaxInstanceAware);
@@ -629,6 +715,7 @@ impl StrictInstanceAwareCounter {
             key_generator,
             connection_manager,
             dead_instance_threshold_ms,
+            cleanup_interval,
         )
     }
 
@@ -743,6 +830,130 @@ impl StrictInstanceAwareCounter {
             }
         });
     }
+
+    /// Reaps dead instances and deletes counter records that no instance
+    /// holds anymore, on a timer: per tick, one `mark_alive` round (which
+    /// runs the budgeted dead-instance reaper), a zero-field sweep over
+    /// every registered instance's count hash, and an unheld-record sweep
+    /// over the cumulative hash. One [`CLEANUP_SCAN_BUDGET`] is shared by
+    /// the two sweeps; the cumulative cursor resumes across ticks, so large
+    /// hashes converge over several ticks.
+    fn run_cleanup_task(self: &Arc<Self>, cleanup_interval: std::time::Duration) {
+        let weak = Arc::downgrade(self);
+
+        tokio::spawn(async move {
+            let zero_script = Script::new(DELETE_FIELD_IF_ZERO_LUA);
+            let unheld_script = Script::new(&format!("{HELPERS_LUA}\n{DELETE_UNHELD_RECORD_LUA}"));
+            let mut interval = tokio::time::interval(cleanup_interval);
+            interval.tick().await; // skip first immediate tick
+            let mut cumulative_cursor = 0u64;
+
+            loop {
+                interval.tick().await;
+
+                let Some(counter) = weak.upgrade() else { break };
+
+                if let Err(error) = counter.mark_alive().await {
+                    tracing::error!(?error, "icounter:cleanup_task: dead-instance reap failed");
+                    continue;
+                }
+
+                match counter
+                    .sweep_records(&zero_script, &unheld_script, cumulative_cursor)
+                    .await
+                {
+                    Ok(next_cursor) => cumulative_cursor = next_cursor,
+                    Err(error) => {
+                        tracing::error!(?error, "icounter:cleanup_task: record sweep failed");
+                    }
+                }
+            }
+        });
+    } // end fn run_cleanup_task
+
+    /// One cleanup-task pass over this counter's records: zero fields leave
+    /// every registered instance's count hash (restarted from the front each
+    /// pass, since deletions shrink the rescan), then the cumulative hash is
+    /// scanned from `cumulative_cursor` and each scanned record is deleted
+    /// when no instance holds it. Returns the next cumulative cursor.
+    async fn sweep_records(
+        &self,
+        zero_script: &Script,
+        unheld_script: &Script,
+        cumulative_cursor: u64,
+    ) -> Result<u64, DistkitError> {
+        let mut conn = self.connection_manager.clone();
+        let mut budget = CLEANUP_SCAN_BUDGET;
+
+        let instance_ids: Vec<String> = redis::cmd("ZRANGE")
+            .arg(self.instances_key())
+            .arg(0)
+            .arg(-1)
+            .query_async(&mut conn)
+            .await
+            .map_err(DistkitError::RedisError)?;
+
+        for instance_id in &instance_ids {
+            if budget == 0 {
+                return Ok(cumulative_cursor);
+            }
+
+            let count_hash_key = format!("{}:count:{}", self.prefix_str(), instance_id);
+            let (_, fields_read) =
+                sweep_zero_fields(&mut conn, zero_script, &count_hash_key, 0, budget).await?;
+            budget = budget.saturating_sub(fields_read);
+        }
+
+        if budget == 0 {
+            return Ok(cumulative_cursor);
+        }
+
+        let mut cursor = cumulative_cursor;
+
+        loop {
+            let (next_cursor, entries): (u64, Vec<String>) = redis::cmd("HSCAN")
+                .arg(self.cumulative_key())
+                .arg(cursor)
+                .arg("COUNT")
+                .arg(500)
+                .query_async(&mut conn)
+                .await
+                .map_err(DistkitError::RedisError)?;
+
+            // Every scanned record is checked, whatever its value, so a
+            // drifted record that no instance holds is deleted too.
+            let fields: Vec<&String> = entries
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|[field, _]| field)
+                .collect();
+
+            if !fields.is_empty() {
+                execute_pipeline_with_script_retry::<(), _, _>(
+                    &mut conn,
+                    unheld_script,
+                    &fields,
+                    |field| {
+                        let mut invocation = unheld_script.key(self.instances_key());
+                        invocation.key(self.cumulative_key());
+                        invocation.key(self.keys_key());
+                        invocation.arg(field.as_str());
+                        invocation.arg(self.prefix_str());
+                        invocation
+                    },
+                )
+                .await?;
+            }
+
+            budget = budget.saturating_sub(entries.len() / 2);
+            cursor = next_cursor;
+
+            if cursor == 0 || budget == 0 {
+                return Ok(cursor);
+            }
+        }
+    } // end fn sweep_records
 
     /// Sends recovery increments for all keys in `recoveries` using pipelined
     /// `INC_IF_EPOCH_MATCHES_LUA` calls, chunked to avoid oversized pipelines.

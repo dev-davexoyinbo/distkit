@@ -1,10 +1,17 @@
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::icounter::{InstanceAwareCounterTrait, StrictInstanceAwareCounter};
+use tokio::time::sleep;
+
+use crate::icounter::{
+    InstanceAwareCounterTrait, StrictInstanceAwareCounter, StrictInstanceAwareCounterOptions,
+};
 use crate::{CounterComparator, DistkitRedisKey};
 
 use super::common::{
-    key, make_counter, make_n_counters, make_n_counters_with_opts, make_pair, make_pair_with_opts,
+    field_exists, hset_raw, icounter_container, key, key_exists, make_connection, make_counter,
+    make_n_counters, make_n_counters_with_opts, make_pair, make_pair_with_opts, run_id, sadd_raw,
+    set_member_exists, zadd_raw,
 };
 
 // ===========================================================================
@@ -1273,4 +1280,244 @@ async fn a_deleted_key_is_not_subtracted_when_another_instance_dies() {
     assert_eq!(c2.get(&kept).await.unwrap().0, 4);
 
     c2.clear().await.unwrap();
+}
+
+// ===========================================================================
+// Records that reach zero are deleted
+// ===========================================================================
+
+/// `n` counters sharing one known prefix, so raw Redis assertions can
+/// address the container directly.
+async fn make_n_on_prefix(
+    prefix: &str,
+    n: usize,
+    threshold_ms: u64,
+) -> Vec<Arc<StrictInstanceAwareCounter>> {
+    let mut counters = Vec::with_capacity(n);
+
+    for _ in 0..n {
+        let conn = make_connection().await;
+        counters.push(StrictInstanceAwareCounter::new(
+            StrictInstanceAwareCounterOptions {
+                prefix: DistkitRedisKey::from(prefix.to_string()),
+                connection_manager: conn,
+                dead_instance_threshold_ms: threshold_ms,
+                cleanup_interval: None,
+            },
+        ));
+    }
+
+    counters
+}
+
+#[tokio::test]
+async fn a_zero_slice_is_deleted_while_other_instances_hold_the_key() {
+    let prefix = format!("{}_zero_slice_held", run_id());
+    let counters = make_n_on_prefix(&prefix, 3, 30_000).await;
+    let (a, b, c) = (&counters[0], &counters[1], &counters[2]);
+    let container = icounter_container(&prefix);
+    let cumulative = format!("{container}:cumulative");
+    let keys_set = format!("{container}:keys");
+    let k = key("slots");
+
+    a.inc(&k, 1).await.unwrap();
+    b.dec(&k, 1).await.unwrap();
+    c.inc(&k, 1).await.unwrap();
+    a.dec(&k, 1).await.unwrap(); // A's slice lands on 0.
+
+    let a_hash = format!("{container}:count:{}", a.instance_id());
+    assert!(!field_exists(&a_hash, "slots").await);
+
+    // B at -1 and C at +1 still hold the key: the shared record stays.
+    assert!(field_exists(&cumulative, "slots").await);
+    assert!(set_member_exists(&keys_set, "slots").await);
+    assert_eq!(a.get(&k).await.unwrap(), (0, 0));
+    assert_eq!(b.get(&k).await.unwrap().1, -1);
+    assert_eq!(c.get(&k).await.unwrap().1, 1);
+
+    // The last holders leave: nothing remains.
+    b.inc(&k, 1).await.unwrap();
+    c.dec(&k, 1).await.unwrap();
+
+    assert!(!field_exists(&cumulative, "slots").await);
+    assert!(!set_member_exists(&keys_set, "slots").await);
+    assert_eq!(a.get(&k).await.unwrap(), (0, 0));
+    assert_eq!(b.get(&k).await.unwrap(), (0, 0));
+    assert_eq!(c.get(&k).await.unwrap(), (0, 0));
+}
+
+#[tokio::test]
+async fn set_on_instance_to_zero_deletes_only_unheld_records() {
+    let prefix = format!("{}_set_on_instance_zero", run_id());
+    let counters = make_n_on_prefix(&prefix, 2, 30_000).await;
+    let (c1, c2) = (&counters[0], &counters[1]);
+    let container = icounter_container(&prefix);
+    let cumulative = format!("{container}:cumulative");
+    let keys_set = format!("{container}:keys");
+    let k = key("slots");
+
+    c1.inc(&k, 5).await.unwrap();
+    c2.inc(&k, 2).await.unwrap();
+
+    c1.set_on_instance(&k, 0).await.unwrap();
+
+    let c1_hash = format!("{container}:count:{}", c1.instance_id());
+    assert!(!field_exists(&c1_hash, "slots").await);
+    // C2 still holds the key.
+    assert!(field_exists(&cumulative, "slots").await);
+    assert_eq!(c1.get(&k).await.unwrap(), (2, 0));
+
+    c2.del_on_instance(&k).await.unwrap();
+
+    assert!(!field_exists(&cumulative, "slots").await);
+    assert!(!set_member_exists(&keys_set, "slots").await);
+    assert_eq!(c2.get(&k).await.unwrap(), (0, 0));
+}
+
+#[tokio::test]
+async fn a_dead_instance_reap_deletes_records_nobody_holds() {
+    let prefix = format!("{}_reap_unheld", run_id());
+    let counters = make_n_on_prefix(&prefix, 2, 150).await;
+    let (c1, c2) = (&counters[0], &counters[1]);
+    let container = icounter_container(&prefix);
+    let cumulative = format!("{container}:cumulative");
+    let keys_set = format!("{container}:keys");
+    let k = key("slots");
+
+    c1.inc(&k, 2).await.unwrap();
+    c2.dec(&k, 2).await.unwrap();
+
+    let c2_hash = format!("{container}:count:{}", c2.instance_id());
+
+    // With a 150 ms threshold and no operations, C2's score goes stale;
+    // C1's next operation reaps it.
+    sleep(Duration::from_millis(700)).await;
+    c1.inc(&key("other"), 1).await.unwrap();
+
+    // C1 still holds the key, so the record stays, now at C1's slice.
+    assert!(!key_exists(&c2_hash).await);
+    assert!(field_exists(&cumulative, "slots").await);
+    assert_eq!(c1.get(&k).await.unwrap(), (2, 2));
+
+    c1.dec(&k, 2).await.unwrap();
+
+    assert!(!field_exists(&cumulative, "slots").await);
+    assert!(!set_member_exists(&keys_set, "slots").await);
+}
+
+#[tokio::test]
+async fn reaping_the_last_holder_deletes_the_shared_record() {
+    let prefix = format!("{}_reap_last_holder", run_id());
+    let counters = make_n_on_prefix(&prefix, 2, 150).await;
+    let container = icounter_container(&prefix);
+    let cumulative = format!("{container}:cumulative");
+    let keys_set = format!("{container}:keys");
+    let k = key("slots");
+
+    counters[0].inc(&k, 5).await.unwrap();
+    let dead_hash = format!("{container}:count:{}", counters[0].instance_id());
+
+    drop(counters);
+
+    // A fresh instance on the same prefix reaps on its first operation.
+    let survivor = make_n_on_prefix(&prefix, 1, 150).await;
+    sleep(Duration::from_millis(700)).await;
+    survivor[0].inc(&key("other"), 1).await.unwrap();
+
+    assert!(!key_exists(&dead_hash).await);
+    assert!(!field_exists(&cumulative, "slots").await);
+    assert!(!set_member_exists(&keys_set, "slots").await);
+    assert_eq!(survivor[0].get(&k).await.unwrap(), (0, 0));
+}
+
+#[tokio::test]
+async fn set_to_zero_deletes_storage_and_keeps_the_epoch_bump() {
+    let prefix = format!("{}_set_zero_epoch", run_id());
+    let counters = make_n_on_prefix(&prefix, 1, 30_000).await;
+    let counter = &counters[0];
+    let container = icounter_container(&prefix);
+    let k = key("slots");
+
+    counter.inc(&k, 9).await.unwrap();
+    counter.set(&k, 0).await.unwrap();
+
+    assert!(!field_exists(&format!("{container}:cumulative"), "slots").await);
+    assert!(!set_member_exists(&format!("{container}:keys"), "slots").await);
+    let own_hash = format!("{container}:count:{}", counter.instance_id());
+    assert!(!field_exists(&own_hash, "slots").await);
+    // The epoch bump stays, so stale instances reset as they do after del.
+    assert!(field_exists(&format!("{container}:epoch"), "slots").await);
+    assert_eq!(counter.get(&k).await.unwrap(), (0, 0));
+}
+
+#[tokio::test]
+async fn the_cleanup_task_converges_legacy_records_without_traffic() {
+    let prefix = format!("{}_icounter_cleanup", run_id());
+    let container = icounter_container(&prefix);
+    let instances = format!("{container}:instances");
+    let cumulative = format!("{container}:cumulative");
+    let keys_set = format!("{container}:keys");
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+
+    // Records as a pre-0.7.2 deployment leaves them:
+    // a dead instance holding a key only it held,
+    zadd_raw(&instances, "legacy-dead", now_ms - 60_000).await;
+    hset_raw(&format!("{container}:count:legacy-dead"), "dead_key", 4).await;
+    hset_raw(&cumulative, "dead_key", 4).await;
+    sadd_raw(&keys_set, "dead_key").await;
+
+    // a live-but-idle instance with a slice left at 0,
+    zadd_raw(&instances, "legacy-idle", now_ms).await;
+    hset_raw(&format!("{container}:count:legacy-idle"), "zero_key", 0).await;
+    hset_raw(&cumulative, "zero_key", 0).await;
+    sadd_raw(&keys_set, "zero_key").await;
+
+    // and a key held at -1/+1, whose cumulative is 0 but must stay.
+    zadd_raw(&instances, "legacy-b", now_ms).await;
+    hset_raw(&format!("{container}:count:legacy-idle"), "held_key", -1).await;
+    hset_raw(&format!("{container}:count:legacy-b"), "held_key", 1).await;
+    hset_raw(&cumulative, "held_key", 0).await;
+    sadd_raw(&keys_set, "held_key").await;
+
+    let conn = make_connection().await;
+    let _counter = StrictInstanceAwareCounter::new(StrictInstanceAwareCounterOptions {
+        prefix: DistkitRedisKey::from(prefix.clone()),
+        connection_manager: conn,
+        dead_instance_threshold_ms: 30_000,
+        cleanup_interval: Some(Duration::from_millis(50)),
+    });
+
+    // No operations: the cleanup task alone must converge the records.
+    sleep(Duration::from_millis(500)).await;
+
+    assert!(!key_exists(&format!("{container}:count:legacy-dead")).await);
+    assert!(!field_exists(&cumulative, "dead_key").await);
+    assert!(!set_member_exists(&keys_set, "dead_key").await);
+
+    assert!(!field_exists(&format!("{container}:count:legacy-idle"), "zero_key").await);
+    assert!(!field_exists(&cumulative, "zero_key").await);
+    assert!(!set_member_exists(&keys_set, "zero_key").await);
+
+    assert!(field_exists(&format!("{container}:count:legacy-idle"), "held_key").await);
+    assert!(field_exists(&format!("{container}:count:legacy-b"), "held_key").await);
+    assert!(field_exists(&cumulative, "held_key").await);
+    assert!(set_member_exists(&keys_set, "held_key").await);
+}
+
+#[tokio::test]
+async fn no_cleanup_interval_means_no_sweep() {
+    let prefix = format!("{}_no_cleanup_task", run_id());
+    let container = icounter_container(&prefix);
+    let cumulative = format!("{container}:cumulative");
+
+    hset_raw(&cumulative, "legacy_zero", 0).await;
+
+    let counters = make_n_on_prefix(&prefix, 1, 30_000).await;
+    sleep(Duration::from_millis(300)).await;
+
+    assert!(field_exists(&cumulative, "legacy_zero").await);
+    drop(counters);
 }

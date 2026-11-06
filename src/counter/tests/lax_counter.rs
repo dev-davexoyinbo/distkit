@@ -1,6 +1,18 @@
+use std::time::Duration;
+
+use tokio::time::sleep;
+
 use crate::{CounterComparator, counter::CounterTrait};
 
-use super::common::{key, make_lax_counter};
+use crate::{
+    DistkitRedisKey,
+    counter::{CounterOptions, LaxCounter},
+};
+
+use super::common::{
+    field_exists, hset_raw, key, lax_container_key, make_connection, make_lax_counter,
+    make_lax_counter_from_prefix, unique_prefix,
+};
 
 // ---------------------------------------------------------------------------
 // inc
@@ -839,4 +851,47 @@ async fn set_all_if_is_eventually_flushed_for_successful_updates() {
         reader.get_all(&[&k1, &k2]).await.unwrap(),
         vec![(&k1, 55), (&k2, 0)]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Records that reach zero are deleted
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_flushed_record_that_reaches_zero_is_deleted() {
+    let prefix = unique_prefix("lax_zero_record");
+    let counter = make_lax_counter_from_prefix(&prefix).await;
+    let container = lax_container_key(&prefix);
+    let k = key("hits");
+
+    counter.inc(&k, 4).await.unwrap();
+    sleep(Duration::from_millis(100)).await;
+    assert!(field_exists(&container, "hits").await);
+
+    counter.dec(&k, 4).await.unwrap();
+    sleep(Duration::from_millis(100)).await;
+    assert!(!field_exists(&container, "hits").await);
+    assert_eq!(counter.get(&k).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn the_lax_cleanup_task_deletes_legacy_zero_records() {
+    let prefix = unique_prefix("lax_cleanup_task");
+    let container = lax_container_key(&prefix);
+
+    hset_raw(&container, "legacy_zero", 0).await;
+    hset_raw(&container, "legacy_live", 3).await;
+
+    let conn = make_connection().await;
+    let _counter = LaxCounter::new(CounterOptions {
+        prefix: DistkitRedisKey::from(prefix.clone()),
+        connection_manager: conn,
+        allowed_lag: Duration::from_millis(20),
+        cleanup_interval: Some(Duration::from_millis(50)),
+    });
+
+    sleep(Duration::from_millis(400)).await;
+
+    assert!(!field_exists(&container, "legacy_zero").await);
+    assert!(field_exists(&container, "legacy_live").await);
 }

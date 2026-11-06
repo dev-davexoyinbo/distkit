@@ -8,7 +8,9 @@ use crate::icounter::{
     InstanceAwareCounterTrait, LaxInstanceAwareCounter, LaxInstanceAwareCounterOptions,
 };
 
-use super::common::{make_connection, run_id};
+use super::common::{
+    field_exists, key_exists, lax_icounter_container, make_connection, run_id, set_member_exists,
+};
 use crate::DistkitRedisKey;
 
 // ---------------------------------------------------------------------------
@@ -31,6 +33,7 @@ async fn make_lax_from_prefix(prefix: &str) -> Arc<LaxInstanceAwareCounter> {
         dead_instance_threshold_ms: THRESHOLD_MS,
         flush_interval: Duration::from_millis(FLUSH_MS),
         allowed_lag: Duration::from_millis(FLUSH_MS),
+        cleanup_interval: None,
     })
 }
 
@@ -841,6 +844,7 @@ async fn make_lax_for_scale(prefix: &str) -> Arc<LaxInstanceAwareCounter> {
         dead_instance_threshold_ms: SCALE_THRESHOLD_MS,
         flush_interval: Duration::from_millis(FLUSH_MS),
         allowed_lag: Duration::from_millis(FLUSH_MS),
+        cleanup_interval: None,
     })
 }
 
@@ -1090,6 +1094,7 @@ async fn flush_failures_never_lose_increments() {
             dead_instance_threshold_ms: THRESHOLD_MS,
             flush_interval: Duration::from_millis(FLUSH_MS),
             allowed_lag: Duration::from_millis(FLUSH_MS),
+            cleanup_interval: None,
         })
     };
 
@@ -1151,6 +1156,7 @@ async fn quiet_instance_flushes_promptly() {
             dead_instance_threshold_ms: THRESHOLD_MS,
             flush_interval: Duration::from_millis(FLUSH_MS),
             allowed_lag: Duration::from_millis(FLUSH_MS),
+            cleanup_interval: None,
         },
         Duration::from_secs(1),
     );
@@ -1166,4 +1172,28 @@ async fn quiet_instance_flushes_promptly() {
 
     let reader = make_lax_from_prefix(&prefix).await;
     assert_eq!(reader.get(&k).await.unwrap().0, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Records that reach zero are deleted
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_lax_slice_that_reaches_zero_leaves_no_record() {
+    let (c1, _c2, prefix) = make_lax_pair("lax_zero_record").await;
+    let container = lax_icounter_container(&prefix);
+    let cumulative = format!("{container}:cumulative");
+    let k = key("hits");
+
+    c1.inc(&k, 3).await.unwrap();
+    sleep(Duration::from_millis(FLUSH_MS * 5)).await; // the +3 settles
+    assert!(field_exists(&cumulative, "hits").await);
+
+    c1.dec(&k, 3).await.unwrap();
+    sleep(Duration::from_millis(FLUSH_MS * 5)).await; // the -3 settles at 0
+
+    assert!(!field_exists(&cumulative, "hits").await);
+    assert!(!set_member_exists(&format!("{container}:keys"), "hits").await);
+    assert!(!key_exists(&format!("{container}:count:{}", c1.instance_id())).await);
+    assert_eq!(c1.get(&k).await.unwrap(), (0, 0));
 }

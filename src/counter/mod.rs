@@ -38,6 +38,10 @@ pub struct CounterOptions {
     /// Maximum acceptable staleness for [`LaxCounter`] reads (default 20 ms).
     /// Controls how often the background task flushes buffered writes to Redis.
     pub allowed_lag: Duration,
+    /// How often a background task sweeps the counter's Redis hash and
+    /// deletes records whose value is 0, such as records written by versions
+    /// before 0.7.2. `None` (the default) spawns no task.
+    pub cleanup_interval: Option<Duration>,
 }
 
 impl CounterOptions {
@@ -65,6 +69,7 @@ impl CounterOptions {
             prefix,
             connection_manager,
             allowed_lag: Duration::from_millis(20),
+            cleanup_interval: None,
         }
     }
 }

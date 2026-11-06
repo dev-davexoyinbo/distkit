@@ -1,6 +1,16 @@
-use crate::{CounterComparator, counter::CounterTrait};
+use std::time::Duration;
 
-use super::common::{key, make_strict_counter};
+use tokio::time::sleep;
+
+use crate::{
+    CounterComparator, DistkitRedisKey,
+    counter::{CounterOptions, CounterTrait, StrictCounter},
+};
+
+use super::common::{
+    field_exists, hset_raw, key, make_connection, make_strict_counter,
+    make_strict_counter_from_prefix, strict_container_key, unique_prefix,
+};
 
 /// A key that has never been written returns 0.
 #[tokio::test]
@@ -422,4 +432,69 @@ async fn set_all_if_supports_partial_success_and_missing_keys() {
     assert_eq!(counter.get(&k1).await.unwrap(), 11);
     assert_eq!(counter.get(&k2).await.unwrap(), 20);
     assert_eq!(counter.get(&k3).await.unwrap(), 30);
+}
+
+// ---------------------------------------------------------------------------
+// Records that reach zero are deleted
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_record_that_reaches_zero_is_deleted() {
+    let prefix = unique_prefix("strict_zero_record");
+    let counter = make_strict_counter_from_prefix(&prefix).await;
+    let container = strict_container_key(&prefix);
+    let k = key("hits");
+
+    counter.inc(&k, 5).await.unwrap();
+    assert!(field_exists(&container, "hits").await);
+
+    counter.dec(&k, 5).await.unwrap();
+    assert!(!field_exists(&container, "hits").await);
+    assert_eq!(counter.get(&k).await.unwrap(), 0);
+
+    // A crossing from below lands on 0 the same way.
+    counter.dec(&k, 3).await.unwrap();
+    counter.inc(&k, 3).await.unwrap();
+    assert!(!field_exists(&container, "hits").await);
+}
+
+#[tokio::test]
+async fn set_to_zero_deletes_the_record() {
+    let prefix = unique_prefix("strict_set_zero");
+    let counter = make_strict_counter_from_prefix(&prefix).await;
+    let container = strict_container_key(&prefix);
+    let k = key("hits");
+
+    counter.set(&k, 7).await.unwrap();
+    assert!(field_exists(&container, "hits").await);
+
+    counter.set(&k, 0).await.unwrap();
+    assert!(!field_exists(&container, "hits").await);
+    assert_eq!(counter.get(&k).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn the_cleanup_task_deletes_legacy_zero_records() {
+    let prefix = unique_prefix("strict_cleanup_task");
+    let container = strict_container_key(&prefix);
+
+    // Records as a pre-0.7.2 deployment leaves them.
+    hset_raw(&container, "legacy_zero", 0).await;
+    hset_raw(&container, "legacy_live", 7).await;
+
+    let conn = make_connection().await;
+    let counter = StrictCounter::new(CounterOptions {
+        prefix: DistkitRedisKey::from(prefix.clone()),
+        connection_manager: conn,
+        allowed_lag: Duration::from_millis(20),
+        cleanup_interval: Some(Duration::from_millis(50)),
+    });
+
+    // No operations: the sweep alone must converge the hash.
+    sleep(Duration::from_millis(400)).await;
+
+    assert!(!field_exists(&container, "legacy_zero").await);
+    assert!(field_exists(&container, "legacy_live").await);
+    assert_eq!(counter.get(&key("legacy_zero")).await.unwrap(), 0);
+    assert_eq!(counter.get(&key("legacy_live")).await.unwrap(), 7);
 }

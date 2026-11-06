@@ -114,6 +114,11 @@ pub struct LaxInstanceAwareCounterOptions {
     /// How old a key's pending delta must be before it is included in a flush.
     /// Default: 20 ms.
     pub allowed_lag: Duration,
+    /// How often a background task on the backing strict counter reaps dead
+    /// instances and deletes counter records that no instance holds anymore,
+    /// such as records written by versions before 0.7.2. `None` (the
+    /// default) spawns no task.
+    pub cleanup_interval: Option<Duration>,
 }
 
 impl LaxInstanceAwareCounterOptions {
@@ -146,6 +151,7 @@ impl LaxInstanceAwareCounterOptions {
             dead_instance_threshold_ms: 30_000,
             flush_interval: Duration::from_millis(20),
             allowed_lag: Duration::from_millis(20),
+            cleanup_interval: None,
         }
     }
 }
@@ -226,6 +232,7 @@ impl LaxInstanceAwareCounter {
             dead_instance_threshold_ms,
             flush_interval,
             allowed_lag,
+            cleanup_interval,
         } = options;
 
         let strict =
@@ -233,6 +240,7 @@ impl LaxInstanceAwareCounter {
                 prefix,
                 connection_manager,
                 dead_instance_threshold_ms,
+                cleanup_interval,
             });
 
         let counter = Arc::new(Self {

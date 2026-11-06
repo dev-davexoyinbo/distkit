@@ -3,9 +3,10 @@ use std::{collections::HashMap, sync::Arc};
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
-    CounterComparator, DistkitError, DistkitRedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
+    CLEANUP_SCAN_BUDGET, CounterComparator, DELETE_FIELD_IF_ZERO_LUA, DistkitError,
+    DistkitRedisKey, RedisKeyGenerator, RedisKeyGeneratorTypeKey,
     counter::{CounterOptions, CounterTrait},
-    execute_pipeline_with_script_retry,
+    execute_pipeline_with_script_retry, sweep_zero_fields,
 };
 
 const HELPER_LUA: &str = r#"
@@ -38,7 +39,14 @@ const INC_LUA: &str = r#"
         return {current, current}
     end
 
-    return {tonumber(redis.call('HINCRBY', container_key, key, count)), current}
+    local new_count = tonumber(redis.call('HINCRBY', container_key, key, count))
+
+    -- A record at 0 reads the same as no record, so it is deleted.
+    if new_count == 0 then
+        redis.call('HDEL', container_key, key)
+    end
+
+    return {new_count, current}
 "#;
 
 const SET_LUA: &str = r#"
@@ -53,7 +61,13 @@ const SET_LUA: &str = r#"
         return {key, current, current}
     end
 
-    redis.call('HSET', container_key, key, count)
+    -- A record at 0 reads the same as no record, so setting to 0 deletes.
+    if count == 0 then
+        redis.call('HDEL', container_key, key)
+    else
+        redis.call('HSET', container_key, key, count)
+    end
+
     return {key, count, current}
 "#;
 
@@ -119,6 +133,7 @@ impl StrictCounter {
         let CounterOptions {
             prefix,
             connection_manager,
+            cleanup_interval,
             ..
         } = options;
 
@@ -129,7 +144,7 @@ impl StrictCounter {
         let del_script = Script::new(DEL_LUA);
         let clear_script = Script::new(CLEAR_LUA);
 
-        Arc::new(Self {
+        let counter = Arc::new(Self {
             connection_manager,
             key_generator,
             inc_script,
@@ -137,8 +152,51 @@ impl StrictCounter {
             set_script,
             del_script,
             clear_script,
-        })
+        });
+
+        if let Some(cleanup_interval) = cleanup_interval {
+            counter.run_cleanup_task(cleanup_interval);
+        }
+
+        counter
     }
+
+    /// Sweeps this counter's hash on a timer and deletes records whose value
+    /// is 0, such as records written by versions before 0.7.2. The cursor
+    /// resumes across ticks, so a large hash converges over several ticks.
+    fn run_cleanup_task(self: &Arc<Self>, cleanup_interval: std::time::Duration) {
+        let weak = Arc::downgrade(self);
+
+        tokio::spawn(async move {
+            let script = Script::new(DELETE_FIELD_IF_ZERO_LUA);
+            let mut interval = tokio::time::interval(cleanup_interval);
+            interval.tick().await; // skip first immediate tick
+            let mut cursor = 0u64;
+
+            loop {
+                interval.tick().await;
+
+                let Some(counter) = weak.upgrade() else { break };
+                let mut conn = counter.connection_manager.clone();
+                let container_key = counter.key_generator.container_key();
+
+                match sweep_zero_fields(
+                    &mut conn,
+                    &script,
+                    &container_key,
+                    cursor,
+                    CLEANUP_SCAN_BUDGET,
+                )
+                .await
+                {
+                    Ok((next_cursor, _)) => cursor = next_cursor,
+                    Err(error) => {
+                        tracing::error!(?error, "strict_counter:cleanup_task: sweep failed");
+                    }
+                }
+            }
+        });
+    } // end fn run_cleanup_task
 }
 
 #[async_trait::async_trait]

@@ -13,10 +13,11 @@ use redis::{Script, aio::ConnectionManager};
 use tokio::time::Instant;
 
 use crate::{
-    ActivityTracker, CounterComparator, DistkitError, DistkitRedisKey, EPOCH_CHANGE_INTERVAL,
-    RedisKeyGenerator, RedisKeyGeneratorTypeKey,
+    ActivityTracker, CLEANUP_SCAN_BUDGET, CounterComparator, DELETE_FIELD_IF_ZERO_LUA,
+    DistkitError, DistkitRedisKey, EPOCH_CHANGE_INTERVAL, RedisKeyGenerator,
+    RedisKeyGeneratorTypeKey,
     counter::{CounterError, CounterOptions, CounterTrait},
-    execute_pipeline_with_script_retry, mutex_lock,
+    execute_pipeline_with_script_retry, mutex_lock, sweep_zero_fields,
 };
 
 const MAX_BATCH_SIZE: usize = 100;
@@ -33,7 +34,12 @@ const COMMIT_STATE_LUA: &str = r#"
     local key = KEYS[2]
     local count = tonumber(ARGV[1]) or 0
 
-    redis.call('HINCRBY', container_key, key, count)
+    local new_count = tonumber(redis.call('HINCRBY', container_key, key, count))
+
+    -- A record at 0 reads the same as no record, so it is deleted.
+    if new_count == 0 then
+        redis.call('HDEL', container_key, key)
+    end
 "#;
 
 const DEL_LUA: &str = r#"
@@ -124,6 +130,7 @@ impl LaxCounter {
             prefix,
             connection_manager,
             allowed_lag,
+            cleanup_interval,
         } = options;
         let key_generator = RedisKeyGenerator::new(prefix, RedisKeyGeneratorTypeKey::Lax);
 
@@ -151,8 +158,49 @@ impl LaxCounter {
 
         counter.run_flush_task();
 
+        if let Some(cleanup_interval) = cleanup_interval {
+            counter.run_cleanup_task(cleanup_interval);
+        }
+
         counter
     }
+
+    /// Sweeps this counter's hash on a timer and deletes records whose value
+    /// is 0, such as records written by versions before 0.7.2. The cursor
+    /// resumes across ticks, so a large hash converges over several ticks.
+    fn run_cleanup_task(self: &Arc<Self>, cleanup_interval: Duration) {
+        let weak = Arc::downgrade(self);
+
+        tokio::spawn(async move {
+            let script = Script::new(DELETE_FIELD_IF_ZERO_LUA);
+            let mut interval = tokio::time::interval(cleanup_interval);
+            interval.tick().await; // skip first immediate tick
+            let mut cursor = 0u64;
+
+            loop {
+                interval.tick().await;
+
+                let Some(counter) = weak.upgrade() else { break };
+                let mut conn = counter.connection_manager.clone();
+                let container_key = counter.key_generator.container_key();
+
+                match sweep_zero_fields(
+                    &mut conn,
+                    &script,
+                    &container_key,
+                    cursor,
+                    CLEANUP_SCAN_BUDGET,
+                )
+                .await
+                {
+                    Ok((next_cursor, _)) => cursor = next_cursor,
+                    Err(error) => {
+                        tracing::error!(?error, "lax_counter:cleanup_task: sweep failed");
+                    }
+                }
+            }
+        });
+    } // end fn run_cleanup_task
 
     fn run_flush_task(self: &Arc<Self>) {
         tokio::spawn({

@@ -53,6 +53,71 @@ where
     }
 }
 
+/// The most hash fields one cleanup-task tick scans.
+pub(crate) const CLEANUP_SCAN_BUDGET: usize = 10_000;
+
+/// Deletes a hash field only when its value is still 0, so a concurrent
+/// increment between a sweep's scan and its delete is never lost.
+pub(crate) const DELETE_FIELD_IF_ZERO_LUA: &str = r#"
+    local container_key = KEYS[1]
+    local field = ARGV[1]
+
+    if tonumber(redis.call('HGET', container_key, field)) == 0 then
+        redis.call('HDEL', container_key, field)
+    end
+"#;
+
+/// One pass of a zero-record sweep over the hash at `container_key`: resumes
+/// `HSCAN` from `cursor`, reads up to `budget` fields, and deletes the ones
+/// whose value is still 0 through `script` ([`DELETE_FIELD_IF_ZERO_LUA`]).
+/// Returns the cursor for the next pass (0 when the scan wrapped around) and
+/// the number of fields read.
+pub(crate) async fn sweep_zero_fields(
+    conn: &mut ConnectionManager,
+    script: &redis::Script,
+    container_key: &str,
+    cursor: u64,
+    budget: usize,
+) -> Result<(u64, usize), DistkitError> {
+    let mut cursor = cursor;
+    let mut fields_read = 0usize;
+
+    loop {
+        let (next_cursor, entries): (u64, Vec<String>) = redis::cmd("HSCAN")
+            .arg(container_key)
+            .arg(cursor)
+            .arg("COUNT")
+            .arg(500)
+            .query_async(conn)
+            .await
+            .map_err(DistkitError::RedisError)?;
+
+        let zero_fields: Vec<&String> = entries
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .filter(|[_, value]| value.parse::<i64>() == Ok(0))
+            .map(|[field, _]| field)
+            .collect();
+
+        if !zero_fields.is_empty() {
+            execute_pipeline_with_script_retry::<(), _, _>(conn, script, &zero_fields, |field| {
+                let mut invocation = script.key(container_key);
+                invocation.arg(field.as_str());
+                invocation
+            })
+            .await?;
+        }
+
+        fields_read += entries.len() / 2;
+        cursor = next_cursor;
+
+        if cursor == 0 || fields_read >= budget {
+            return Ok((cursor, fields_read));
+        }
+    }
+} // end fn sweep_zero_fields
+
 /// A validated Redis key.
 ///
 /// All Redis-backed distkit operations require keys wrapped in this type.
