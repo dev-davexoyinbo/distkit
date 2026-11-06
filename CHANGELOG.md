@@ -3,6 +3,47 @@
 Notable changes to distkit, newest first. For the full commit log, see the
 [GitHub releases](https://github.com/dev-davexoyinbo/distkit/releases).
 
+## 0.7.2 - 2026-11-05
+
+- **Fixed:** `LaxInstanceAwareCounter` reads no longer miss this instance's
+  own writes while a flush is in flight. Between swapping the buffered delta
+  out and applying the Redis reply, `get`, `inc_if` and the other read paths
+  returned values short by the in-flight amount for a full Redis round-trip,
+  which could make conditional updates such as `inc_if(Gt(0), -1)` skip an
+  update that should have applied. Each key now tracks its in-flight amount,
+  every read includes it, and a comparator check and its update run in one
+  critical section.
+- **Fixed:** a flush that failed no longer loses or re-sends deltas. A failed
+  flush inside `set`, `del`, `clear` or their variants dropped the swapped
+  delta, and a background flush that failed after part of a multi-chunk batch
+  was applied sent the applied part again, which double-counted (both lax
+  counters). Confirmed chunks now settle at once and unconfirmed amounts
+  return to the buffer for the next flush. A flush interrupted by a
+  connection failure stays at-least-once: the unconfirmed amount is retried
+  and can apply twice.
+- **Fixed:** `set_on_instance` and `set_all_on_instance` no longer overshoot
+  the instance slice when called while a flush is in flight.
+- **Fixed:** a flush reply that arrives after `del` removed a key no longer
+  re-creates a stale cache entry for that key.
+- **Fixed:** on a quiet instance, a buffered write could wait up to an
+  activity epoch (15 s) before flushing. The flush task now drains the buffer
+  before it goes idle, and the first write on an idle instance wakes it at
+  once. Applies to `LaxCounter` and `LaxInstanceAwareCounter`.
+- Counters now delete a record that reaches 0, since a missing record reads
+  as 0. The plain counters delete the hash field; the instance-aware
+  counters delete an instance's slice field when that slice reaches 0, and
+  the shared record (cumulative field and keys-set member) only when no
+  registered instance, dead-but-unreaped ones included, holds a field for
+  the key — a key held at -1 and +1 keeps its records. `set(key, 0)`
+  deletes the storage and keeps the epoch bump, as `del` does.
+- New `cleanup_interval: Option<Duration>` on `CounterOptions`,
+  `StrictInstanceAwareCounterOptions` and `LaxInstanceAwareCounterOptions`
+  (default `None`: no task). When set, a background task sweeps the
+  counter's records on that interval: it deletes records at 0 that older
+  versions left behind, reaps dead instances on a timer instead of waiting
+  for traffic, and deletes shared records that no instance holds. Scans are
+  budgeted (about 10 000 fields per tick) and resume across ticks.
+
 ## 0.7.1 - 2026-10-10
 
 - **Fixed:** `StrictInstanceAwareCounter` and `LaxInstanceAwareCounter` no
