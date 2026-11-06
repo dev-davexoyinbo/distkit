@@ -26,7 +26,9 @@ pub(crate) struct ActivityTracker {
 impl ActivityTracker {
     pub(crate) fn new(epoch_interval: Duration) -> Arc<Self> {
         let tracker = Arc::new(Self {
-            epoch: AtomicU64::new(0), // start at 1 so the first signal() fires immediately
+            // run_epoch_task bumps this to 1 before the first signal() can
+            // run, so the first signal always sends.
+            epoch: AtomicU64::new(0),
             is_active: AtomicBool::new(false),
             last_commited_epoch: AtomicU64::new(0),
             is_active_watch: watch::Sender::new(0u64),
@@ -89,11 +91,16 @@ impl ActivityTracker {
     } // end method run_is_active_task
 
     /// Sends an epoch-change signal if the epoch has advanced since the last
-    /// signal, waking any subscribers (e.g. the flush task).
+    /// signal, or if the tracker is currently inactive, waking any
+    /// subscribers (e.g. the flush task). The inactive case wakes a parked
+    /// flush task on the first activity after an idle stretch, so a write
+    /// never waits for the next epoch.
     #[inline(always)]
     pub(crate) fn signal(&self) {
         let epoch = self.epoch.load(Ordering::Relaxed);
-        if self.last_commited_epoch.load(Ordering::Relaxed) < epoch {
+        if self.last_commited_epoch.load(Ordering::Relaxed) < epoch
+            || !self.is_active.load(Ordering::Acquire)
+        {
             self.is_active.store(true, Ordering::Release);
             let _ = self.is_active_watch.send(epoch);
             self.last_commited_epoch.store(epoch, Ordering::Relaxed);

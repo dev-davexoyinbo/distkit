@@ -286,8 +286,12 @@ let (total, _) = server_b.get(&key).await?; // total = 5 once cleaned up
 
 A buffered wrapper around [`StrictInstanceAwareCounter`]. `inc` calls
 accumulate locally and are flushed to the strict counter in bulk every
-`flush_interval` (default 20 ms). Global operations (`set`, `del`, `clear`)
-flush any pending delta first, then delegate immediately.
+`flush_interval` (default 20 ms). Reads include this instance's buffered and
+in-flight deltas, so an instance always sees its own writes, and a flush that
+fails returns its deltas to the buffer for the next flush. Global operations
+(`set`, `del`, `clear`) flush any pending delta first, then delegate
+immediately. An idle instance drains its buffer before its flush task sleeps,
+and the first write after an idle stretch wakes the task at once.
 
 Use this when you have many `inc`/`dec` calls per second and can tolerate a
 small consistency lag.
@@ -321,8 +325,11 @@ let (local_total, mine) = counter.inc(&key, 1).await?;
 // Decrement also stays local until flushed.
 let (local_total, mine) = counter.dec(&key, 1).await?;
 
-// get() also returns the local estimate (cumulative + pending delta).
-// A fresh instance with no local state falls back to the strict counter.
+// get() also returns the local estimate: the settled total plus this
+// instance's pending and in-flight deltas, so an instance always sees its
+// own writes, also while a flush is in the air. A flush that fails returns
+// its deltas to the buffer and the next flush retries them. A fresh
+// instance with no local state falls back to the strict counter.
 let (total, mine) = counter.get(&key).await?;
 # Ok(())
 # }

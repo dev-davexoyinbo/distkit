@@ -796,44 +796,6 @@ impl StrictInstanceAwareCounter {
         Ok(())
     }
 
-    pub(crate) async fn inc_batch(
-        &self,
-        increments: &mut Vec<(DistkitRedisKey, i64)>,
-        max_batch_size: usize,
-    ) -> Result<Vec<(String, i64, i64)>, DistkitError> {
-        if increments.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let mut processed = 0;
-        let mut output: Vec<(String, i64, i64)> = Vec::with_capacity(increments.len());
-
-        while processed < increments.len() {
-            let end = (processed + max_batch_size).min(increments.len());
-            let chunk = &increments[processed..end];
-            let conditional_chunk: Vec<(&DistkitRedisKey, CounterComparator, i64)> = chunk
-                .iter()
-                .map(|(key, delta)| (key, CounterComparator::Nil, *delta))
-                .collect();
-            let chunk_results = self.inc_if_batch(&conditional_chunk).await?;
-
-            output.extend(
-                chunk_results
-                    .into_iter()
-                    .map(|(key, cumulative, inst_count, _, _)| {
-                        (key.to_string(), cumulative, inst_count)
-                    }),
-            );
-
-            processed = end;
-        }
-
-        // All chunks succeeded — drain entire input.
-        increments.drain(..processed);
-
-        Ok(output)
-    }
-
     pub(crate) async fn inc_if_batch<'k>(
         &self,
         updates: &[(&'k DistkitRedisKey, CounterComparator, i64)],

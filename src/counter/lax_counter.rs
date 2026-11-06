@@ -161,7 +161,6 @@ impl LaxCounter {
             let mut is_active_watch = self.activity.subscribe();
 
             async move {
-                // let mut batch = Vec::new();
                 let mut interval = tokio::time::interval(allowed_lag);
                 interval.tick().await;
 
@@ -174,9 +173,30 @@ impl LaxCounter {
                         counter.activity.get_is_active()
                     };
 
-                    // if not active, wait for the watcher to change
-                    if !is_active && is_active_watch.changed().await.is_err() {
-                        break;
+                    if !is_active {
+                        // Drain every buffered delta before the task parks,
+                        // so a write made while the tracker went inactive
+                        // does not wait for the next activity epoch. A
+                        // failed drain does not park: the loop retries on
+                        // its normal cadence until the drain succeeds.
+                        let drained = {
+                            let Some(counter) = counter.upgrade() else {
+                                break;
+                            };
+
+                            counter.flush_buffered(false).await
+                        };
+
+                        match drained {
+                            Ok(()) => {
+                                if is_active_watch.changed().await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                tracing::error!("Failed to flush to redis: {err:?}");
+                            }
+                        }
                     }
 
                     interval.tick().await;
@@ -186,73 +206,73 @@ impl LaxCounter {
                         None => break,
                     };
 
-                    let mut batch = counter.batch.lock().await;
-
-                    for entry in counter.store.iter() {
-                        let key = entry.key();
-                        let store = entry.value();
-
-                        if store.delta.load(Ordering::Acquire) == 0 {
-                            continue;
-                        }
-
-                        let last_flushed = mutex_lock(&store.last_flushed, "last_flushed")
-                            .map(|el| *el)
-                            .unwrap_or(None);
-
-                        if let Some(last_flushed) = last_flushed
-                            && last_flushed.elapsed() < allowed_lag
-                        {
-                            continue;
-                        }
-
-                        let delta = store.delta.swap(0, Ordering::AcqRel);
-                        store.remote_total.fetch_add(delta, Ordering::AcqRel);
-                        let Ok(mut last_flushed) = mutex_lock(&store.last_flushed, "last_flushed")
-                        else {
-                            continue;
-                        };
-
-                        *last_flushed = Some(Instant::now());
-
-                        batch.push(Commit {
-                            key: key.clone(),
-                            delta,
-                        });
-                    }
-
-                    if let Err(err) = counter.flush_to_redis(&mut batch, MAX_BATCH_SIZE).await {
+                    if let Err(err) = counter.flush_buffered(true).await {
                         tracing::error!("Failed to flush to redis: {err:?}");
-                        continue;
                     }
                 }
             }
         });
     }
 
+    /// Collects buffered deltas into the shared commit batch and sends the
+    /// batch to Redis. With `only_stale`, a key flushed less than
+    /// `allowed_lag` ago is left for a later flush.
+    async fn flush_buffered(&self, only_stale: bool) -> Result<(), DistkitError> {
+        let mut batch = self.batch.lock().await;
+
+        for entry in self.store.iter() {
+            let key = entry.key();
+            let store = entry.value();
+
+            if store.delta.load(Ordering::Acquire) == 0 {
+                continue;
+            }
+
+            if only_stale {
+                let last_flushed = mutex_lock(&store.last_flushed, "last_flushed")
+                    .map(|el| *el)
+                    .unwrap_or(None);
+
+                if let Some(last_flushed) = last_flushed
+                    && last_flushed.elapsed() < self.allowed_lag
+                {
+                    continue;
+                }
+            }
+
+            let delta = store.delta.swap(0, Ordering::AcqRel);
+            store.remote_total.fetch_add(delta, Ordering::AcqRel);
+            let Ok(mut last_flushed) = mutex_lock(&store.last_flushed, "last_flushed") else {
+                continue;
+            };
+
+            *last_flushed = Some(Instant::now());
+
+            batch.push(Commit {
+                key: key.clone(),
+                delta,
+            });
+        }
+
+        self.flush_to_redis(&mut batch, MAX_BATCH_SIZE).await
+    } // end method flush_buffered
+
     async fn flush_to_redis(
         &self,
         batch: &mut Vec<Commit>,
         max_batch_size: usize,
     ) -> Result<(), DistkitError> {
-        if batch.is_empty() {
-            return Ok(());
-        }
+        while !batch.is_empty() {
+            let chunk_len = batch.len().min(max_batch_size);
 
-        let mut processed = 0;
-
-        while processed < batch.len() {
-            let end = (processed + max_batch_size).min(batch.len());
-            let chunk = &batch[processed..end];
-
-            self.batch_commit_state(chunk)
+            self.batch_commit_state(&batch[..chunk_len])
                 .await
                 .map_err(|err| CounterError::CommitToRedisFailed(format!("{err:?}")))?;
 
-            processed = end;
+            // The chunk is confirmed. It leaves the batch at once, so a
+            // retry after a later chunk's error does not send it again.
+            batch.drain(..chunk_len);
         }
-
-        batch.drain(..processed);
 
         Ok(())
     } // end method flush_to_redis

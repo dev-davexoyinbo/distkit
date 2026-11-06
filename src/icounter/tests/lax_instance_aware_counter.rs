@@ -919,3 +919,251 @@ async fn lax_clear_on_instance_works_with_many_keys() {
 
     reader.clear().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// In-flight visibility: reads always include this instance's own writes
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reads_never_short_during_flush_window() {
+    let c = make_lax("reads_never_short").await;
+    let k = key("hits");
+
+    // Each get runs concurrently with the background flush, whose
+    // send-to-Redis window used to hide the in-flight amount from reads.
+    for i in 1..=3_000i64 {
+        c.inc(&k, 1).await.unwrap();
+
+        let (cumulative, instance_count) = c.get(&k).await.unwrap();
+        assert_eq!((cumulative, instance_count), (i, i), "after {i} increments");
+
+        // Let flush round-trips interleave with the loop.
+        if i % 50 == 0 {
+            sleep(Duration::from_millis(1)).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn inc_if_gt_zero_decrement_never_skips() {
+    let (c1, _c2, prefix) = make_lax_pair("inc_if_gt_zero").await;
+    let k = key("slots");
+
+    // Pattern from a connection-count cap: take a slot, then release it with
+    // a guarded decrement. The guard must always see this instance's own
+    // increment, also while a flush has it in the air.
+    for i in 0..1_000i64 {
+        c1.inc(&k, 1).await.unwrap();
+        tokio::task::yield_now().await;
+
+        let (_, (old_cumulative, _)) = c1.inc_if(&k, CounterComparator::Gt(0), -1).await.unwrap();
+        assert!(
+            old_cumulative >= 1,
+            "guard saw {old_cumulative} on round {i}"
+        );
+    }
+
+    sleep(Duration::from_millis(FLUSH_MS * 5)).await;
+
+    assert_eq!(c1.get(&k).await.unwrap().0, 0);
+
+    let reader = make_lax_from_prefix(&prefix).await;
+    assert_eq!(reader.get(&k).await.unwrap().0, 0);
+}
+
+#[tokio::test]
+async fn set_on_instance_during_flush_is_exact() {
+    let (c1, _c2, prefix) = make_lax_pair("set_on_instance_flush").await;
+
+    for i in 0..30u64 {
+        let k = key(&format!("slots_{i}"));
+
+        c1.inc(&k, 5).await.unwrap();
+        // Scan the flush window: the set used to miss the in-flight 5 and
+        // land on 12 once the flush settled.
+        sleep(Duration::from_millis((i % 4) * 4)).await;
+
+        let (cumulative, slice) = c1.set_on_instance(&k, 7).await.unwrap();
+        assert_eq!((cumulative, slice), (7, 7), "right after set, round {i}");
+
+        sleep(Duration::from_millis(FLUSH_MS * 5)).await;
+        assert_eq!(c1.get(&k).await.unwrap(), (7, 7), "after settle, round {i}");
+    }
+
+    let reader = make_lax_from_prefix(&prefix).await;
+    assert_eq!(reader.get(&key("slots_0")).await.unwrap().0, 7);
+}
+
+#[tokio::test]
+async fn del_leaves_no_ghost_from_late_flush() {
+    let c = make_lax("del_no_ghost").await;
+
+    for i in 0..30u64 {
+        let k = key(&format!("gone_{i}"));
+
+        c.inc(&k, 5).await.unwrap();
+        // Scan the flush window: a flush reply that lands after the delete
+        // used to re-create the key's cache entry with the old value.
+        sleep(Duration::from_millis(i % 12)).await;
+        c.del(&k).await.unwrap();
+
+        assert_eq!(
+            c.get(&k).await.unwrap(),
+            (0, 0),
+            "right after del, round {i}"
+        );
+
+        sleep(Duration::from_millis(FLUSH_MS * 3)).await;
+        assert_eq!(c.get(&k).await.unwrap(), (0, 0), "after settle, round {i}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Flush failures: deltas are retried, never lost
+// ---------------------------------------------------------------------------
+
+/// A TCP proxy to the test Redis whose connections can be cut on demand, so
+/// a test injects connection failures into its own counter only.
+struct FlakyRedisProxy {
+    address: String,
+    cut_all: tokio::sync::watch::Sender<u64>,
+}
+
+impl FlakyRedisProxy {
+    async fn start() -> Self {
+        // The test Redis URL is plain `redis://host:port/` (see the Makefile).
+        let upstream = std::env::var("REDIS_URL")
+            .expect("REDIS_URL must be set — run via `make test`")
+            .trim_start_matches("redis://")
+            .trim_end_matches('/')
+            .to_string();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy listener");
+        let address = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let (cut_all, _) = tokio::sync::watch::channel(0u64);
+        let cut_subscribe = cut_all.clone();
+
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let upstream = upstream.clone();
+                let mut cut = cut_subscribe.subscribe();
+
+                tokio::spawn(async move {
+                    let Ok(mut outbound) = tokio::net::TcpStream::connect(&upstream).await else {
+                        return;
+                    };
+
+                    // Forward bytes until the test cuts the connection.
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                        _ = cut.changed() => {}
+                    }
+                });
+            }
+        });
+
+        Self { address, cut_all }
+    }
+
+    /// Drops every live proxied connection. New connections still succeed.
+    fn cut_connections(&self) {
+        self.cut_all.send_modify(|generation| *generation += 1);
+    }
+}
+
+#[tokio::test]
+async fn flush_failures_never_lose_increments() {
+    let proxy = FlakyRedisProxy::start().await;
+    let prefix = unique_prefix("flush_failures");
+
+    let counter = {
+        let client = redis::Client::open(format!("redis://{}/", proxy.address)).unwrap();
+        let conn = client
+            .get_connection_manager()
+            .await
+            .expect("proxy must be reachable");
+        LaxInstanceAwareCounter::new(LaxInstanceAwareCounterOptions {
+            prefix: DistkitRedisKey::from(prefix.clone()),
+            connection_manager: conn,
+            dead_instance_threshold_ms: THRESHOLD_MS,
+            flush_interval: Duration::from_millis(FLUSH_MS),
+            allowed_lag: Duration::from_millis(FLUSH_MS),
+        })
+    };
+
+    let keys: Vec<DistkitRedisKey> = (0..250).map(|i| key(&format!("k_{i}"))).collect();
+
+    // Two rounds of increments while connections keep dropping, so flushes
+    // span several chunks and some of them fail mid-flight.
+    for round in 0..2u64 {
+        for (i, k) in keys.iter().enumerate() {
+            // The first inc of a key seeds from Redis, so a cut connection
+            // can fail it. A failed inc buffers nothing: retry until the
+            // increment counted, so every key gets exactly two.
+            while counter.inc(k, 1).await.is_err() {
+                sleep(Duration::from_millis(2)).await;
+            }
+
+            if i % 25 == 0 {
+                proxy.cut_connections();
+                sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        sleep(Duration::from_millis(FLUSH_MS * 2 * (round + 1))).await;
+    }
+
+    // Let the reconnected flush task retry everything it had to put back.
+    sleep(Duration::from_millis(1_000)).await;
+
+    // A failed flush is ambiguous (the delta may have reached Redis before
+    // the connection died), so the guarantee is at-least-once: nothing may
+    // be lost. This instance's own reads carry the same floor.
+    let reader = make_lax_from_prefix(&prefix).await;
+
+    for k in &keys {
+        let own = counter.get(k).await.unwrap().0;
+        let settled = reader.get(k).await.unwrap().0;
+        assert!(own >= 2, "own view of {k:?} lost increments: {own}");
+        assert!(
+            settled >= 2,
+            "Redis view of {k:?} lost increments: {settled}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Idle instances flush promptly
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn quiet_instance_flushes_promptly() {
+    let prefix = unique_prefix("quiet_flush");
+    let conn = make_connection().await;
+    // A short activity epoch (1 s): the tracker marks the counter inactive
+    // half an epoch after the round's first write, as in production.
+    let counter = LaxInstanceAwareCounter::new_with_epoch_interval(
+        LaxInstanceAwareCounterOptions {
+            prefix: DistkitRedisKey::from(prefix.clone()),
+            connection_manager: conn,
+            dead_instance_threshold_ms: THRESHOLD_MS,
+            flush_interval: Duration::from_millis(FLUSH_MS),
+            allowed_lag: Duration::from_millis(FLUSH_MS),
+        },
+        Duration::from_secs(1),
+    );
+    let k = key("hits");
+
+    counter.inc(&k, 1).await.unwrap();
+
+    // 700 ms into the epoch the tracker is inactive and the flush task is
+    // parked. A write here used to wait for the next epoch's first signal.
+    sleep(Duration::from_millis(700)).await;
+    counter.inc(&k, 1).await.unwrap();
+    sleep(Duration::from_millis(150)).await;
+
+    let reader = make_lax_from_prefix(&prefix).await;
+    assert_eq!(reader.get(&k).await.unwrap().0, 2);
+}

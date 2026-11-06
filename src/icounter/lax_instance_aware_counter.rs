@@ -4,11 +4,15 @@
 //! [`StrictInstanceAwareCounter`] on a configurable interval. Epoch-bumping
 //! operations (`set`, `del`, `clear`) flush any pending delta first, then
 //! delegate immediately to the strict counter.
+//!
+//! Reads on an instance always include that instance's own writes: both the
+//! buffered delta and any delta that a flush has sent to Redis but not yet
+//! settled. A flush that fails returns its deltas to the buffer and the next
+//! flush retries them, so a delta is never lost. A flush interrupted by a
+//! connection failure can apply twice (the reply is lost, so the retry cannot
+//! know the delta landed); flushes favor not losing data.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicI64, Ordering},
-};
+use std::sync::Arc;
 use std::{collections::HashMap, time::Duration, time::Instant};
 
 use dashmap::DashMap;
@@ -25,29 +29,68 @@ use crate::{
 
 const MAX_BATCH_SIZE: usize = 100;
 
+/// The name the per-key state mutex reports when it is poisoned.
+const STATE_LOCK: &str = "lax_icounter:state";
+
 // ---------------------------------------------------------------------------
 // Per-key in-memory state
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 struct SingleStore {
-    /// When this key was last flushed to the strict counter.
-    last_flush: std::sync::Mutex<Instant>,
-    /// Pending delta accumulated since the last flush.
-    delta: AtomicI64,
-    /// Last cumulative total received from the strict counter.
-    cumulative: AtomicI64,
-    /// Last instance count received from the strict counter.
-    instance_count: AtomicI64,
+    state: std::sync::Mutex<StoreState>,
+}
+
+/// The local state of one key.
+///
+/// Invariant: every unit this instance has written is in exactly one of
+/// `delta` (not sent to Redis yet), `in_flight` (sent, reply not applied
+/// yet), or the settled values, and every move between those buckets happens
+/// inside one critical section of the `state` mutex. A reader computing
+/// `cumulative + delta + in_flight` therefore never sees a unit in zero
+/// places (a short read) or in two places (a double count). The mutex is
+/// never held across an await.
+#[derive(Debug)]
+struct StoreState {
+    /// When this key's local values last changed from a flush, a settle or a
+    /// refresh. Reads treat the local values as fresh while this is younger
+    /// than `allowed_lag`, and a refresh snapshot is discarded when it
+    /// changed while the snapshot was fetched.
+    last_flush: Instant,
+    /// This instance's writes that no flush has sent yet.
+    delta: i64,
+    /// This instance's writes that a flush sent to Redis and whose reply is
+    /// not applied yet.
+    in_flight: i64,
+    /// The last settled cumulative total (all instances) from the strict
+    /// counter.
+    cumulative: i64,
+    /// The last settled count of this instance's slice from the strict
+    /// counter.
+    instance_count: i64,
+}
+
+impl StoreState {
+    /// The local estimate: `(cumulative, instance_count)`, each including
+    /// this instance's unsent and in-flight writes.
+    fn local_estimate(&self) -> (i64, i64) {
+        (
+            self.cumulative + self.delta + self.in_flight,
+            self.instance_count + self.delta + self.in_flight,
+        )
+    } // end function local_estimate
 }
 
 impl SingleStore {
     fn new(cumulative: i64, instance_count: i64) -> Self {
         Self {
-            last_flush: std::sync::Mutex::new(Instant::now()),
-            delta: AtomicI64::new(0),
-            cumulative: AtomicI64::new(cumulative),
-            instance_count: AtomicI64::new(instance_count),
+            state: std::sync::Mutex::new(StoreState {
+                last_flush: Instant::now(),
+                delta: 0,
+                in_flight: 0,
+                cumulative,
+                instance_count,
+            }),
         }
     }
 }
@@ -117,6 +160,9 @@ impl LaxInstanceAwareCounterOptions {
 /// [`StrictInstanceAwareCounter`] every `flush_interval`. Global
 /// epoch-bumping operations (`set`, `del`, `clear`) are forwarded
 /// immediately after draining any pending delta.
+///
+/// Reads on an instance always include that instance's own buffered and
+/// in-flight writes, so a flush in progress never makes them disappear.
 #[derive(Debug)]
 pub struct LaxInstanceAwareCounter {
     strict: Arc<StrictInstanceAwareCounter>,
@@ -125,7 +171,13 @@ pub struct LaxInstanceAwareCounter {
     flush_interval: Duration,
     allowed_lag: Duration,
     reset_locks: DashMap<DistkitRedisKey, Arc<tokio::sync::Mutex<()>>>,
-    pending_flushed: tokio::sync::Mutex<Vec<(DistkitRedisKey, i64)>>,
+    /// Serializes send-to-Redis plus settle-reply sequences, so replies apply
+    /// in Redis order. Without it, a `flush_key` from `set` or `del` racing
+    /// the background flush on one key could apply an older reply after a
+    /// newer flush already settled, and reads would go short until the next
+    /// refresh. Read-only refreshes do not take it; they discard a snapshot
+    /// that a flush overlapped (see [`Self::apply_refresh`]).
+    flush_lock: tokio::sync::Mutex<()>,
 }
 
 impl LaxInstanceAwareCounter {
@@ -154,6 +206,20 @@ impl LaxInstanceAwareCounter {
     /// # }
     /// ```
     pub fn new(options: LaxInstanceAwareCounterOptions) -> Arc<Self> {
+        Self::new_inner(options, EPOCH_CHANGE_INTERVAL)
+    }
+
+    /// Test seam: a counter whose activity epochs advance every
+    /// `epoch_interval`, so idle-wake behavior fits a test's time budget.
+    #[cfg(test)]
+    pub(crate) fn new_with_epoch_interval(
+        options: LaxInstanceAwareCounterOptions,
+        epoch_interval: Duration,
+    ) -> Arc<Self> {
+        Self::new_inner(options, epoch_interval)
+    }
+
+    fn new_inner(options: LaxInstanceAwareCounterOptions, epoch_interval: Duration) -> Arc<Self> {
         let LaxInstanceAwareCounterOptions {
             prefix,
             connection_manager,
@@ -172,16 +238,16 @@ impl LaxInstanceAwareCounter {
         let counter = Arc::new(Self {
             strict,
             local_store: DashMap::default(),
-            activity: ActivityTracker::new(EPOCH_CHANGE_INTERVAL),
+            activity: ActivityTracker::new(epoch_interval),
             flush_interval,
             allowed_lag,
             reset_locks: DashMap::default(),
-            pending_flushed: tokio::sync::Mutex::new(Vec::new()),
+            flush_lock: tokio::sync::Mutex::new(()),
         });
 
         counter.run_flush_task();
         counter
-    }
+    } // end function new_inner
 
     // -----------------------------------------------------------------------
     // Background flush task
@@ -202,8 +268,27 @@ impl LaxInstanceAwareCounter {
                     counter.activity.get_is_active()
                 };
 
-                if !is_active && is_active_watch.changed().await.is_err() {
-                    break;
+                if !is_active {
+                    // Drain every buffered delta before the task parks, so a
+                    // write made while the tracker went inactive does not
+                    // wait for the next activity epoch. A failed drain does
+                    // not park: the loop retries on its normal cadence until
+                    // the drain succeeds.
+                    let drained = {
+                        let Some(counter) = weak.upgrade() else { break };
+                        counter.drain().await
+                    };
+
+                    match drained {
+                        Ok(()) => {
+                            if is_active_watch.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            tracing::error!("lax_icounter:flush_task: drain failed: {err}");
+                        }
+                    }
                 }
 
                 interval.tick().await;
@@ -214,28 +299,21 @@ impl LaxInstanceAwareCounter {
                 }
             }
         });
-    }
+    } // end function run_flush_task
 
+    /// Sends every delta that is at least `allowed_lag` old.
     async fn flush(&self) -> Result<(), DistkitError> {
-        let mut pending = self.pending_flushed.lock().await;
+        let guard = self.flush_lock.lock().await;
+        let pending = self.collect_deltas(&guard, true);
+        self.send_deltas(&guard, pending).await
+    } // end function flush
 
-        // Collect newly stale deltas (delta already swapped to 0 in local_store).
-        pending.extend(self.collect_stale_mark_flushed());
-
-        if pending.is_empty() {
-            return Ok(());
-        }
-
-        let results = self.strict.inc_batch(&mut pending, MAX_BATCH_SIZE).await?;
-
-        for (key_str, cumulative, instance_count) in results {
-            if let Ok(key) = DistkitRedisKey::try_from(key_str) {
-                self.update_local(&key, cumulative, instance_count);
-            }
-        }
-
-        Ok(())
-    }
+    /// Sends every buffered delta, whatever its age.
+    async fn drain(&self) -> Result<(), DistkitError> {
+        let guard = self.flush_lock.lock().await;
+        let pending = self.collect_deltas(&guard, false);
+        self.send_deltas(&guard, pending).await
+    } // end function drain
 
     /// Acquire (or create) the per-key reset lock and return an `Arc` to it.
     fn get_or_create_reset_lock(&self, key: &DistkitRedisKey) -> Arc<tokio::sync::Mutex<()>> {
@@ -249,92 +327,153 @@ impl LaxInstanceAwareCounter {
             .clone()
     } // end function get_or_create_reset_lock
 
-    fn collect_stale_mark_flushed(&self) -> Vec<(DistkitRedisKey, i64)> {
+    /// Moves each key's buffered delta into its in-flight bucket and returns
+    /// the amounts to send. With `only_stale`, a key whose state changed less
+    /// than `allowed_lag` ago is left for a later flush.
+    fn collect_deltas(
+        &self,
+        _flush_guard: &tokio::sync::MutexGuard<'_, ()>,
+        only_stale: bool,
+    ) -> Vec<(DistkitRedisKey, i64)> {
         let now = Instant::now();
+
         self.local_store
             .iter()
             .filter_map(|store| {
-                // Deref copies the Instant; the MutexGuard is dropped immediately.
-                let last = *mutex_lock(&store.last_flush, "lax_icounter:last_flush").ok()?;
+                let mut state = mutex_lock(&store.state, STATE_LOCK).ok()?;
 
-                if now.duration_since(last) < self.allowed_lag {
+                if only_stale && now.duration_since(state.last_flush) < self.allowed_lag {
                     return None;
                 }
 
-                let delta = store.delta.swap(0, Ordering::AcqRel);
-
-                if delta != 0 {
-                    *mutex_lock(&store.last_flush, "lax_icounter:last_flush").ok()? =
-                        Instant::now();
-                    Some((store.key().clone(), delta))
-                } else {
-                    None
+                if state.delta == 0 {
+                    return None;
                 }
+
+                let sent = state.delta;
+                state.delta = 0;
+                state.in_flight += sent;
+                state.last_flush = Instant::now();
+
+                Some((store.key().clone(), sent))
             })
             .collect()
-    }
+    } // end function collect_deltas
 
-    /// Drains the pending delta for a single key by calling `strict.inc`
-    /// directly. Used before epoch-bumping operations (`set`, `del`, etc.).
-    async fn flush_key(&self, key: &DistkitRedisKey) -> Result<(), DistkitError> {
-        let Some(store) = self.local_store.get(key) else {
-            return Ok(());
-        };
+    /// [`Self::collect_deltas`] for the given keys only, whatever their age.
+    /// Used before an epoch-bumping operation on those keys.
+    fn collect_keys<'k>(
+        &self,
+        _flush_guard: &tokio::sync::MutexGuard<'_, ()>,
+        keys: impl IntoIterator<Item = &'k DistkitRedisKey>,
+    ) -> Vec<(DistkitRedisKey, i64)> {
+        keys.into_iter()
+            .filter_map(|key| {
+                let store = self.local_store.get(key)?;
+                let mut state = mutex_lock(&store.state, STATE_LOCK).ok()?;
 
-        let delta = store.delta.swap(0, Ordering::AcqRel);
-        *mutex_lock(&store.last_flush, "lax_icounter:last_flush")? = Instant::now();
-
-        if delta == 0 {
-            return Ok(());
-        }
-
-        let (cumulative, instance_count) = self.strict.inc(key, delta).await?;
-        self.update_local(key, cumulative, instance_count);
-
-        Ok(())
-    } // end function flush_key
-
-    /// Drains pending deltas for all keys regardless of staleness.
-    /// Used by `clear` / `clear_on_instance` before delegating to strict.
-    async fn flush_all_keys(&self) -> Result<(), DistkitError> {
-        let mut all: Vec<(DistkitRedisKey, i64)> = self
-            .local_store
-            .iter()
-            .filter_map(|store| {
-                let delta = store.delta.swap(0, Ordering::AcqRel);
-                *mutex_lock(&store.last_flush, "lax_icounter:last_flush").ok()? = Instant::now();
-
-                if delta != 0 {
-                    Some((store.key().clone(), delta))
-                } else {
-                    None
+                if state.delta == 0 {
+                    return None;
                 }
+
+                let sent = state.delta;
+                state.delta = 0;
+                state.in_flight += sent;
+                state.last_flush = Instant::now();
+
+                Some((key.clone(), sent))
             })
-            .collect();
+            .collect()
+    } // end function collect_keys
 
-        if all.is_empty() {
-            return Ok(());
-        }
+    /// Sends already-collected deltas to the strict counter in chunks of
+    /// [`MAX_BATCH_SIZE`] and settles each chunk's replies as it succeeds.
+    /// On an error, every amount that was not confirmed returns to its key's
+    /// buffer, so the next flush retries it and reads stay exact throughout.
+    /// The caller holds `flush_lock`, so replies apply in Redis order.
+    async fn send_deltas(
+        &self,
+        _flush_guard: &tokio::sync::MutexGuard<'_, ()>,
+        mut batch: Vec<(DistkitRedisKey, i64)>,
+    ) -> Result<(), DistkitError> {
+        while !batch.is_empty() {
+            let chunk_len = batch.len().min(MAX_BATCH_SIZE);
+            let chunk: Vec<(&DistkitRedisKey, CounterComparator, i64)> = batch[..chunk_len]
+                .iter()
+                .map(|(key, sent)| (key, CounterComparator::Nil, *sent))
+                .collect();
 
-        let results = self.strict.inc_batch(&mut all, MAX_BATCH_SIZE).await?;
+            match self.strict.inc_if_batch(&chunk).await {
+                Ok(results) => {
+                    for ((key, sent), (result_key, cumulative, instance_count, _, _)) in
+                        batch[..chunk_len].iter().zip(results)
+                    {
+                        debug_assert_eq!(key, result_key);
+                        self.settle_key(key, *sent, cumulative, instance_count);
+                    }
 
-        for (key_str, cumulative, instance_count) in results {
-            if let Ok(key) = DistkitRedisKey::try_from(key_str) {
-                self.update_local(&key, cumulative, instance_count);
+                    batch.drain(..chunk_len);
+                }
+                Err(err) => {
+                    // This chunk is unconfirmed and the later chunks were
+                    // never sent: give all of it back to the buffers.
+                    for (key, sent) in &batch {
+                        self.restore_key(key, *sent);
+                    }
+
+                    return Err(err);
+                }
             }
         }
 
         Ok(())
-    }
+    } // end function send_deltas
 
-    /// Updates `local_store` with fresh values from the strict counter.
-    fn update_local(&self, key: &DistkitRedisKey, cumulative: i64, instance_count: i64) {
+    /// Applies a flush reply: the settled values replace the local ones and
+    /// the sent amount leaves the in-flight bucket, in one critical section.
+    /// A reply for a key that was deleted meanwhile is dropped; the delete
+    /// bumped the epoch, so the reply's values are void.
+    fn settle_key(&self, key: &DistkitRedisKey, sent: i64, cumulative: i64, instance_count: i64) {
+        let Some(store) = self.local_store.get(key) else {
+            return;
+        };
+        let Ok(mut state) = mutex_lock(&store.state, STATE_LOCK) else {
+            return;
+        };
+
+        state.cumulative = cumulative;
+        state.instance_count = instance_count;
+        state.in_flight -= sent;
+        state.last_flush = Instant::now();
+    } // end function settle_key
+
+    /// Returns an unconfirmed amount from the in-flight bucket to the
+    /// buffer, so the next flush sends it again. The amount of a key that
+    /// was deleted meanwhile is dropped, as the delete reset the key.
+    fn restore_key(&self, key: &DistkitRedisKey, sent: i64) {
+        let Some(store) = self.local_store.get(key) else {
+            return;
+        };
+        let Ok(mut state) = mutex_lock(&store.state, STATE_LOCK) else {
+            return;
+        };
+
+        state.delta += sent;
+        state.in_flight -= sent;
+    } // end function restore_key
+
+    /// Seeds `local_store` with authoritative values from the strict counter
+    /// (an epoch-bumping operation's reply), keeping any buffered delta.
+    fn seed_local(&self, key: &DistkitRedisKey, cumulative: i64, instance_count: i64) {
         match self.local_store.get(key) {
             Some(store) => {
-                store.cumulative.store(cumulative, Ordering::Release);
-                store
-                    .instance_count
-                    .store(instance_count, Ordering::Release);
+                let Ok(mut state) = mutex_lock(&store.state, STATE_LOCK) else {
+                    return;
+                };
+
+                state.cumulative = cumulative;
+                state.instance_count = instance_count;
+                state.last_flush = Instant::now();
             }
             None => {
                 self.local_store
@@ -342,60 +481,148 @@ impl LaxInstanceAwareCounter {
                     .or_insert_with(|| SingleStore::new(cumulative, instance_count));
             }
         }
-    } // end function update_local
+    } // end function seed_local
+
+    /// Applies a read-refresh snapshot, unless the key changed while the
+    /// snapshot was fetched. `captured` is the key's `last_flush` from
+    /// before the fetch (`None`: the key did not exist). The snapshot is
+    /// discarded when `last_flush` changed, when the key has an in-flight
+    /// amount (the snapshot may already include it, and the settle brings
+    /// equally fresh values), or when the key appeared or disappeared
+    /// meanwhile. The local values stay exact for this instance's own
+    /// writes either way; a later read refreshes again.
+    fn apply_refresh(
+        &self,
+        key: &DistkitRedisKey,
+        captured: Option<Instant>,
+        cumulative: i64,
+        instance_count: i64,
+    ) {
+        match self.local_store.get(key) {
+            Some(store) => {
+                let Ok(mut state) = mutex_lock(&store.state, STATE_LOCK) else {
+                    return;
+                };
+
+                if captured == Some(state.last_flush) && state.in_flight == 0 {
+                    state.cumulative = cumulative;
+                    state.instance_count = instance_count;
+                    state.last_flush = Instant::now();
+                }
+            }
+            None => {
+                if captured.is_none() {
+                    self.local_store
+                        .entry(key.clone())
+                        .or_insert_with(|| SingleStore::new(cumulative, instance_count));
+                }
+            }
+        }
+    } // end function apply_refresh
 
     async fn refresh_local_if_needed(&self, key: &DistkitRedisKey) -> Result<(), DistkitError> {
         let lock = self.get_or_create_reset_lock(key);
         let _guard = lock.lock().await;
 
-        if let Some(store) = self.local_store.get(key)
-            && mutex_lock(&store.last_flush, "lax_icounter:last_flush")?.elapsed()
-                < self.allowed_lag
-        {
-            return Ok(());
-        }
+        let captured: Option<Instant> = match self.local_store.get(key) {
+            Some(store) => {
+                let state = mutex_lock(&store.state, STATE_LOCK)?;
+
+                if state.last_flush.elapsed() < self.allowed_lag {
+                    return Ok(());
+                }
+
+                Some(state.last_flush)
+            }
+            None => None,
+        };
 
         let (cumulative, instance_count) = self.strict.get(key).await?;
 
-        self.update_local(key, cumulative, instance_count);
+        self.apply_refresh(key, captured, cumulative, instance_count);
 
         Ok(())
-    }
+    } // end function refresh_local_if_needed
 
     /// Fetches stale/missing keys from the strict counter in a single batched
-    /// round-trip, then updates `local_store` for each key.
+    /// round-trip, then updates `local_store` for each key whose state did
+    /// not change while the fetch was in the air (see [`Self::apply_refresh`]).
     async fn batch_refresh_stale(&self, keys: &[&DistkitRedisKey]) -> Result<(), DistkitError> {
         if keys.is_empty() {
             return Ok(());
         }
 
-        let keys: Vec<&DistkitRedisKey> = keys
-            .iter()
-            .filter(|key| {
-                self.local_store
-                    .get(*key)
-                    .and_then(|s| {
-                        mutex_lock(&s.last_flush, "lax_icounter:last_flush")
-                            .ok()
-                            .map(|g| g.elapsed() >= self.allowed_lag)
-                    })
-                    .unwrap_or(true)
-            })
-            .copied()
-            .collect();
+        let mut captured: HashMap<&DistkitRedisKey, Option<Instant>> =
+            HashMap::with_capacity(keys.len());
+        let mut to_fetch: Vec<&DistkitRedisKey> = Vec::new();
 
-        if keys.is_empty() {
+        for key in keys {
+            if captured.contains_key(*key) {
+                continue;
+            }
+
+            match self.local_store.get(*key) {
+                Some(store) => {
+                    let state = mutex_lock(&store.state, STATE_LOCK)?;
+
+                    if state.last_flush.elapsed() >= self.allowed_lag {
+                        captured.insert(*key, Some(state.last_flush));
+                        to_fetch.push(*key);
+                    }
+                }
+                None => {
+                    captured.insert(*key, None);
+                    to_fetch.push(*key);
+                }
+            }
+        }
+
+        if to_fetch.is_empty() {
             return Ok(());
         }
 
-        let results = self.strict.get_batch(&keys).await?;
+        let results = self.strict.get_batch(&to_fetch).await?;
 
         for (key, cumulative, instance_count) in results {
-            self.update_local(key, cumulative, instance_count);
+            let Some(captured_at) = captured.get(key).copied() else {
+                continue;
+            };
+
+            self.apply_refresh(key, captured_at, cumulative, instance_count);
         }
 
         Ok(())
-    }
+    } // end function batch_refresh_stale
+
+    /// Runs `op` on the key's state: directly when the cached entry is
+    /// younger than `allowed_lag`, otherwise after one refresh from the
+    /// strict counter. `op` runs inside the state's critical section, so a
+    /// comparator check and its update are atomic on this instance.
+    async fn with_fresh_store<R>(
+        &self,
+        key: &DistkitRedisKey,
+        op: impl FnOnce(&mut StoreState) -> R,
+    ) -> Result<R, DistkitError> {
+        if let Some(store) = self.local_store.get(key) {
+            let mut state = mutex_lock(&store.state, STATE_LOCK)?;
+
+            if state.last_flush.elapsed() < self.allowed_lag {
+                return Ok(op(&mut state));
+            }
+        }
+
+        self.refresh_local_if_needed(key).await?;
+
+        // A key can leave the store between the refresh and here only
+        // through `del`, which resets it; it then starts fresh at zero.
+        let store = self
+            .local_store
+            .entry(key.clone())
+            .or_insert_with(|| SingleStore::new(0, 0));
+        let mut state = mutex_lock(&store.state, STATE_LOCK)?;
+
+        Ok(op(&mut state))
+    } // end function with_fresh_store
 }
 
 // ---------------------------------------------------------------------------
@@ -425,9 +652,12 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// a Redis round-trip.
     ///
     /// On the first call for a key, the current value is fetched from the
-    /// backing [`StrictInstanceAwareCounter`] to seed the local cache. Subsequent
-    /// calls accumulate into a single `inc_batch` that is flushed after
-    /// `flush_interval` (default 20 ms). Returns `(cumulative, instance_count)`.
+    /// backing [`StrictInstanceAwareCounter`] to seed the local cache.
+    /// Subsequent calls accumulate locally and a background flush sends them
+    /// after `flush_interval` (default 20 ms). Reads on this instance include
+    /// the buffered amount and any amount a flush has in the air, so a write
+    /// is never invisible to its own instance. Returns
+    /// `(cumulative, instance_count)`.
     ///
     /// # Examples
     ///
@@ -458,48 +688,18 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     ) -> Result<((i64, i64), (i64, i64)), DistkitError> {
         self.activity.signal();
 
-        let store = match self.local_store.get(key) {
-            Some(store)
-                if mutex_lock(&store.last_flush, "lax_icounter:last_flush")?.elapsed()
-                    < self.allowed_lag =>
-            {
-                store
+        self.with_fresh_store(key, |state| {
+            let current = state.local_estimate();
+
+            if !comparator.matches(current.0) {
+                return (current, current);
             }
-            Some(store) => {
-                drop(store);
 
-                self.refresh_local_if_needed(key).await?;
+            state.delta += count;
 
-                self.local_store
-                    .get(key)
-                    .expect("key should be in local_store")
-            }
-            None => {
-                self.refresh_local_if_needed(key).await?;
-
-                self.local_store
-                    .get(key)
-                    .expect("key should be in local_store")
-            }
-        };
-
-        let delta_before = store.delta.load(Ordering::Acquire);
-        let current = (
-            store.cumulative.load(Ordering::Acquire) + delta_before,
-            store.instance_count.load(Ordering::Acquire) + delta_before,
-        );
-        if !comparator.matches(current.0) {
-            return Ok((current, current));
-        }
-
-        let delta_after = store.delta.fetch_add(count, Ordering::AcqRel) + count;
-        let cumulative = store.cumulative.load(Ordering::Acquire);
-        let instance_count = store.instance_count.load(Ordering::Acquire);
-
-        Ok((
-            (cumulative + delta_after, instance_count + delta_after),
-            current,
-        ))
+            ((current.0 + count, current.1 + count), current)
+        })
+        .await
     }
 
     /// Decrements the counter locally. Equivalent to `inc(key, -count)`.
@@ -563,11 +763,14 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         }
 
         self.activity.signal();
-        self.flush_key(key).await?;
+
+        let flush_guard = self.flush_lock.lock().await;
+        let pending = self.collect_keys(&flush_guard, std::iter::once(key));
+        self.send_deltas(&flush_guard, pending).await?;
 
         let (cumulative, instance_count) = self.strict.set(key, count).await?;
 
-        self.update_local(key, cumulative, instance_count);
+        self.seed_local(key, cumulative, instance_count);
 
         Ok(((cumulative, instance_count), current))
     }
@@ -616,49 +819,33 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     ) -> Result<((i64, i64), (i64, i64)), DistkitError> {
         self.activity.signal();
 
-        let store = match self.local_store.get(key) {
-            Some(store)
-                if mutex_lock(&store.last_flush, "lax_icounter:last_flush")?.elapsed()
-                    < self.allowed_lag =>
-            {
-                store
+        self.with_fresh_store(key, |state| {
+            let current = state.local_estimate();
+
+            if !comparator.matches(current.1) {
+                return (current, current);
             }
-            Some(store) => {
-                drop(store);
 
-                self.refresh_local_if_needed(key).await?;
+            // The instance's contribution is its settled slice plus its
+            // unsent and in-flight writes; the delta makes their sum `count`.
+            state.delta = count - state.instance_count - state.in_flight;
 
-                self.local_store
-                    .get(key)
-                    .expect("key should be in local_store")
-            }
-            None => {
-                self.refresh_local_if_needed(key).await?;
-
-                self.local_store
-                    .get(key)
-                    .expect("key should be in local_store")
-            }
-        };
-
-        let delta = store.delta.load(Ordering::Acquire);
-        let cumulative = store.cumulative.load(Ordering::Acquire);
-        let instance_count = store.instance_count.load(Ordering::Acquire);
-        let current = (cumulative + delta, instance_count + delta);
-        if !comparator.matches(current.1) {
-            return Ok((current, current));
-        }
-
-        store.delta.store(count - instance_count, Ordering::Release);
-
-        Ok(((cumulative - instance_count + count, count), current))
+            (
+                (state.cumulative - state.instance_count + count, count),
+                current,
+            )
+        })
+        .await
     }
 
-    /// Returns `(cumulative + pending_delta, instance_count + pending_delta)`.
+    /// Returns `(cumulative, instance_count)`, each including this instance's
+    /// buffered and in-flight writes.
     ///
     /// On the first call for a key the current value is fetched from Redis to
-    /// seed the local cache. Subsequent reads return the local estimate without
-    /// a Redis round-trip.
+    /// seed the local cache. A later read within `allowed_lag` of the last
+    /// flush, settle or refresh returns the local estimate without a Redis
+    /// round-trip; an older read refreshes the other instances' part from
+    /// Redis first.
     ///
     /// # Examples
     ///
@@ -678,36 +865,8 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     async fn get(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
 
-        let store = match self.local_store.get(key) {
-            Some(store)
-                if mutex_lock(&store.last_flush, "lax_icounter:last_flush")?.elapsed()
-                    < self.allowed_lag =>
-            {
-                store
-            }
-            Some(store) => {
-                drop(store);
-
-                self.refresh_local_if_needed(key).await?;
-
-                self.local_store
-                    .get(key)
-                    .expect("key should be in local_store")
-            }
-            None => {
-                self.refresh_local_if_needed(key).await?;
-
-                self.local_store
-                    .get(key)
-                    .expect("key should be in local_store")
-            }
-        };
-
-        let delta = store.delta.load(Ordering::Acquire);
-        let cumulative = store.cumulative.load(Ordering::Acquire);
-        let instance_count = store.instance_count.load(Ordering::Acquire);
-
-        Ok((cumulative + delta, instance_count + delta))
+        self.with_fresh_store(key, |state| state.local_estimate())
+            .await
     }
 
     /// Flushes the pending delta for `key`, then deletes the key globally and
@@ -732,9 +891,14 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// ```
     async fn del(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
-        self.flush_key(key).await?;
+
+        let flush_guard = self.flush_lock.lock().await;
+        let pending = self.collect_keys(&flush_guard, std::iter::once(key));
+        self.send_deltas(&flush_guard, pending).await?;
+
         let result = self.strict.del(key).await?;
         self.local_store.remove(key);
+
         Ok(result)
     }
 
@@ -765,9 +929,14 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// ```
     async fn del_on_instance(&self, key: &DistkitRedisKey) -> Result<(i64, i64), DistkitError> {
         self.activity.signal();
-        self.flush_key(key).await?;
+
+        let flush_guard = self.flush_lock.lock().await;
+        let pending = self.collect_keys(&flush_guard, std::iter::once(key));
+        self.send_deltas(&flush_guard, pending).await?;
+
         let result = self.strict.del_on_instance(key).await?;
-        self.update_local(key, result.0, 0);
+        self.seed_local(key, result.0, 0);
+
         Ok(result)
     }
 
@@ -793,9 +962,14 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// ```
     async fn clear(&self) -> Result<(), DistkitError> {
         self.activity.signal();
-        self.flush_all_keys().await?;
+
+        let flush_guard = self.flush_lock.lock().await;
+        let pending = self.collect_deltas(&flush_guard, false);
+        self.send_deltas(&flush_guard, pending).await?;
+
         self.strict.clear().await?;
         self.local_store.clear();
+
         Ok(())
     }
 
@@ -820,9 +994,14 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
     /// ```
     async fn clear_on_instance(&self) -> Result<(), DistkitError> {
         self.activity.signal();
-        self.flush_all_keys().await?;
+
+        let flush_guard = self.flush_lock.lock().await;
+        let pending = self.collect_deltas(&flush_guard, false);
+        self.send_deltas(&flush_guard, pending).await?;
+
         self.strict.clear_on_instance().await?;
         self.local_store.clear();
+
         Ok(())
     }
 
@@ -840,16 +1019,13 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
 
         keys.iter()
             .map(|key| {
-                let store = self
-                    .local_store
-                    .get(*key)
-                    .expect("store populated after refresh");
-                let delta = store.delta.load(Ordering::Acquire);
-                Ok((
-                    *key,
-                    store.cumulative.load(Ordering::Acquire) + delta,
-                    store.instance_count.load(Ordering::Acquire) + delta,
-                ))
+                let estimate = match self.local_store.get(*key) {
+                    Some(store) => mutex_lock(&store.state, STATE_LOCK)?.local_estimate(),
+                    // The key was deleted while refreshing: it starts at zero.
+                    None => (0, 0),
+                };
+
+                Ok((*key, estimate.0, estimate.1))
             })
             .collect()
     } // end function get_all
@@ -858,19 +1034,24 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         &self,
         keys: &[&'k DistkitRedisKey],
     ) -> Result<Vec<(&'k DistkitRedisKey, i64)>, DistkitError> {
+        self.activity.signal();
+
         self.batch_refresh_stale(keys).await?;
 
         Ok(keys
             .iter()
             .map(|key| {
-                let val = self
+                let slice = self
                     .local_store
                     .get(*key)
-                    .map(|s| {
-                        s.instance_count.load(Ordering::Acquire) + s.delta.load(Ordering::Acquire)
+                    .and_then(|store| {
+                        mutex_lock(&store.state, STATE_LOCK)
+                            .ok()
+                            .map(|state| state.local_estimate().1)
                     })
                     .unwrap_or(0);
-                (*key, val)
+
+                (*key, slice)
             })
             .collect())
     } // end function get_all_on_instance
@@ -910,23 +1091,15 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
             .map(|(key, comparator, count)| {
                 let store = self
                     .local_store
-                    .get(*key)
-                    .expect("store populated after refresh");
-                let delta_before = store.delta.load(Ordering::Acquire);
-                let current = (
-                    store.cumulative.load(Ordering::Acquire) + delta_before,
-                    store.instance_count.load(Ordering::Acquire) + delta_before,
-                );
+                    .entry((*key).clone())
+                    .or_insert_with(|| SingleStore::new(0, 0));
+                let mut state = mutex_lock(&store.state, STATE_LOCK)?;
+                let current = state.local_estimate();
 
                 if comparator.matches(current.0) {
-                    let delta_after = store.delta.fetch_add(*count, Ordering::AcqRel) + *count;
-                    let cumulative = store.cumulative.load(Ordering::Acquire);
-                    let instance_count = store.instance_count.load(Ordering::Acquire);
-                    Ok((
-                        *key,
-                        (cumulative + delta_after, instance_count + delta_after),
-                        current,
-                    ))
+                    state.delta += *count;
+
+                    Ok((*key, (current.0 + count, current.1 + count), current))
                 } else {
                     Ok((*key, current, current))
                 }
@@ -969,15 +1142,10 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         let mut matched_updates: Vec<(&DistkitRedisKey, i64)> = Vec::new();
 
         for (key, comparator, count) in updates {
-            let store = self
-                .local_store
-                .get(*key)
-                .expect("store populated after refresh");
-            let delta = store.delta.load(Ordering::Acquire);
-            let current = (
-                store.cumulative.load(Ordering::Acquire) + delta,
-                store.instance_count.load(Ordering::Acquire) + delta,
-            );
+            let current = match self.local_store.get(*key) {
+                Some(store) => mutex_lock(&store.state, STATE_LOCK)?.local_estimate(),
+                None => (0, 0),
+            };
             current_map.insert((*key).clone(), current);
 
             if comparator.matches(current.0) {
@@ -988,10 +1156,17 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
         let mut applied_map: HashMap<DistkitRedisKey, (i64, i64)> =
             HashMap::with_capacity(matched_updates.len());
         if !matched_updates.is_empty() {
-            self.flush().await?;
+            // The matched keys' pending deltas must land before the set,
+            // or a later flush would add them on top of the set value.
+            let flush_guard = self.flush_lock.lock().await;
+            let pending =
+                self.collect_keys(&flush_guard, matched_updates.iter().map(|(key, _)| *key));
+            self.send_deltas(&flush_guard, pending).await?;
+
             let batch = self.strict.set_batch(&matched_updates).await?;
+
             for (key, cumulative, instance_count) in &batch {
-                self.update_local(key, *cumulative, *instance_count);
+                self.seed_local(key, *cumulative, *instance_count);
                 applied_map.insert((*key).clone(), (*cumulative, *instance_count));
             }
         }
@@ -1050,16 +1225,19 @@ impl InstanceAwareCounterTrait for LaxInstanceAwareCounter {
             .map(|(key, comparator, count)| {
                 let store = self
                     .local_store
-                    .get(*key)
-                    .expect("store populated after refresh");
-                let delta = store.delta.load(Ordering::Acquire);
-                let cumulative = store.cumulative.load(Ordering::Acquire);
-                let instance_count = store.instance_count.load(Ordering::Acquire);
-                let current = (cumulative + delta, instance_count + delta);
+                    .entry((*key).clone())
+                    .or_insert_with(|| SingleStore::new(0, 0));
+                let mut state = mutex_lock(&store.state, STATE_LOCK)?;
+                let current = state.local_estimate();
 
                 if comparator.matches(current.1) {
-                    store.delta.store(count - instance_count, Ordering::Release);
-                    Ok((*key, (cumulative - instance_count + count, *count), current))
+                    state.delta = count - state.instance_count - state.in_flight;
+
+                    Ok((
+                        *key,
+                        (state.cumulative - state.instance_count + count, *count),
+                        current,
+                    ))
                 } else {
                     Ok((*key, current, current))
                 }
