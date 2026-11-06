@@ -252,6 +252,10 @@ One call removes dead instances until it has read approximately 10,000 of their
 counts. The next calls remove the dead instances that stay. Thus, a large
 backlog does not block Redis in one call.
 
+Set `cleanup_interval` on the options to also run cleanup on a timer: a
+background task reaps dead instances and deletes records that no instance
+holds anymore, so a quiet deployment converges without waiting for traffic.
+
 ```rust
 use distkit::icounter::{
     InstanceAwareCounterTrait,
@@ -269,6 +273,7 @@ let opts = |conn| StrictInstanceAwareCounterOptions {
     prefix: prefix.clone(),
     connection_manager: conn,
     dead_instance_threshold_ms: 30_000, // 30 s
+    cleanup_interval: None,
 };
 let server_a = StrictInstanceAwareCounter::new(opts(conn1));
 let server_b = StrictInstanceAwareCounter::new(opts(conn2));
@@ -287,7 +292,9 @@ A buffered wrapper around `StrictInstanceAwareCounter`. `inc` calls accumulate
 locally and are flushed to the strict counter in bulk every `flush_interval`
 (default 20 ms). Reads include this instance's buffered and in-flight deltas,
 so an instance always sees its own writes, and a flush that fails returns its
-deltas to the buffer for the next flush. Global operations (`set`, `del`,
+deltas to the buffer for the next flush. A record that
+reaches 0 is deleted, since a missing record reads as 0; `cleanup_interval`
+on the options sweeps records that older versions left behind. Global operations (`set`, `del`,
 `clear`) flush any pending delta first, then delegate immediately. An idle
 instance drains its buffer before its flush task sleeps, and the first write
 after an idle stretch wakes the task at once.
@@ -312,6 +319,7 @@ let counter = LaxInstanceAwareCounter::new(LaxInstanceAwareCounterOptions {
     dead_instance_threshold_ms: 30_000,
     flush_interval: Duration::from_millis(20),
     allowed_lag:    Duration::from_millis(20),
+    cleanup_interval: None,
 });
 
 let key = DistkitRedisKey::try_from("connections".to_string())?;
